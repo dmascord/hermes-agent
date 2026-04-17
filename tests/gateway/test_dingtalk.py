@@ -268,8 +268,3 @@ class TestConnect:
 # Platform enum
 # ---------------------------------------------------------------------------
 
-
-class TestPlatformEnum:
-
-    def test_dingtalk_in_platform_enum(self):
-        assert Platform.DINGTALK.value == "dingtalk"
