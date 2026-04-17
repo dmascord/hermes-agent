@@ -9,10 +9,11 @@ Resolution order for text tasks (auto mode):
   2. Nous Portal (~/.hermes/auth.json active provider)
   3. Custom endpoint (config.yaml model.base_url + OPENAI_API_KEY)
   4. Codex OAuth (Responses API via chatgpt.com with gpt-5.3-codex,
-     wrapped to look like a chat.completions client)
+      wrapped to look like a chat.completions client)
   5. Native Anthropic
   6. Direct API-key providers (z.ai/GLM, Kimi/Moonshot, MiniMax, MiniMax-CN)
-  7. None
+  7. Local Claude CLI wrapper (when Claude Code credentials are present)
+  8. None
 
 Resolution order for vision/multimodal tasks (auto mode):
   1. Selected main provider, if it is one of the supported vision backends below
@@ -39,6 +40,7 @@ import logging
 import os
 import threading
 import time
+import asyncio
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,6 +48,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 from agent.credential_pool import load_pool
+from agent.claude_cli_helper import _call_claude_cli_from_messages, _find_claude_cli_path
+from agent.claude_code_bridge import ClaudeCodeMCPBridge
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -73,6 +77,10 @@ _PROVIDER_ALIASES = {
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
     "claude-code": "anthropic",
+    "claude-cli": "claude-cli",
+    "claude-local": "claude-cli",
+    "claude-code-cli": "claude-cli",
+    "claude-code-mcp": "claude-code-mcp",
 }
 
 
@@ -150,6 +158,76 @@ _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 # vision via Responses.
 _CODEX_AUX_MODEL = "gpt-5.2-codex"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+_CLAUDE_CLI_AUX_MODEL = os.getenv("CLAUDE_CLI_MODEL", "claude-sonnet-4-6")
+
+
+class _ClaudeCLICompletionsAdapter:
+    """OpenAI-chat-compatible wrapper over `claude --print`."""
+
+    def __init__(self, model: str):
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        messages = kwargs.get("messages", [])
+        timeout = float(kwargs.get("timeout") or _DEFAULT_AUX_TIMEOUT)
+        model = kwargs.get("model") or self._model
+        if kwargs.get("tools"):
+            logger.debug("Claude CLI auxiliary wrapper ignores tools for text-only side tasks")
+        return _call_claude_cli_from_messages(messages, model, timeout)
+
+
+class _ClaudeCLIChatShim:
+    def __init__(self, model: str):
+        self.completions = _ClaudeCLICompletionsAdapter(model)
+
+
+class ClaudeCLIAuxiliaryClient:
+    def __init__(self, model: str):
+        self.model = model
+        self.chat = _ClaudeCLIChatShim(model)
+
+
+class _AsyncClaudeCLICompletionsAdapter:
+    def __init__(self, sync_client: ClaudeCLIAuxiliaryClient):
+        self._sync = sync_client
+
+    async def create(self, **kwargs) -> Any:
+        return await asyncio.to_thread(self._sync.chat.completions.create, **kwargs)
+
+
+class _AsyncClaudeCLIChatShim:
+    def __init__(self, sync_client: ClaudeCLIAuxiliaryClient):
+        self.completions = _AsyncClaudeCLICompletionsAdapter(sync_client)
+
+
+class AsyncClaudeCLIAuxiliaryClient:
+    def __init__(self, sync_client: ClaudeCLIAuxiliaryClient):
+        self._sync = sync_client
+        self.model = sync_client.model
+        self.chat = _AsyncClaudeCLIChatShim(sync_client)
+
+
+class _AsyncClaudeCodeMCPBridgeCompletions:
+    """Async wrapper over _MCPBridgeShim.create()."""
+    def __init__(self, sync_shim):
+        self._sync = sync_shim
+
+    async def create(self, **kwargs) -> Any:
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncClaudeCodeMCPBridgeChat:
+    def __init__(self, sync_shim):
+        self.completions = _AsyncClaudeCodeMCPBridgeCompletions(sync_shim)
+
+
+class AsyncClaudeCodeMCPBridgeClient:
+    """Async-compatible wrapper for ClaudeCodeMCPBridge via _MCPBridgeShim."""
+    def __init__(self, sync_shim):
+        self._sync = sync_shim
+        self.api_key = sync_shim.api_key
+        self.base_url = sync_shim.base_url
+        self.chat = _AsyncClaudeCodeMCPBridgeChat(sync_shim)
 
 
 def _to_openai_base_url(base_url: str) -> str:
@@ -1051,12 +1129,110 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
 
 
+def _try_claude_cli() -> Tuple[Optional[Any], Optional[str]]:
+    """Use local Claude CLI (`claude -p`) as an auxiliary backend when available."""
+    cli_path = _find_claude_cli_path()
+    if not cli_path:
+        return None, None
+    try:
+        from agent.anthropic_adapter import read_claude_code_credentials, is_claude_code_token_valid
+
+        creds = read_claude_code_credentials()
+        if not creds:
+            return None, None
+        if not is_claude_code_token_valid(creds) and not creds.get("refreshToken"):
+            return None, None
+    except Exception as exc:
+        logger.debug("Auxiliary client: Claude CLI credentials unavailable: %s", exc)
+        return None, None
+
+    model = _CLAUDE_CLI_AUX_MODEL
+    return ClaudeCLIAuxiliaryClient(model), model
+
+
+def _try_claude_code_mcp() -> Tuple[Optional[Any], Optional[str]]:
+    """Use Claude Code as an MCP server with tool calling via the sampling protocol."""
+    if not _MCP_AVAILABLE:
+        return None, None
+    cli_path = _find_claude_cli_path()
+    if not cli_path:
+        return None, None
+    try:
+        from agent.anthropic_adapter import read_claude_code_credentials, is_claude_code_token_valid
+
+        creds = read_claude_code_credentials()
+        if not creds:
+            return None, None
+        if not is_claude_code_token_valid(creds) and not creds.get("refreshToken"):
+            return None, None
+    except Exception as exc:
+        logger.debug("Auxiliary client: Claude Code MCP credentials unavailable: %s", exc)
+        return None, None
+
+    model = _CLAUDE_CLI_AUX_MODEL
+    # Wrap ClaudeCodeMCPBridge in a ClaudeCLIAuxiliaryClient-compatible shim
+    bridge = ClaudeCodeMCPBridge(claude_cli_path=cli_path, model=model, verbose=False)
+
+    class _MCPBridgeCompletions:
+        """Exposes .create() matching call_llm's client.chat.completions.create() interface."""
+        def __init__(self, mcp_bridge):
+            self._bridge = mcp_bridge
+
+        def create(self, **kwargs):
+            messages = kwargs.get("messages", [])
+            max_tokens = kwargs.get("max_tokens") or 4096
+            tools = kwargs.get("tools")
+
+            # Build a simple text prompt from messages for non-tool-call flows
+            from agent.claude_cli_helper import _messages_to_prompt
+            prompt = _messages_to_prompt(messages)
+
+            # ClaudeCodeMCPBridge uses the sampling protocol internally
+            # when tools are provided; this shim currently handles text-only.
+            if not tools:
+                result = self._bridge.chat(prompt)
+                from types import SimpleNamespace
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        message=SimpleNamespace(content=result),
+                        finish_reason="stop",
+                        index=0,
+                    )],
+                    model=self._bridge.model,
+                    usage=None,
+                )
+            else:
+                # With tools: use the sampling path via _call_claude_cli_from_messages
+                # (ClaudeCodeMCPBridge's tool-call flow requires async integration)
+                return _call_claude_cli_from_messages(messages, self._bridge.model, 120.0)
+
+    class _MCPBridgeChat:
+        def __init__(self, mcp_bridge):
+            self.completions = _MCPBridgeCompletions(mcp_bridge)
+
+    class _MCPBridgeShim:
+        """Exposes .chat.completions.create() for call_llm compatibility."""
+        def __init__(self, mcp_bridge):
+            self._bridge = mcp_bridge
+            self.api_key = "claude-code-mcp"
+            self.base_url = "claude-code-mcp://"
+            self.chat = _MCPBridgeChat(mcp_bridge)
+
+        def close(self):
+            self._bridge.close()
+
+    shim = _MCPBridgeShim(bridge)
+    return shim, model
+
+
 _AUTO_PROVIDER_LABELS = {
     "_try_openrouter": "openrouter",
     "_try_nous": "nous",
     "_try_custom_endpoint": "local/custom",
     "_try_codex": "openai-codex",
     "_resolve_api_key_provider": "api-key",
+    "_try_claude_cli": "claude-cli",
+    "_try_claude_code_mcp": "claude-code-mcp",
 }
 
 _AGGREGATOR_PROVIDERS = frozenset({"openrouter", "nous"})
@@ -1091,6 +1267,8 @@ def _get_provider_chain() -> List[tuple]:
         ("local/custom", _try_custom_endpoint),
         ("openai-codex", _try_codex),
         ("api-key", _resolve_api_key_provider),
+        ("claude-cli", _try_claude_cli),
+        ("claude-code-mcp", _try_claude_code_mcp),
     ]
 
 
@@ -1164,7 +1342,8 @@ def _try_payment_fallback(
     # Map common resolved_provider values back to chain labels.
     _alias_to_label = {"openrouter": "openrouter", "nous": "nous",
                        "openai-codex": "openai-codex", "codex": "openai-codex",
-                       "custom": "local/custom", "local/custom": "local/custom"}
+                       "custom": "local/custom", "local/custom": "local/custom",
+                       "claude-cli": "claude-cli"}
     skip_chain_labels = {_alias_to_label.get(s, s) for s in skip_labels}
 
     tried = []
@@ -1288,6 +1467,11 @@ def _to_async_client(sync_client, model: str):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, ClaudeCLIAuxiliaryClient):
+        return AsyncClaudeCLIAuxiliaryClient(sync_client), model
+    # Check for the _MCPBridgeShim used by claude-code-mcp
+    if getattr(sync_client, "_bridge", None) is not None:
+        return AsyncClaudeCodeMCPBridgeClient(sync_client), model
     try:
         from agent.copilot_acp_client import CopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
@@ -1345,6 +1529,7 @@ def resolve_provider_client(
             "openrouter", "nous", "openai-codex" (or "codex"),
             "zai", "kimi-coding", "minimax", "minimax-cn",
             "custom" (OPENAI_BASE_URL + OPENAI_API_KEY),
+            "claude-cli" (local Claude Code CLI wrapper),
             "auto" (full auto-detection chain).
         model: Model slug override.  If None, uses the provider's default
                auxiliary model.
@@ -1459,6 +1644,33 @@ def resolve_provider_client(
         if client is None:
             logger.warning("resolve_provider_client: openai-codex requested "
                            "but no Codex OAuth token found (run: hermes model)")
+            return None, None
+        final_model = _normalize_resolved_model(model or default, provider)
+        return (_to_async_client(client, final_model) if async_mode
+                else (client, final_model))
+
+    # ── Local Claude CLI wrapper ──────────────────────────────────────
+    if provider == "claude-cli":
+        client, default = _try_claude_cli()
+        if client is None:
+            logger.warning(
+                "resolve_provider_client: claude-cli requested but local Claude CLI "
+                "or Claude Code credentials are unavailable"
+            )
+            return None, None
+        final_model = _normalize_resolved_model(model or default, provider)
+        client.model = final_model
+        return (_to_async_client(client, final_model) if async_mode
+                else (client, final_model))
+
+    # ── Claude Code MCP bridge (tool-calling via sampling protocol) ───
+    if provider == "claude-code-mcp":
+        client, default = _try_claude_code_mcp()
+        if client is None:
+            logger.warning(
+                "resolve_provider_client: claude-code-mcp requested but Claude Code "
+                "MCP bridge is unavailable (check: claude CLI path + credentials)"
+            )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model) if async_mode
