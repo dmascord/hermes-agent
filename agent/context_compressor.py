@@ -46,11 +46,11 @@ SUMMARY_PREFIX = (
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
 # Minimum tokens for the summary output
-_MIN_SUMMARY_TOKENS = 2000
+_MIN_SUMMARY_TOKENS = 1500  # Reduced from 2000 for more aggressive compression
 # Proportion of compressed content to allocate for summary
-_SUMMARY_RATIO = 0.20
+_SUMMARY_RATIO = 0.15  # Reduced from 0.20 for more aggressive compression
 # Absolute ceiling for summary tokens (even on very large context windows)
-_SUMMARY_TOKENS_CEILING = 12_000
+_SUMMARY_TOKENS_CEILING = 10_000  # Reduced from 12_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -58,6 +58,15 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+
+# Enhanced compression thresholds (configurable via config.yaml)
+_AGGRESSIVE_COMPRESSION_THRESHOLD = 0.40  # Start compression at 40% context
+_ULTRA_COMPRESSION_THRESHOLD = 0.35  # Ultra mode at 35% context
+_LIGHT_COMPRESSION_THRESHOLD = 0.60  # Light mode at 60% context
+
+# Cache integration for summarization results
+_SUMMARY_CACHE_ENABLED = True
+_SUMMARY_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
@@ -227,6 +236,19 @@ class ContextCompressor(ContextEngine):
             MINIMUM_CONTEXT_LENGTH,
         )
 
+    # Compression mode presets
+    COMPRESSION_MODE_LIGHT = "light"
+    COMPRESSION_MODE_balanced = "balanced"  # default
+    COMPRESSION_MODE_AGGRESSIVE = "aggressive"
+    COMPRESSION_MODE_ULTRA = "ultra"
+
+    COMPRESSION_PRESETS = {
+        COMPRESSION_MODE_LIGHT: {"threshold": 0.60, "summary_ratio": 0.25},
+        COMPRESSION_MODE_balanced: {"threshold": 0.50, "summary_ratio": 0.20},
+        COMPRESSION_MODE_AGGRESSIVE: {"threshold": 0.40, "summary_ratio": 0.15},
+        COMPRESSION_MODE_ULTRA: {"threshold": 0.35, "summary_ratio": 0.12},
+    }
+
     def __init__(
         self,
         model: str,
@@ -241,6 +263,7 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
+        compression_mode: str = COMPRESSION_MODE_balanced,
     ):
         self.model = model
         self.base_url = base_url
@@ -250,8 +273,15 @@ class ContextCompressor(ContextEngine):
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
-        self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
+        self.summary_target_ratio = max(0.05, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
+        self.compression_mode = compression_mode
+
+        # Derive preset settings if compression_mode is specified
+        if compression_mode != self.COMPRESSION_MODE_balanced and compression_mode in self.COMPRESSION_PRESETS:
+            preset = self.COMPRESSION_PRESETS[compression_mode]
+            self.threshold_percent = preset["threshold"]
+            self.summary_target_ratio = preset["summary_ratio"]
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -263,7 +293,7 @@ class ContextCompressor(ContextEngine):
         # compression on large-context models at 50% while keeping the % sane
         # for models right at the minimum.
         self.threshold_tokens = max(
-            int(self.context_length * threshold_percent),
+            int(self.context_length * self.threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
         self.compression_count = 0
@@ -279,10 +309,10 @@ class ContextCompressor(ContextEngine):
             logger.info(
                 "Context compressor initialized: model=%s context_length=%d "
                 "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
-                "provider=%s base_url=%s",
+                "compression_mode=%s provider=%s base_url=%s",
                 model, self.context_length, self.threshold_tokens,
-                threshold_percent * 100, self.summary_target_ratio * 100,
-                self.tail_token_budget,
+                self.threshold_percent * 100, self.summary_target_ratio * 100,
+                self.tail_token_budget, compression_mode,
                 provider or "none", base_url or "none",
             )
         self._context_probed = False  # True after a step-down from context error

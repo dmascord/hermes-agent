@@ -444,7 +444,27 @@ DEFAULT_CONFIG = {
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        # Compression mode: "light" (60%, 25%), "balanced" (50%, 20%), "aggressive" (40%, 15%), "ultra" (35%, 12%)
+        "mode": "balanced",
+    },
 
+    # Persistent KV cache for LLM responses and tool results
+    "cache": {
+        "kv_cache": {
+            "enabled": True,
+            "max_size_mb": 500,        # Maximum cache size in MB
+            "ttl_seconds": 3600,        # Default TTL for cached entries (1 hour)
+        },
+        "code_search": {
+            "enabled": True,
+            "max_files": 10000,         # Maximum number of files to cache
+            "max_size_mb": 200,         # Maximum cache size in MB
+        },
+        "tool_results": {
+            "enabled": True,
+            "max_size_mb": 500,         # Maximum cache size in MB
+            "ttl_seconds": 3600,         # Default TTL for tool results
+        },
     },
 
     # AWS Bedrock provider configuration.
@@ -648,8 +668,9 @@ DEFAULT_CONFIG = {
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).
-        # Set to a provider name to activate: "openviking", "mem0",
+        # Set to a provider name to activate: "local_memory", "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
+        # local_memory is a free, local-only provider with no external dependencies.
         # Only ONE external provider is allowed at a time.
         "provider": "",
     },
