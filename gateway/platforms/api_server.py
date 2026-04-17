@@ -50,6 +50,26 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 # Default settings
+
+
+def _resolve_swarm_model(pool):
+    """Resolve a model from the swarm pool based on selection policy."""
+    import random, os
+    primary = pool.get("primary", "")
+    fallbacks = pool.get("fallbacks", [])
+    policy = pool.get("selection_policy", "cost-balanced")
+    if primary:
+        return primary
+    if not fallbacks:
+        return "openrouter/free"
+    if policy == "round-robin":
+        return fallbacks[0]
+    elif policy == "cost-balanced":
+        cheap = [m for m in fallbacks if any(x in m for x in ["gemma", "free", "nemotron"])]
+        return random.choice(cheap) if cheap else fallbacks[0]
+    return fallbacks[0]
+
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
@@ -57,6 +77,83 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_HISTORY_MESSAGES = 200
+MAX_HISTORY_TEXT_LENGTH = 240_000
+
+
+def _compact_message_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep recent history bounded so provider request bodies stay sane."""
+    if not messages:
+        return []
+
+    trimmed = list(messages[-MAX_HISTORY_MESSAGES:])
+
+    def _msg_cost(msg: Dict[str, Any]) -> int:
+        cost = len(str(msg.get("content") or ""))
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    fn = tc.get("function")
+                    if isinstance(fn, dict):
+                        cost += len(str(fn.get("arguments") or ""))
+        return cost
+
+    total = sum(_msg_cost(msg) for msg in trimmed)
+    if total <= MAX_HISTORY_TEXT_LENGTH:
+        return trimmed
+
+    kept: List[Dict[str, Any]] = []
+    running = 0
+    for msg in reversed(trimmed):
+        cost = _msg_cost(msg)
+        if kept and running + cost > MAX_HISTORY_TEXT_LENGTH:
+            continue
+        kept.append(msg)
+        running += cost
+        if running >= MAX_HISTORY_TEXT_LENGTH:
+            break
+
+    kept.reverse()
+    return kept
+
+
+def _extract_openai_tool_calls(raw_tool_calls: Any) -> List[Dict[str, Any]]:
+    """Normalize OpenAI-style tool_calls from an incoming chat request."""
+    normalized: List[Dict[str, Any]] = []
+    if not isinstance(raw_tool_calls, list):
+        return normalized
+    for tc in raw_tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function")
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        arguments = fn.get("arguments", "{}")
+        if isinstance(arguments, (dict, list)):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        elif not isinstance(arguments, str):
+            arguments = str(arguments)
+        call_id = tc.get("id") or tc.get("call_id")
+        item: Dict[str, Any] = {
+            "type": tc.get("type", "function"),
+            "function": {
+                "name": name.strip(),
+                "arguments": arguments,
+            },
+        }
+        if isinstance(call_id, str) and call_id.strip():
+            item["id"] = call_id.strip()
+            item["call_id"] = call_id.strip()
+        normalized.append(item)
+    return normalized
+
+
+def _is_opencode_user_agent(user_agent: str) -> bool:
+    return isinstance(user_agent, str) and "opencode/" in user_agent.lower()
 
 
 def _normalize_chat_content(
@@ -515,8 +612,16 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        tool_gen_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        provider_mode: bool = False,
+        swarm_mode: bool = False,
+        swarm_model_pool: Optional[Dict[str, Any]] = None,
+        toolset_mode: str = "auto",
+        tools: Optional[list] = None,
+        tool_choice: Optional[str] = None,
+        external_tool_mode: str = "none",
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -531,10 +636,40 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        
+        # Swarm mode: select from free/cheap model pool
+        if swarm_mode and swarm_model_pool:
+            model = _resolve_swarm_model(swarm_model_pool)
+            # Override base_url based on model provider
+            # Most provider/model formats are OpenRouter models
+            if "/" in model and not model.startswith("github-copilot/") and not model.startswith("local/"):
+                runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+                runtime_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
+            elif model.startswith("github-copilot/"):
+                runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
+                runtime_kwargs["api_key"] = os.getenv("GITHUB_COPILOT_API_KEY", "")
+        else:
+            model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        skip_memory = False
+        skip_context_files = False
+        if provider_mode:
+            enabled_toolsets = []
+            skip_memory = True
+            skip_context_files = True
+            if ephemeral_system_prompt is None:
+                ephemeral_system_prompt = "You are a helpful AI assistant."
+        elif toolset_mode == "local":
+            enabled_toolsets = sorted(
+                [t for t in enabled_toolsets if t in ("terminal", "hermes-cli")]
+            )
+        elif toolset_mode == "remote":
+            enabled_toolsets = sorted(
+                [t for t in enabled_toolsets if t in ("web", "skills")]
+            )
+        # "full", "auto" or anything else uses all configured toolsets
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -555,11 +690,23 @@ class APIServerAdapter(BasePlatformAdapter):
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
+            tool_gen_callback=tool_gen_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            skip_memory=skip_memory,
+            skip_context_files=skip_context_files,
+            tools=tools,
+            tool_choice=tool_choice,
         )
+        try:
+            agent._provider_mode = provider_mode
+            agent._tools_from_request = bool(tools)
+            agent._toolset_mode = toolset_mode
+            agent._external_tool_mode = external_tool_mode
+        except Exception:
+            pass
         return agent
 
     # ------------------------------------------------------------------
@@ -608,7 +755,44 @@ class APIServerAdapter(BasePlatformAdapter):
                     "permission": [],
                     "root": self._model_name,
                     "parent": None,
-                }
+                },
+                {
+                    "id": "hermes-code",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "hermes",
+                    "permission": [],
+                    "root": "hermes-code",
+                    "parent": None,
+                    "description": "Routes all tools to client (OpenCode local). Use with tools from OpenCode.",
+                },
+                {
+                    "id": "hermes-agentic-remote",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "hermes",
+                    "permission": [],
+                    "root": "hermes-agentic-remote",
+                    "parent": None,
+                },
+                {
+                    "id": "hermes-agentic-full",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "hermes",
+                    "permission": [],
+                    "root": "hermes-agentic-full",
+                    "parent": None,
+                },
+                {
+                    "id": "hermes-swarm",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "hermes",
+                    "permission": [],
+                    "root": "hermes-swarm",
+                    "parent": None,
+                },
             ],
         })
 
@@ -633,30 +817,56 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = body.get("stream", False)
 
+        # Extract tools from request (passed by OpenCode client)
+        tools = body.get("tools")
+        tool_choice = body.get("tool_choice")
+        user_agent = request.headers.get("User-Agent", "")
+        force_connection_close = _is_opencode_user_agent(user_agent)
+        if isinstance(tools, list):
+            for tool in tools:
+                if isinstance(tool, dict):
+                    tool["_from_client"] = True
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
-        conversation_messages: List[Dict[str, str]] = []
+        conversation_messages: List[Dict[str, Any]] = []
 
         for msg in messages:
             role = msg.get("role", "")
             content = _normalize_chat_content(msg.get("content", ""))
             if role == "system":
-                # Accumulate system messages
                 if system_prompt is None:
                     system_prompt = content
                 else:
                     system_prompt = system_prompt + "\n" + content
-            elif role in ("user", "assistant"):
+            elif role == "assistant":
+                assistant_entry: Dict[str, Any] = {"role": "assistant", "content": content}
+                tool_calls = _extract_openai_tool_calls(msg.get("tool_calls"))
+                if tool_calls:
+                    assistant_entry["tool_calls"] = tool_calls
+                conversation_messages.append(assistant_entry)
+            elif role == "tool":
+                tool_entry: Dict[str, Any] = {"role": "tool", "content": content}
+                tool_call_id = msg.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id.strip():
+                    tool_entry["tool_call_id"] = tool_call_id.strip()
+                conversation_messages.append(tool_entry)
+            elif role == "user":
                 conversation_messages.append({"role": role, "content": content})
 
-        # Extract the last user message as the primary input
         user_message = ""
         history = []
         if conversation_messages:
-            user_message = conversation_messages[-1].get("content", "")
-            history = conversation_messages[:-1]
+            last_message = conversation_messages[-1]
+            if last_message.get("role") == "user":
+                user_message = last_message.get("content", "")
+                history = conversation_messages[:-1]
+            else:
+                user_message = ""
+                history = conversation_messages
+        history = _compact_message_history(history)
 
-        if not user_message:
+        if not user_message and not any(isinstance(m, dict) and m.get("role") == "tool" for m in history):
             return web.json_response(
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
@@ -711,8 +921,44 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        history = _compact_message_history(history)
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
+        _toolset_mode = "auto"
+        _provider_mode = False
+        if model_name == "hermes-agentic-full":
+            _toolset_mode = "full"
+        elif model_name == "hermes-agentic-remote":
+            _toolset_mode = "remote"
+        elif model_name == "hermes-code":
+            _provider_mode = True
+        external_tool_mode = "none"
+        if isinstance(tools, list) and tools:
+            if model_name == "hermes-code":
+                external_tool_mode = "broker"
+            else:
+                external_tool_mode = "inband" if force_connection_close else "broker"
+        logger.info(
+            "[api_server] chat request stream=%s tools=%s external_tool_mode=%s ua=%s model=%s",
+            stream, bool(tools), external_tool_mode, user_agent[:120], model_name,
+        )
+
+        # Hermes-swarm: select free/cheap model pool
+        swarm_mode = False
+        swarm_model_pool = None
+        if model_name == "hermes-swarm":
+            swarm_mode = True
+            swarm_model_pool = {
+                "primary": os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
+                "fallbacks": [
+                    os.getenv("HERMES_SWARM_FALLBACK_1", "openrouter/free"),
+                    os.getenv("HERMES_SWARM_FALLBACK_2", "nvidia/nemotron-nano-9b-v2:free"),
+                    os.getenv("HERMES_SWARM_FALLBACK_3", "google/gemma-4-26b-a4b-it:free"),
+                ],
+                "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
+            }
+        
         created = int(time.time())
 
         if stream:
@@ -761,6 +1007,49 @@ class APIServerAdapter(BasePlatformAdapter):
                     "label": label,
                 }))
 
+            def _on_tool_gen(tool_name: str, call_id: Optional[str] = None, arguments: str = ""):
+                """Emit function_call chunks when the model decides to use a tool."""
+                if not isinstance(call_id, str) or not call_id.strip():
+                    basis = f"{session_id}:{completion_id}:{tool_name}:{arguments or ''}"
+                    call_id = f"call_{hashlib.sha1(basis.encode('utf-8')).hexdigest()[:24]}"
+                if external_tool_mode == "broker":
+                    try:
+                        from gateway.platforms import tool_call_hub
+                        tool_call_hub.register_call(session_id, call_id, tool_name)
+                        logger.info(
+                            "[api_server] registered external tool call session=%s call_id=%s tool=%s",
+                            session_id, call_id, tool_name,
+                        )
+                    except Exception as e:
+                        logger.debug("tool_call_hub.register_call failed: %s", e)
+                tool_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": arguments or "",
+                                },
+                            }],
+                        },
+                        "finish_reason": None,
+                    }],
+                }
+                _stream_q.put(("__tool_call_start__", {
+                    "session_id": session_id,
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "register_with_hub": external_tool_mode == "broker",
+                    "chunk": tool_chunk,
+                }))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             agent_ref = [None]
@@ -771,12 +1060,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
+                tool_gen_callback=_on_tool_gen,
                 agent_ref=agent_ref,
+                toolset_mode=_toolset_mode,
+                provider_mode=_provider_mode,
+                swarm_mode=swarm_mode,
+                swarm_model_pool=swarm_model_pool,
+                tools=tools,
+                tool_choice=tool_choice,
+                external_tool_mode=external_tool_mode,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
+                force_connection_close=force_connection_close,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -786,6 +1084,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                toolset_mode=_toolset_mode,
+                provider_mode=_provider_mode,
+                tools=tools,
+                tool_choice=tool_choice,
+                external_tool_mode=external_tool_mode,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -810,6 +1113,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
         final_response = result.get("final_response", "")
+        if result.get("tool_calls_pending"):
+            last_assistant = None
+            for msg in reversed(result.get("messages", [])):
+                if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    last_assistant = msg
+                    break
+            response_data = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": (last_assistant or {}).get("content", "") if last_assistant else "",
+                            "tool_calls": (last_assistant or {}).get("tool_calls", []) if last_assistant else [],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
+            headers = {"X-Hermes-Session-Id": session_id}
+            if force_connection_close:
+                headers["Connection"] = "close"
+            return web.json_response(response_data, headers=headers)
         if not final_response:
             final_response = result.get("error", "(No response generated)")
 
@@ -835,11 +1170,15 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        headers = {"X-Hermes-Session-Id": session_id}
+        if force_connection_close:
+            headers["Connection"] = "close"
+        return web.json_response(response_data, headers=headers)
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
+        force_connection_close: bool = False,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -862,6 +1201,8 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers.update(cors)
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
+        if force_connection_close:
+            sse_headers["Connection"] = "close"
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
@@ -887,18 +1228,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    event_data = json.dumps(item[1])
-                    await response.write(
-                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
-                    )
-                else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                if isinstance(item, tuple) and len(item) == 2:
+                    tag, payload = item
+                    if tag == "__tool_progress__":
+                        event_data = json.dumps(payload)
+                        await response.write(
+                            f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                        )
+                        return time.monotonic()
+                    if tag == "__tool_call_start__":
+                        try:
+                            logger.info(
+                                "[api_server] emitting tool call SSE session=%s call_id=%s tool=%s",
+                                payload.get("session_id", session_id), payload.get("call_id"), payload.get("tool_name"),
+                            )
+                            if payload.get("session_id") and payload.get("register_with_hub"):
+                                from gateway.platforms import tool_call_hub
+                                tool_call_hub.register_call(
+                                    payload.get("session_id", session_id), payload.get("call_id"), payload.get("tool_name"),
+                                )
+                        except Exception:
+                            pass
+                        chunk = payload.get("chunk")
+                        if isinstance(chunk, dict):
+                            await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                            return time.monotonic()
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -930,9 +1290,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            finish_reason = "stop"
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                if isinstance(result, dict) and result.get("tool_calls_pending"):
+                    finish_reason = "tool_calls"
             except Exception:
                 pass
 
@@ -940,7 +1303,7 @@ class APIServerAdapter(BasePlatformAdapter):
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 "usage": {
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),
@@ -1414,6 +1777,12 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation = body.get("conversation")
         store = body.get("store", True)
 
+        # Extract tools from request and mark them as from client
+        tools = body.get("tools")
+        if tools:
+            for tool in tools:
+                tool["_from_client"] = True
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
@@ -1484,6 +1853,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("truncation") == "auto" and len(conversation_history) > 100:
             conversation_history = conversation_history[-100:]
 
+        # Compact message history to keep request bodies bounded
+        conversation_history = _compact_message_history(conversation_history)
+
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
@@ -1540,6 +1912,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                toolset_mode="auto",
+                provider_mode=True,
+                tools=tools,
             ))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -1568,6 +1943,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                toolset_mode="auto",
+                provider_mode=True,
+                tools=tools,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1989,9 +2367,17 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        tool_gen_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        toolset_mode: str = "auto",
+        provider_mode: bool = False,
+        swarm_mode: bool = False,
+        swarm_model_pool = None,
+        tools: Optional[list] = None,
+        tool_choice: Optional[str] = None,
+        external_tool_mode: str = "none",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2007,13 +2393,38 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
+            generated_tool_calls: List[Dict[str, Any]] = []
+
+            def _wrapped_tool_gen_callback(tool_name: str, call_id: Optional[str] = None, arguments: str = ""):
+                generated_tool_calls.append({
+                    "id": call_id or "",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": arguments or "",
+                    },
+                })
+                if tool_gen_callback:
+                    try:
+                        tool_gen_callback(tool_name, call_id=call_id, arguments=arguments)
+                    except Exception:
+                        pass
+
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
+                tool_gen_callback=_wrapped_tool_gen_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                toolset_mode=toolset_mode,
+                provider_mode=provider_mode,
+                swarm_mode=swarm_mode,
+                swarm_model_pool=swarm_model_pool,
+                tools=tools,
+                tool_choice=tool_choice,
+                external_tool_mode=external_tool_mode,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -2022,6 +2433,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 task_id="default",
             )
+            if (
+                isinstance(result, dict)
+                and generated_tool_calls
+                and getattr(agent, "_external_tool_mode", "none") in ("broker", "inband")
+            ):
+                messages = list(result.get("messages", []))
+                has_tool_calls = any(
+                    isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls")
+                    for msg in messages
+                )
+                if not has_tool_calls:
+                    messages.append({
+                        "role": "assistant",
+                        "content": result.get("final_response", "") or "",
+                        "tool_calls": generated_tool_calls,
+                    })
+                    result["messages"] = messages
+                result["tool_calls_pending"] = True
+                result["finish_reason"] = "tool_calls"
+                result["completed"] = False
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -2299,6 +2730,43 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_streams.pop(run_id, None)
                 self._run_streams_created.pop(run_id, None)
 
+    async def _handle_tool_responses(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/tool_responses — ingest client tool results."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = (request.match_info.get("session_id") or "").strip()
+        if not session_id:
+            return web.json_response({"error": "Missing session_id in path"}, status=400)
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
+
+        call_id = body.get("call_id")
+        status = body.get("status")
+        result = body.get("result")
+
+        if not isinstance(call_id, str) or not call_id.strip():
+            return web.json_response({"error": "Missing or invalid 'call_id'"}, status=400)
+        if status not in ("ok", "error"):
+            return web.json_response({"error": "'status' must be 'ok' or 'error'"}, status=400)
+
+        try:
+            from gateway.platforms import tool_call_hub
+            tool_call_hub.set_response(session_id, call_id, status, result)
+            logger.info(
+                "[api_server] ingested tool response session=%s call_id=%s status=%s",
+                session_id, call_id, status,
+            )
+        except Exception as e:
+            logger.error("Failed to set tool response: %s", e, exc_info=True)
+            return web.json_response({"error": "Internal server error"}, status=500)
+
+        return web.json_response({"ok": True}, status=200)
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -2333,6 +2801,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/v1/sessions/{session_id}/tool_responses", self._handle_tool_responses)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

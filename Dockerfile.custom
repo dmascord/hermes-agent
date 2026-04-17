@@ -1,0 +1,58 @@
+FROM python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV HERMES_HOME=/home/tusker/.hermes
+ENV HOME=/home/tusker
+ENV PATH="/srv/opencode/hermes-venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/games"
+
+# Hermes-Swarm Free Models Configuration
+ENV HERMES_SWARM_PRIMARY_MODEL=openrouter/free
+ENV HERMES_SWARM_FALLBACK_1=nvidia/nemotron-nano-9b-v2:free
+ENV HERMES_SWARM_FALLBACK_2=google/gemma-4-26b-a4b-it:free
+ENV HERMES_SWARM_FALLBACK_3=github-copilot/gpt-5-mini
+ENV HERMES_SWARM_SELECTION_POLICY=cost-balanced
+ENV HERMES_SWARM_MAX_TOKENS=4000
+ENV HERMES_SWARM_DAILY_TOKEN_LIMIT=50000
+
+# Install system deps (include curl/wget/jq/ca-certificates and adduser)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential nodejs npm python3 ripgrep ffmpeg gcc python3-dev \
+    libffi-dev procps curl jq wget ca-certificates adduser && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV CLAUDE_CLI_PATH=/usr/local/bin/claude
+
+# Create runtime user
+RUN adduser --disabled-password --uid 1000 --gecos "" tusker || true
+
+# Copy source
+COPY --chown=tusker:tusker . /srv/opencode/hermes-agent
+WORKDIR /srv/opencode/hermes-agent
+
+# Create venv and install deps
+RUN python3 -m venv /srv/opencode/hermes-venv && \
+    /srv/opencode/hermes-venv/bin/pip install --no-cache-dir -e ".[all]"
+
+# Create Hermes home dir and keep legacy hermes-data path aliased to it
+RUN mkdir -p /home/tusker/.hermes && \
+    rm -rf /home/tusker/hermes-data && \
+    ln -s /home/tusker/.hermes /home/tusker/hermes-data && \
+    chown -R 1000:1000 /home/tusker || mkdir -p /home/tusker/.hermes
+
+# Install Claude binary explicitly into /usr/local/bin (final step)
+# Doing this late reduces the chance of later steps removing it.
+RUN set -eux; \
+    GCS_BUCKET="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"; \
+    VERSION=$(curl -fsSL "$GCS_BUCKET/latest"); \
+    PLATFORM="linux-x64"; \
+    echo "Downloading claude $VERSION $PLATFORM"; \
+    curl -fsSL -o /usr/local/bin/claude "$GCS_BUCKET/$VERSION/$PLATFORM/claude"; \
+    chmod +x /usr/local/bin/claude; \
+    ls -la /usr/local/bin/claude; \
+    /usr/local/bin/claude --version || true
+
+USER root
+
+EXPOSE 8642
+
+CMD ["python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]

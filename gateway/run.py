@@ -340,8 +340,14 @@ def _resolve_runtime_agent_kwargs() -> dict:
     )
 
     try:
+        requested_provider = os.getenv("HERMES_INFERENCE_PROVIDER")
+        if not requested_provider:
+            cfg = _load_gateway_config()
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            if isinstance(model_cfg, dict):
+                requested_provider = str(model_cfg.get("provider") or "").strip() or None
         runtime = resolve_runtime_provider(
-            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            requested=requested_provider,
         )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
