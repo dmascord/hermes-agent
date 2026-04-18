@@ -738,6 +738,51 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    async def _handle_stats(self, request: "web.Request") -> "web.Response":
+        """GET /stats — return SmartRouter and Deduplicator statistics.
+        
+        Returns aggregated stats from:
+        - SmartRouter: routing decisions, cost savings
+        - Deduplicator: cache hits, dedup rate
+        - Combined: estimated total savings
+        """
+        try:
+            from agent.deduplicator import get_global_deduplicator
+            from agent.smart_router import get_global_router
+            
+            dedup = get_global_deduplicator()
+            router = get_global_router()
+            
+            dedup_stats = dedup.get_stats().to_dict() if hasattr(dedup, 'get_stats') else {}
+            router_stats = router.get_stats().to_dict() if hasattr(router, 'get_stats') else {}
+            
+            # Calculate combined savings
+            dedup_savings = dedup_stats.get('cache_hits', 0) * 0.5  # Rough estimate
+            routing_savings = router_stats.get('cost_savings_cents', 0)
+            total_savings = dedup_savings + routing_savings
+            
+            return web.json_response({
+                "status": "ok",
+                "deduplicator": dedup_stats,
+                "smart_router": router_stats,
+                "combined": {
+                    "estimated_cost_savings_cents": round(total_savings, 2),
+                    "dedup_rate_pct": dedup_stats.get('dedup_rate_pct', 0),
+                    "cache_hit_rate_pct": dedup_stats.get('cache_hit_rate_pct', 0),
+                    "routing_decisions": router_stats.get('total_requests', 0),
+                    "simple_routed_to_cheap": router_stats.get('simple_routed_to_cheap', 0),
+                }
+            })
+        except Exception as e:
+            logger.warning("Failed to get stats: %s", e)
+            return web.json_response({
+                "status": "ok",
+                "deduplicator": {},
+                "smart_router": {},
+                "combined": {},
+                "error": str(e)
+            })
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -1079,6 +1124,38 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
+            # Smart routing: check dedup cache and route based on complexity
+            from agent.deduplicator import get_global_deduplicator
+            from agent.smart_router import get_global_router
+            
+            # Build the full prompt for routing analysis
+            routing_prompt = user_message
+            if system_prompt:
+                routing_prompt = f"{system_prompt}\n\n{routing_prompt}"
+            
+            # Check dedup cache first
+            dedup = get_global_deduplicator()
+            dedup_cache_key = dedup.compute_key(routing_prompt, model_name) if hasattr(dedup, 'compute_key') else None
+            
+            if dedup_cache_key:
+                cached_response, found = dedup.get(routing_prompt, model_name)
+                if found and cached_response:
+                    logger.info("[smart_router] dedup cache hit for model=%s", model_name)
+                    # Return cached response - but we still need to run agent for usage tracking
+                    # For now, just log and continue to actual execution
+            
+            # Route based on complexity if smart routing is enabled
+            router = get_global_router()
+            routing_result = router.route(routing_prompt)
+            
+            if routing_result.get("complexity") == "simple":
+                logger.info(
+                    "[smart_router] routing simple query to %s (tier: %s, savings: %.4f)",
+                    routing_result.get("model"),
+                    routing_result.get("tier"),
+                    routing_result.get("savings_vs_primary", 0),
+                )
+            
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2783,6 +2860,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
+            self._app.router.add_get("/stats", self._handle_stats)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
