@@ -152,6 +152,40 @@ def _extract_openai_tool_calls(raw_tool_calls: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _enrich_client_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure client-visible tool calls satisfy strict downstream schemas."""
+    if not isinstance(tc, dict):
+        return tc
+    fn = tc.get("function")
+    if not isinstance(fn, dict):
+        return tc
+    name = fn.get("name")
+    arguments = fn.get("arguments", "{}")
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except Exception:
+            return tc
+    elif isinstance(arguments, dict):
+        parsed = dict(arguments)
+    else:
+        return tc
+
+    if name in {"bash", "terminal"} and "description" not in parsed:
+        cmd = parsed.get("command", "")
+        parsed["description"] = f"Execute command: {str(cmd)[:100]}"
+
+    fn["arguments"] = json.dumps(parsed, ensure_ascii=False)
+    tc["function"] = fn
+    return tc
+
+
+def _enrich_client_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+    if not isinstance(tool_calls, list):
+        return []
+    return [_enrich_client_tool_call(dict(tc)) for tc in tool_calls if isinstance(tc, dict)]
+
+
 def _is_opencode_user_agent(user_agent: str) -> bool:
     return isinstance(user_agent, str) and "opencode/" in user_agent.lower()
 
@@ -648,6 +682,11 @@ class APIServerAdapter(BasePlatformAdapter):
             elif model.startswith("github-copilot/"):
                 runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
                 runtime_kwargs["api_key"] = os.getenv("GITHUB_COPILOT_API_KEY", "")
+        elif provider_mode:
+            # OpenCode routes hermes-code through provider mode. Keep the
+            # requested hermes-code model stable even when there is no gateway
+            # config model.default configured.
+            model = os.getenv("HERMES_CODE_MODEL", "").strip() or _resolve_gateway_model()
         else:
             model = _resolve_gateway_model()
 
@@ -911,16 +950,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 history = conversation_messages
         history = _compact_message_history(history)
 
-        # Tool loop prevention: reject requests with only tool results
-        # (no new user message and last message is a tool result)
+        # Tool loop prevention: allow legitimate OpenAI tool continuation
+        # (assistant tool_calls -> tool results), but reject orphaned tool-only
+        # continuations that have no preceding assistant tool call context.
         has_user_msg = bool(user_message and user_message.strip())
-        is_tool_result_only = (
+        is_tool_result_only = bool(
             conversation_messages and
             conversation_messages[-1].get("role") == "tool"
         )
-        if is_tool_result_only and not has_user_msg:
+        last_non_tool = None
+        if is_tool_result_only:
+            for msg in reversed(conversation_messages[:-1]):
+                if isinstance(msg, dict) and msg.get("role") != "tool":
+                    last_non_tool = msg
+                    break
+        has_assistant_tool_context = bool(
+            isinstance(last_non_tool, dict)
+            and last_non_tool.get("role") == "assistant"
+            and isinstance(last_non_tool.get("tool_calls"), list)
+            and last_non_tool.get("tool_calls")
+        )
+        if is_tool_result_only and not has_user_msg and not has_assistant_tool_context:
             return web.json_response(
-                {"error": {"message": "Cannot continue with only tool results. Include a user message to continue.", "type": "invalid_request_error"}},
+                {"error": {"message": "Cannot continue with orphaned tool results. Include a user message, or send the preceding assistant tool_calls in the conversation.", "type": "invalid_request_error"}},
                 status=400,
             )
 
@@ -1214,7 +1266,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message": {
                             "role": "assistant",
                             "content": (last_assistant or {}).get("content", "") if last_assistant else "",
-                            "tool_calls": (last_assistant or {}).get("tool_calls", []) if last_assistant else [],
+                            "tool_calls": _enrich_client_tool_calls((last_assistant or {}).get("tool_calls", [])) if last_assistant else [],
                         },
                         "finish_reason": "tool_calls",
                     }
@@ -2480,14 +2532,14 @@ class APIServerAdapter(BasePlatformAdapter):
             generated_tool_calls: List[Dict[str, Any]] = []
 
             def _wrapped_tool_gen_callback(tool_name: str, call_id: Optional[str] = None, arguments: str = ""):
-                generated_tool_calls.append({
+                generated_tool_calls.append(_enrich_client_tool_call({
                     "id": call_id or "",
                     "type": "function",
                     "function": {
                         "name": tool_name,
                         "arguments": arguments or "",
                     },
-                })
+                }))
                 if tool_gen_callback:
                     try:
                         tool_gen_callback(tool_name, call_id=call_id, arguments=arguments)
@@ -2531,7 +2583,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     messages.append({
                         "role": "assistant",
                         "content": result.get("final_response", "") or "",
-                        "tool_calls": generated_tool_calls,
+                        "tool_calls": _enrich_client_tool_calls(generated_tool_calls),
                     })
                     result["messages"] = messages
                 result["tool_calls_pending"] = True
