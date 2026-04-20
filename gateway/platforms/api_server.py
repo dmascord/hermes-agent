@@ -1912,6 +1912,7 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = body.get("store", True)
+        tool_choice = body.get("tool_choice")
 
         # Extract tools from request and mark them as from client
         tools = body.get("tools")
@@ -1996,6 +1997,37 @@ class APIServerAdapter(BasePlatformAdapter):
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
 
+        model_name = body.get("model", self._model_name)
+        _toolset_mode = "auto"
+        _provider_mode = False
+        if model_name == "hermes-agentic-full":
+            _toolset_mode = "full"
+        elif model_name == "hermes-agentic-remote":
+            _toolset_mode = "remote"
+        elif model_name == "hermes-code":
+            _provider_mode = True
+
+        swarm_mode = False
+        swarm_model_pool = None
+        if model_name == "hermes-swarm":
+            swarm_mode = True
+            swarm_model_pool = {
+                "primary": os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
+                "fallbacks": [
+                    os.getenv("HERMES_SWARM_FALLBACK_1", "openrouter/free"),
+                    os.getenv("HERMES_SWARM_FALLBACK_2", "nvidia/nemotron-nano-9b-v2:free"),
+                    os.getenv("HERMES_SWARM_FALLBACK_3", "google/gemma-4-26b-a4b-it:free"),
+                ],
+                "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
+            }
+
+        external_tool_mode = "none"
+        if isinstance(tools, list) and tools:
+            if model_name == "hermes-code":
+                external_tool_mode = "broker"
+            else:
+                external_tool_mode = "broker"
+
         stream = bool(body.get("stream", False))
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
@@ -2048,13 +2080,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
-                toolset_mode="auto",
-                provider_mode=True,
+                toolset_mode=_toolset_mode,
+                provider_mode=_provider_mode,
+                swarm_mode=swarm_mode,
+                swarm_model_pool=swarm_model_pool,
                 tools=tools,
+                tool_choice=tool_choice,
+                external_tool_mode=external_tool_mode,
             ))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
-            model_name = body.get("model", self._model_name)
             created_at = int(time.time())
 
             return await self._write_sse_responses(
@@ -2079,9 +2114,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
-                toolset_mode="auto",
-                provider_mode=True,
+                toolset_mode=_toolset_mode,
+                provider_mode=_provider_mode,
+                swarm_mode=swarm_mode,
+                swarm_model_pool=swarm_model_pool,
                 tools=tools,
+                tool_choice=tool_choice,
+                external_tool_mode=external_tool_mode,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
