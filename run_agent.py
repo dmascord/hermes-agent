@@ -78,6 +78,11 @@ from hermes_constants import OPENROUTER_BASE_URL
 from agent.memory_manager import build_memory_context_block
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
+from agent.model_cooldown_db import (
+    clear_model_cooldown,
+    model_cooldown_remaining,
+    record_model_cooldown,
+)
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -5815,10 +5820,41 @@ class AIAgent:
                 "Fallback activated: %s → %s (%s)",
                 old_model, fb_model, fb_provider,
             )
-            return True
         except Exception as e:
             logging.error("Failed to activate fallback %s: %s", fb_model, e)
             return self._try_activate_fallback()  # try next in chain
+
+        return True
+
+    def _current_model_cooldown_remaining(self) -> Optional[float]:
+        provider = str(getattr(self, "provider", "") or "").strip()
+        model = str(getattr(self, "model", "") or "").strip()
+        base_url = str(getattr(self, "base_url", "") or "").strip()
+        if not provider or not model:
+            return None
+        return model_cooldown_remaining(provider, model, base_url=base_url)
+
+    def _record_current_model_cooldown(self, cooldown_seconds: float, *, reason: str = "") -> None:
+        provider = str(getattr(self, "provider", "") or "").strip()
+        model = str(getattr(self, "model", "") or "").strip()
+        base_url = str(getattr(self, "base_url", "") or "").strip()
+        if not provider or not model or cooldown_seconds <= 0:
+            return
+        record_model_cooldown(
+            provider,
+            model,
+            base_url=base_url,
+            cooldown_until=time.time() + float(cooldown_seconds),
+            reason=reason,
+        )
+
+    def _clear_current_model_cooldown(self) -> None:
+        provider = str(getattr(self, "provider", "") or "").strip()
+        model = str(getattr(self, "model", "") or "").strip()
+        base_url = str(getattr(self, "base_url", "") or "").strip()
+        if not provider or not model:
+            return
+        clear_model_cooldown(provider, model, base_url=base_url)
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
@@ -8498,6 +8534,31 @@ class AIAgent:
 
             while retry_count < max_retries:
                 try:
+                    _cooldown_remaining = self._current_model_cooldown_remaining()
+                    if _cooldown_remaining and _cooldown_remaining > 0:
+                        self._emit_status(
+                            f"⏳ Skipping cooled-down model {self.model} via {self.provider} "
+                            f"({_cooldown_remaining:.0f}s remaining)"
+                        )
+                        if self._try_activate_fallback():
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
+                        _cooldown_summary = (
+                            f"Model {self.model} via {self.provider} is cooling down for another "
+                            f"{int(_cooldown_remaining)} seconds and no fallback provider/model is available."
+                        )
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": _cooldown_summary,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _cooldown_summary,
+                        }
+
                     self._reset_stream_delivery_tracking()
                     api_kwargs = self._build_api_kwargs(api_messages)
                     if self._force_ascii_payload:
@@ -8570,6 +8631,7 @@ class AIAgent:
                         response = self._interruptible_api_call(api_kwargs)
                     
                     api_duration = time.time() - api_start_time
+                    self._clear_current_model_cooldown()
                     
                     # Stop thinking spinner silently -- the response box or tool
                     # execution messages that follow are more informative.
@@ -9801,6 +9863,11 @@ class AIAgent:
                                     _retry_after = max(1, int(float(_ra_raw)))
                                 except (TypeError, ValueError):
                                     pass
+                    if is_rate_limited and _retry_after:
+                        self._record_current_model_cooldown(
+                            _retry_after,
+                            reason=self._summarize_api_error(api_error),
+                        )
                     if is_rate_limited and _retry_after and _retry_after > 5:
                         self._emit_status(
                             f"⚠️ Upstream requested a long cooldown ({_retry_after}s) — trying fallback/provider failover before waiting..."
