@@ -186,6 +186,49 @@ def _enrich_client_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
     return [_enrich_client_tool_call(dict(tc)) for tc in tool_calls if isinstance(tc, dict)]
 
 
+def _fallback_provider_for_model(model_id: str) -> tuple[str, str]:
+    raw = str(model_id or "").strip()
+    if not raw:
+        return "", ""
+    if "/" not in raw:
+        return "openrouter", raw
+
+    prefix, rest = raw.split("/", 1)
+    prefix = prefix.strip().lower()
+    rest = rest.strip()
+    if prefix == "openai":
+        return "openai-codex", raw
+    if prefix in {"github-copilot", "opencode-go", "opencode-zen"}:
+        return prefix, raw
+    if prefix == "openrouter":
+        return "openrouter", rest
+    return "openrouter", raw
+
+
+def _build_env_fallback_chain(prefix: str) -> List[Dict[str, Any]]:
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    chain: List[Dict[str, Any]] = []
+    for idx in range(1, 33):
+        raw_model = os.getenv(f"{prefix}_{idx}", "").strip()
+        if not raw_model:
+            continue
+        provider, resolved_model = _fallback_provider_for_model(raw_model)
+        if not provider or not resolved_model:
+            continue
+        try:
+            runtime = resolve_runtime_provider(requested=provider)
+        except Exception:
+            runtime = {}
+        chain.append({
+            "provider": provider,
+            "model": resolved_model,
+            "base_url": str(runtime.get("base_url") or "").strip(),
+            "api_key": str(runtime.get("api_key") or "").strip(),
+        })
+    return chain
+
+
 def _is_opencode_user_agent(user_agent: str) -> bool:
     return isinstance(user_agent, str) and "opencode/" in user_agent.lower()
 
@@ -716,6 +759,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         from gateway.run import GatewayRunner
         fallback_model = GatewayRunner._load_fallback_model()
+        if not fallback_model:
+            if provider_mode:
+                fallback_model = _build_env_fallback_chain("HERMES_AGENT_FALLBACK")
+            elif swarm_mode:
+                fallback_model = _build_env_fallback_chain("HERMES_SWARM_FALLBACK")
 
         agent = AIAgent(
             model=model,
@@ -1040,7 +1088,7 @@ class APIServerAdapter(BasePlatformAdapter):
         external_tool_mode = "none"
         if isinstance(tools, list) and tools:
             if model_name == "hermes-code":
-                external_tool_mode = "broker"
+                external_tool_mode = "inband"
             else:
                 external_tool_mode = "inband" if force_connection_close else "broker"
         logger.info(
@@ -1265,7 +1313,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": (last_assistant or {}).get("content", "") if last_assistant else "",
+                            # For pending tool calls, return tool_calls only.
+                            # Some clients mis-handle mixed assistant text +
+                            # tool_calls and render them out of order.
+                            "content": "",
                             "tool_calls": _enrich_client_tool_calls((last_assistant or {}).get("tool_calls", [])) if last_assistant else [],
                         },
                         "finish_reason": "tool_calls",
@@ -1354,6 +1405,9 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
             last_activity = time.monotonic()
 
+            buffered_text_deltas: List[str] = []
+            tool_call_started = False
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
@@ -1364,6 +1418,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972.
                 """
+                nonlocal tool_call_started
                 if isinstance(item, tuple) and len(item) == 2:
                     tag, payload = item
                     if tag == "__tool_progress__":
@@ -1373,6 +1428,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                         return time.monotonic()
                     if tag == "__tool_call_start__":
+                        tool_call_started = True
+                        buffered_text_deltas.clear()
                         try:
                             logger.info(
                                 "[api_server] emitting tool call SSE session=%s call_id=%s tool=%s",
@@ -1394,7 +1451,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "created": created, "model": model,
                     "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
                 }
-                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                if tool_call_started:
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                else:
+                    buffered_text_deltas.append(item)
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -1434,6 +1494,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     finish_reason = "tool_calls"
             except Exception:
                 pass
+
+            if finish_reason == "stop" and buffered_text_deltas:
+                for item in buffered_text_deltas:
+                    content_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                    }
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
 
             # Finish chunk
             finish_chunk = {
@@ -2024,7 +2093,7 @@ class APIServerAdapter(BasePlatformAdapter):
         external_tool_mode = "none"
         if isinstance(tools, list) and tools:
             if model_name == "hermes-code":
-                external_tool_mode = "broker"
+                external_tool_mode = "inband"
             else:
                 external_tool_mode = "broker"
 
