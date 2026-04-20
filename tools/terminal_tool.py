@@ -1517,7 +1517,32 @@ def terminal_tool(
             if approval_note:
                 result_dict["approval"] = approval_note
             if exit_note:
+                result_dict["success"] = True
+                result_dict["status"] = "completed_with_note"
                 result_dict["exit_code_meaning"] = exit_note
+            elif returncode != 0:
+                failure_summary = f"Command failed with exit code {returncode}"
+                if output:
+                    result_dict["output"] = (
+                        f"COMMAND FAILED (exit code {returncode})\n"
+                        f"--- command ---\n{command}\n"
+                        f"--- output ---\n{output}"
+                    )
+                else:
+                    result_dict["output"] = (
+                        f"COMMAND FAILED (exit code {returncode})\n"
+                        f"--- command ---\n{command}"
+                    )
+                result_dict["error"] = failure_summary
+                result_dict["success"] = False
+                result_dict["status"] = "failed"
+                result_dict["failure_summary"] = failure_summary
+                result_dict["next_step_hint"] = (
+                    "Do not assume the command succeeded. Inspect the failure output and adjust the plan before retrying."
+                )
+            else:
+                result_dict["success"] = True
+                result_dict["status"] = "completed"
 
             return json.dumps(result_dict, ensure_ascii=False)
 

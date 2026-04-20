@@ -109,6 +109,14 @@ DANGEROUS_PATTERNS = [
     # Gateway protection: never start gateway outside systemd management
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
+    # Docker container lifecycle protection: hermes-swarm container
+    # serves the API on port 8642 — killing it kills the gateway itself.
+    # Match patterns like: docker stop hermes-swarm, docker rm hermes-swarm, docker kill hermes-swarm
+    (r'\bdocker\s+(stop|restart|rm|kill)\b.*hermes', "docker stop/restart/rm/kill hermes container (kills the API server)"),
+    (r'\bhermes-swarm\s+(stop|restart)\b', "hermes-swarm service stop/restart (kills the API server)"),
+    # Remote docker commands via SSH (ssh ... "docker stop hermes-swarm")
+    (r'\bssh\s+.*"docker\s+(stop|restart|rm|kill)\b.*hermes', "remote docker command via SSH (kills the API server)"),
+    (r'\bsshpass.*ssh.*"docker\s+(stop|restart|rm|kill)\b.*hermes', "remote docker command via sshpass (kills the API server)"),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
     # Self-termination via kill + command substitution (pgrep/pidof).

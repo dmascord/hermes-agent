@@ -911,9 +911,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 history = conversation_messages
         history = _compact_message_history(history)
 
-        if not user_message and not any(isinstance(m, dict) and m.get("role") == "tool" for m in history):
+        # Tool loop prevention: reject requests with only tool results
+        # (no new user message and last message is a tool result)
+        has_user_msg = bool(user_message and user_message.strip())
+        is_tool_result_only = (
+            conversation_messages and
+            conversation_messages[-1].get("role") == "tool"
+        )
+        if is_tool_result_only and not has_user_msg:
             return web.json_response(
-                {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
+                {"error": {"message": "Cannot continue with only tool results. Include a user message to continue.", "type": "invalid_request_error"}},
                 status=400,
             )
 
