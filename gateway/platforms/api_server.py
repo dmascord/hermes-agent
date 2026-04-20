@@ -2147,12 +2147,58 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        created_at = int(time.time())
+
+        if result.get("tool_calls_pending"):
+            last_assistant = None
+            for msg in reversed(result.get("messages", [])):
+                if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    last_assistant = msg
+                    break
+
+            output_items: List[Dict[str, Any]] = []
+            for tc in _enrich_client_tool_calls((last_assistant or {}).get("tool_calls", [])):
+                func = tc.get("function", {}) if isinstance(tc, dict) else {}
+                output_items.append({
+                    "type": "function_call",
+                    "name": func.get("name", ""),
+                    "arguments": func.get("arguments", ""),
+                    "call_id": tc.get("id") or tc.get("call_id", ""),
+                })
+
+            response_data = {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "created_at": created_at,
+                "model": body.get("model", self._model_name),
+                "output": output_items,
+                "usage": {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
+
+            if store:
+                full_history = list(conversation_history)
+                full_history.append({"role": "user", "content": user_message})
+                full_history.extend(result.get("messages", []))
+                self._response_store.put(response_id, {
+                    "response": response_data,
+                    "conversation_history": full_history,
+                    "instructions": instructions,
+                    "session_id": session_id,
+                })
+                if conversation:
+                    self._response_store.set_conversation(conversation, response_id)
+
+            return web.json_response(response_data)
+
         final_response = result.get("final_response", "")
         if not final_response:
             final_response = result.get("error", "(No response generated)")
-
-        response_id = f"resp_{uuid.uuid4().hex[:28]}"
-        created_at = int(time.time())
 
         # Build the full conversation history for storage
         # (includes tool calls from the agent run)
