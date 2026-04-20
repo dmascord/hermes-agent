@@ -2801,6 +2801,12 @@ class AIAgent:
                 if response_obj is not None:
                     try:
                         error_info["response_status"] = getattr(response_obj, "status_code", None)
+                        resp_headers = getattr(response_obj, "headers", None)
+                        if resp_headers is not None:
+                            try:
+                                error_info["response_headers"] = dict(resp_headers)
+                            except Exception:
+                                pass
                         error_info["response_text"] = response_obj.text
                     except Exception as e:
                         logger.debug("Could not extract error response details: %s", e)
@@ -4743,6 +4749,32 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
+            reset_at = None
+            if isinstance(error_context, dict):
+                reset_at = error_context.get("reset_at")
+            cooldown_seconds = None
+            if reset_at not in (None, ""):
+                try:
+                    cooldown_seconds = max(0.0, float(reset_at) - time.time())
+                except (TypeError, ValueError):
+                    cooldown_seconds = None
+
+            # If the provider explicitly tells us to wait a long time, don't
+            # waste a retry on the same credential/provider path.
+            if cooldown_seconds and cooldown_seconds > 5:
+                rotate_status = status_code if status_code is not None else 429
+                next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+                if next_entry is not None:
+                    logger.info(
+                        "Credential %s (rate limit cooldown %.0fs) — rotated to pool entry %s",
+                        rotate_status,
+                        cooldown_seconds,
+                        getattr(next_entry, "id", "?"),
+                    )
+                    self._swap_credential(next_entry)
+                    return True, False
+                return False, True
+
             if not has_retried_429:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
@@ -5153,6 +5185,13 @@ class AIAgent:
                     arguments = entry.get("function", {}).get("arguments", "") or ""
                     if not entry.get("id"):
                         entry["id"] = self._deterministic_call_id(name, arguments, idx)
+                    try:
+                        print(
+                            f"[raw_model_tool_call][stream] provider={self.provider} model={getattr(self, 'model', '')} name={name} id={entry.get('id')} args={arguments[:400]}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
                     tool_gen_notified.add(idx)
                     _fire_first_delta()
                     self._fire_tool_gen_started(name, entry.get("id"), arguments)
@@ -7311,6 +7350,13 @@ class AIAgent:
                 break
 
             function_name = tool_call.function.name
+            try:
+                print(
+                    f"[raw_model_tool_call][nonstream] provider={self.provider} model={getattr(self, 'model', '')} name={function_name} id={getattr(tool_call, 'id', '')} args={getattr(getattr(tool_call, 'function', None), 'arguments', '')[:400]}",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
             # Check if this tool should be routed back to the client (from_client tools)
             # Instead of executing locally, we'll return the tool call in the response
@@ -7318,6 +7364,45 @@ class AIAgent:
             if hasattr(self, 'client_tool_names') and function_name in self.client_tool_names:
                 # Mark this tool call to route back to client
                 tool_call._route_to_client = True
+
+                # Fix: Populate missing required parameters from tool schema
+                # The model may omit required fields, but the client expects complete arguments
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    function_args = {}
+                if isinstance(function_args, dict):
+                    # Look up the tool schema to find required parameters
+                    required_params = set()
+                    for tool_def in (self.tools or []):
+                        func_def = tool_def.get("function", {})
+                        if func_def.get("name") == function_name:
+                            schema_params = func_def.get("parameters", {})
+                            required_params = set(schema_params.get("required", []))
+                            break
+
+                    # Add missing required parameters with sensible defaults
+                    for req_param in required_params:
+                        if req_param not in function_args:
+                            if req_param == "description":
+                                # Most common missing param - provide a default
+                                function_args[req_param] = f"Tool call for {function_name}"
+                            elif req_param == "command":
+                                # Skip - command should already be present
+                                pass
+                            else:
+                                # Generic default for other required params
+                                function_args[req_param] = ""
+
+                    # Also ensure 'description' is present for common tools (bash, terminal, etc.)
+                    # that clients like OpenCode often expect even if not in the schema's required list
+                    if function_name in ("bash", "terminal") and "description" not in function_args:
+                        function_args["description"] = f"Execute command: {function_args.get('command', '')[:100]}"
+
+                    # Re-serialize the enriched arguments
+                    enriched_args = json.dumps(function_args, ensure_ascii=False)
+                    tool_call.function.arguments = enriched_args
+
                 # Add to messages as pending - client will handle execution
                 pending_msg = {
                     "role": "tool",
@@ -9713,9 +9798,38 @@ class AIAgent:
                             _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
                             if _ra_raw:
                                 try:
-                                    _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
+                                    _retry_after = max(1, int(float(_ra_raw)))
                                 except (TypeError, ValueError):
                                     pass
+                    if is_rate_limited and _retry_after and _retry_after > 5:
+                        self._emit_status(
+                            f"⚠️ Upstream requested a long cooldown ({_retry_after}s) — trying fallback/provider failover before waiting..."
+                        )
+                        if self._try_activate_fallback():
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
+                        _cooldown_summary = self._summarize_api_error(api_error)
+                        self._emit_status(
+                            f"❌ Upstream cooldown is {_retry_after}s and no fallback is available — failing fast"
+                        )
+                        if api_kwargs is not None:
+                            self._dump_api_request_debug(
+                                api_kwargs, reason="rate_limit_long_cooldown_no_fallback", error=api_error,
+                            )
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": (
+                                f"Upstream provider requested a cooldown of {_retry_after} seconds and no fallback provider/model was available. "
+                                f"Last error: {_cooldown_summary}"
+                            ),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _cooldown_summary,
+                        }
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
