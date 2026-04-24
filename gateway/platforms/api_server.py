@@ -70,6 +70,90 @@ def _resolve_swarm_model(pool):
     return fallbacks[0]
 
 
+_EXPLICIT_MODEL_PROVIDER_ALIASES = {
+    "openrouter": "openrouter",
+    "openai": "openai-codex",
+    "openai-codex": "openai-codex",
+    "codex": "openai-codex",
+    "anthropic": "anthropic",
+    "copilot": "copilot",
+    "github-copilot": "copilot",
+    "copilot-acp": "copilot-acp",
+    "opencode": "opencode-zen",
+    "opencode-zen": "opencode-zen",
+    "zen": "opencode-zen",
+    "opencode-go": "opencode-go",
+    "go": "opencode-go",
+    "nous": "nous",
+    "custom": "custom",
+    "xai": "xai",
+    "zai": "zai",
+    "kimi-coding": "kimi-coding",
+    "kimi-coding-cn": "kimi-coding-cn",
+    "minimax": "minimax",
+    "minimax-cn": "minimax-cn",
+    "ai-gateway": "ai-gateway",
+    "kilocode": "kilocode",
+    "alibaba": "alibaba",
+    "arcee": "arcee",
+    "huggingface": "huggingface",
+    "xiaomi": "xiaomi",
+    "bedrock": "bedrock",
+    "qwen-oauth": "qwen-oauth",
+    "ollama-cloud": "ollama-cloud",
+}
+
+
+def _explicit_provider_from_model(model: str) -> str:
+    raw = str(model or "").strip()
+    if "/" not in raw:
+        return ""
+    prefix = raw.split("/", 1)[0].strip().lower()
+    return _EXPLICIT_MODEL_PROVIDER_ALIASES.get(prefix, "")
+
+
+def _align_runtime_with_explicit_model(runtime_kwargs: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Honor provider-prefixed model IDs before the first upstream call.
+
+    This prevents auto provider resolution from selecting an unrelated backend
+    (for example Codex OAuth) when the model string itself already names the
+    intended provider (for example ``opencode-zen/big-pickle``).
+    """
+    explicit_provider = _explicit_provider_from_model(model)
+    if not explicit_provider:
+        return runtime_kwargs
+
+    current_provider = str(runtime_kwargs.get("provider") or "").strip().lower()
+    if current_provider == explicit_provider and runtime_kwargs.get("api_key"):
+        return runtime_kwargs
+
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        resolved = resolve_runtime_provider(requested=explicit_provider)
+    except Exception as exc:
+        logger.warning(
+            "[api_server] failed to resolve provider %s for explicit model %s: %s",
+            explicit_provider,
+            model,
+            exc,
+        )
+        return runtime_kwargs
+
+    merged = dict(runtime_kwargs)
+    for key in ("api_key", "base_url", "provider", "api_mode"):
+        value = resolved.get(key)
+        if value is not None:
+            merged[key] = value
+
+    logger.info(
+        "[api_server] aligned runtime provider to %s for explicit model %s",
+        explicit_provider,
+        model,
+    )
+    return merged
+
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
@@ -81,15 +165,24 @@ MAX_HISTORY_MESSAGES = 200
 MAX_HISTORY_TEXT_LENGTH = 240_000
 
 
-def _compact_message_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _compact_message_history(messages: List[Dict[str, Any]], session_id: str = "unknown") -> List[Dict[str, Any]]:
     """Keep recent history bounded so provider request bodies stay sane."""
+    import logging
+    _logger = logging.getLogger(__name__)
+    
     if not messages:
         return []
 
     trimmed = list(messages[-MAX_HISTORY_MESSAGES:])
+    original_count = len(messages)
+    trimmed_count = len(trimmed)
 
     def _msg_cost(msg: Dict[str, Any]) -> int:
         cost = len(str(msg.get("content") or ""))
+        # Account for reasoning_content which can be substantial for reasoning models
+        reasoning_content = msg.get("reasoning_content")
+        if isinstance(reasoning_content, str):
+            cost += len(reasoning_content)
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
             for tc in tool_calls:
@@ -100,14 +193,24 @@ def _compact_message_history(messages: List[Dict[str, Any]]) -> List[Dict[str, A
         return cost
 
     total = sum(_msg_cost(msg) for msg in trimmed)
+    
+    # Log if we're hitting message count limit
+    if original_count > MAX_HISTORY_MESSAGES:
+        _logger.warning(
+            "[CONTEXT] Session %s compacting: %d messages -> %d (limit: %d, total chars: %d/%d)",
+            session_id, original_count, trimmed_count, MAX_HISTORY_MESSAGES, total, MAX_HISTORY_TEXT_LENGTH
+        )
+    
     if total <= MAX_HISTORY_TEXT_LENGTH:
         return trimmed
 
     kept: List[Dict[str, Any]] = []
     running = 0
+    dropped_count = 0
     for msg in reversed(trimmed):
         cost = _msg_cost(msg)
         if kept and running + cost > MAX_HISTORY_TEXT_LENGTH:
+            dropped_count += 1
             continue
         kept.append(msg)
         running += cost
@@ -115,6 +218,16 @@ def _compact_message_history(messages: List[Dict[str, Any]]) -> List[Dict[str, A
             break
 
     kept.reverse()
+    
+    # Log if we're hitting text length limit
+    if dropped_count > 0:
+        _logger.warning(
+            "[CONTEXT] Session %s TRUNCATED: dropped %d messages due to text length limit (%d/%d chars). "
+            "Original messages: %d, Kept: %d, Total chars: %d",
+            session_id, dropped_count, total, MAX_HISTORY_TEXT_LENGTH,
+            original_count, len(kept), running
+        )
+    
     return kept
 
 
@@ -199,7 +312,9 @@ def _fallback_provider_for_model(model_id: str) -> tuple[str, str]:
     if prefix == "openai":
         return "openai-codex", raw
     if prefix in {"github-copilot", "opencode-go", "opencode-zen"}:
-        return prefix, raw
+        # CRITICAL FIX: Return bare model name (rest) without provider prefix for OpenCode providers
+        # These APIs only accept bare model names (e.g., "kimi-k2.5", not "opencode-go/kimi-k2.5")
+        return prefix, rest
     if prefix == "openrouter":
         return "openrouter", rest
     return "openrouter", raw
@@ -712,26 +827,102 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        
-        # Swarm mode: select from free/cheap model pool
+        logging.warning(f"[API_SERVER] _create_agent called: swarm_mode={swarm_mode}, swarm_model_pool={swarm_model_pool}")
+
+        # Swarm mode: select from free/cheap model pool FIRST
+        # This must happen before _resolve_runtime_agent_kwargs() to avoid provider resolution errors
         if swarm_mode and swarm_model_pool:
             model = _resolve_swarm_model(swarm_model_pool)
-            # Override base_url based on model provider
-            # Most provider/model formats are OpenRouter models
-            if "/" in model and not model.startswith("github-copilot/") and not model.startswith("local/"):
-                runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-                runtime_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
-            elif model.startswith("github-copilot/"):
-                runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
-                runtime_kwargs["api_key"] = os.getenv("GITHUB_COPILOT_API_KEY", "")
-        elif provider_mode:
-            # OpenCode routes hermes-code through provider mode. Keep the
-            # requested hermes-code model stable even when there is no gateway
-            # config model.default configured.
-            model = os.getenv("HERMES_CODE_MODEL", "").strip() or _resolve_gateway_model()
-        else:
-            model = _resolve_gateway_model()
+            logging.warning(f"[API_SERVER] Swarm mode: resolved model={model}")
+            # Set up runtime_kwargs with swarm model config before general provider resolution
+            runtime_kwargs = {}
+            if "/" in model:
+                provider_prefix = model.split("/")[0].strip().lower()
+                # Handle OpenCode Zen models
+                if provider_prefix == "opencode-zen":
+                    runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+                    runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
+                    runtime_kwargs["provider"] = "opencode-zen"
+                # Handle OpenCode Go models
+                elif provider_prefix == "opencode-go":
+                    runtime_kwargs["base_url"] = os.getenv("OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1")
+                    runtime_kwargs["api_key"] = os.getenv("OPENCODE_GO_API_KEY", "")
+                    runtime_kwargs["provider"] = "opencode-go"
+                # Handle OpenAI models (maps to openai-codex for Codex OAuth)
+                elif provider_prefix == "openai":
+                    runtime_kwargs["provider"] = "openai-codex"
+                # Handle GitHub Copilot models
+                elif provider_prefix == "github-copilot":
+                    runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
+                    runtime_kwargs["api_key"] = os.getenv("GITHUB_COPILOT_API_KEY", "")
+                    runtime_kwargs["provider"] = "github-copilot"
+                # Handle ZAI models
+                elif provider_prefix == "zai":
+                    runtime_kwargs["base_url"] = "https://api.z.ai/api/coding/paas/v4"
+                    runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
+                    runtime_kwargs["provider"] = "zai"
+                # Handle OpenRouter models (default)
+                elif provider_prefix != "local":
+                    runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+                    runtime_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
+                    runtime_kwargs["provider"] = "openrouter"
+                else:
+                    runtime_kwargs["provider"] = provider_prefix
+            else:
+                # No provider prefix in model name, try to detect from model
+                from hermes_cli.model_normalize import detect_vendor
+                detected_provider = detect_vendor(model)
+                if detected_provider:
+                    runtime_kwargs["provider"] = detected_provider
+            # Don't add model to runtime_kwargs since it's passed separately to AIAgent()
+            logging.warning(f"[API_SERVER] Swarm: runtime_kwargs={runtime_kwargs}")
+            
+            # CRITICAL FIX: Strip provider prefix from OpenCode Go/Zen models before passing to AIAgent()
+            # These providers only accept bare model names (e.g., "kimi-k2.5", not "opencode-go/kimi-k2.5")
+            if provider_prefix in ("opencode-go", "opencode-zen"):
+                if "/" in model:
+                    model = model.split("/", 1)[1].strip()
+                    logging.warning(f"[API_SERVER] Stripped prefix: now using model={model}")
+        
+        # Only resolve credentials if NOT in swarm mode (swarm mode already has runtime_kwargs)
+        # This prevents unnecessary Codex credential checks when using other providers
+        if not swarm_mode:
+            # Check if a specific provider is configured - if so, use it directly
+            # without going through the default credential resolution (which checks Codex)
+            requested_provider = os.getenv("HERMES_INFERENCE_PROVIDER")
+            if not requested_provider:
+                cfg = _load_gateway_config()
+                model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+                if isinstance(model_cfg, dict):
+                    requested_provider = str(model_cfg.get("provider") or "").strip() or None
+            
+            if requested_provider and requested_provider.lower() in ("zai", "opencode-go", "opencode-zen"):
+                if requested_provider.lower() == "zai":
+                    runtime_kwargs = {
+                        "base_url": "https://api.z.ai/api/coding/paas/v4",
+                        "api_key": os.getenv("ZAI_API_KEY", ""),
+                        "provider": "zai",
+                    }
+                else:
+                    runtime_kwargs = {
+                        "base_url": os.getenv(f"{requested_provider.upper().replace('-', '_')}_BASE_URL", f"https://opencode.ai/zen/go/v1" if requested_provider.lower() == "opencode-go" else "https://opencode.ai/zen/v1"),
+                        "api_key": os.getenv(f"{requested_provider.upper().replace('-', '_')}_API_KEY", ""),
+                        "provider": requested_provider.lower(),
+                    }
+            else:
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
+        
+        # Non-swarm path continues here - model resolution (swarm already has model at this point)
+        if not swarm_mode:
+            if provider_mode:
+                # OpenCode routes hermes-code through provider mode. Keep the
+                # requested hermes-code model stable even when there is no gateway
+                # config model.default configured.
+                model = os.getenv("HERMES_CODE_MODEL", "").strip() or _resolve_gateway_model()
+            else:
+                model = _resolve_gateway_model()
+
+            runtime_kwargs = _align_runtime_with_explicit_model(runtime_kwargs, model)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -976,6 +1167,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_calls = _extract_openai_tool_calls(msg.get("tool_calls"))
                 if tool_calls:
                     assistant_entry["tool_calls"] = tool_calls
+                # Preserve reasoning_content for providers that use it
+                # (Moonshot/Kimi, GLM, Novita, OpenRouter) so multi-turn
+                # conversations maintain reasoning context.
+                reasoning_content = msg.get("reasoning_content")
+                if isinstance(reasoning_content, str) and reasoning_content.strip():
+                    assistant_entry["reasoning_content"] = reasoning_content
                 conversation_messages.append(assistant_entry)
             elif role == "tool":
                 tool_entry: Dict[str, Any] = {"role": "tool", "content": content}
@@ -996,7 +1193,9 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 user_message = ""
                 history = conversation_messages
-        history = _compact_message_history(history)
+        # Derive a temporary session ID from conversation for logging before real session is established
+        _pre_session_id = f"pre-session-{hash(str(conversation_messages[:3]))}"
+        history = _compact_message_history(history, session_id=_pre_session_id)
 
         # Tool loop prevention: allow legitimate OpenAI tool continuation
         # (assistant tool_calls -> tool results), but reject orphaned tool-only
@@ -1073,7 +1272,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
-        history = _compact_message_history(history)
+        history = _compact_message_history(history, session_id=session_id)
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -1270,6 +1469,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 toolset_mode=_toolset_mode,
                 provider_mode=_provider_mode,
+                swarm_mode=swarm_mode,
+                swarm_model_pool=swarm_model_pool,
                 tools=tools,
                 tool_choice=tool_choice,
                 external_tool_mode=external_tool_mode,
@@ -1335,6 +1536,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final_response:
             final_response = result.get("error", "(No response generated)")
 
+        # Extract reasoning_content from the last assistant message if available
+        # This is needed for Kimi/Moonshot/GLM reasoning models
+        reasoning_content = None
+        for msg in reversed(result.get("messages", [])):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                reasoning_content = msg.get("reasoning_content")
+                if isinstance(reasoning_content, str) and reasoning_content.strip():
+                    break
+
+        message_data = {
+            "role": "assistant",
+            "content": final_response,
+        }
+        # Include reasoning_content if present and non-empty
+        if reasoning_content:
+            message_data["reasoning_content"] = reasoning_content
+
         response_data = {
             "id": completion_id,
             "object": "chat.completion",
@@ -1343,10 +1561,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_response,
-                    },
+                    "message": message_data,
                     "finish_reason": "stop",
                 }
             ],
@@ -2060,7 +2275,9 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history = conversation_history[-100:]
 
         # Compact message history to keep request bodies bounded
-        conversation_history = _compact_message_history(conversation_history)
+        # Use temporary session ID since session_id not yet established
+        _pre_session_id = f"responses-pre-{hash(str(conversation_history[:3]))}"
+        conversation_history = _compact_message_history(conversation_history, session_id=_pre_session_id)
 
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
@@ -2076,9 +2293,20 @@ class APIServerAdapter(BasePlatformAdapter):
         elif model_name == "hermes-code":
             _provider_mode = True
 
+        external_tool_mode = "none"
+        if isinstance(tools, list) and tools:
+            if model_name == "hermes-code":
+                external_tool_mode = "inband"
+            else:
+                external_tool_mode = "broker"
+
+        # Extract model_name FIRST - before any agent creation  
+        _model_name = body.get("model", self._model_name)
+        
+        # Handle hermes-swarm mode - use _model_name from request body
         swarm_mode = False
         swarm_model_pool = None
-        if model_name == "hermes-swarm":
+        if _model_name == "hermes-swarm":
             swarm_mode = True
             swarm_model_pool = {
                 "primary": os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
@@ -2089,13 +2317,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
                 "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
             }
-
-        external_tool_mode = "none"
-        if isinstance(tools, list) and tools:
-            if model_name == "hermes-code":
-                external_tool_mode = "inband"
-            else:
-                external_tool_mode = "broker"
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -2164,7 +2385,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._write_sse_responses(
                 request=request,
                 response_id=response_id,
-                model=model_name,
+                model=_model_name,
                 created_at=created_at,
                 stream_q=_stream_q,
                 agent_task=agent_task,
@@ -2682,6 +2903,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         loop = asyncio.get_running_loop()
 
+        logging.warning(f"[API_SERVER] _run_agent called: swarm_mode={swarm_mode}, swarm_model_pool={swarm_model_pool}")
+
         def _run():
             generated_tool_calls: List[Dict[str, Any]] = []
 
@@ -2905,6 +3128,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    provider_mode=provider_mode,
+                    swarm_mode=swarm_mode,
+                    swarm_model_pool=swarm_model_pool,
                 )
                 def _run_sync():
                     r = agent.run_conversation(

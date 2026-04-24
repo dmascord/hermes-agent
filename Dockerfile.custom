@@ -8,19 +8,20 @@ ENV PATH="/srv/opencode/hermes-venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/games"
 # API Server Configuration - bind to all interfaces for external access
 ENV API_SERVER_ENABLED=true
 ENV API_SERVER_HOST=0.0.0.0
+ENV ZAI_API_KEY=837d46e293034dceacd901a5176d98c8.m2FBMN9WJoVaY60I
 # NOTE: Set API_SERVER_KEY at runtime for production use
 
 # Hermes-Swarm Configuration - Priority: OpenCode Zen free > OpenCode Go subscription > Free
 # Primary: OpenCode Zen big-pickle (free tier - best for now)
-ENV HERMES_SWARM_PRIMARY_MODEL=opencode-zen/big-pickle
+ENV HERMES_INFERENCE_PROVIDER=zai
+ENV HERMES_SWARM_PRIMARY_MODEL=zai/glm-5.1
 
-# OpenCode Zen free models (best free tier)
-# NOTE: qwen3-coder → qwen3.5-plus, minimax-m2.7 → minimax-m2.5 (correct names)
-ENV HERMES_SWARM_FALLBACK_1=opencode-zen/qwen3.5-plus
-ENV HERMES_SWARM_FALLBACK_2=opencode-zen/kimi-k2.5
-ENV HERMES_SWARM_FALLBACK_3=opencode-zen/minimax-m2.5
-ENV HERMES_SWARM_FALLBACK_4=opencode-zen/glm-5
-ENV HERMES_SWARM_FALLBACK_5=opencode-zen/gemini-3-flash
+# OpenCode Zen free models (only working ones as of 2025-04-22)
+ENV HERMES_SWARM_FALLBACK_1=opencode-zen/minimax-m2.5-free
+ENV HERMES_SWARM_FALLBACK_2=opencode-zen/ling-2.6-flash-free
+ENV HERMES_SWARM_FALLBACK_3=opencode-zen/gpt-5-nano
+ENV HERMES_SWARM_FALLBACK_4=opencode-zen/trinity-large-preview-free
+ENV HERMES_SWARM_FALLBACK_5=opencode-zen/nemotron-3-super-free
 
 # OpenCode Go models ($10/month subscription)
 ENV HERMES_SWARM_FALLBACK_6=opencode-go/glm-5
@@ -65,13 +66,12 @@ ENV HERMES_AGENTIC_REMOTE_MODEL=opencode-zen/big-pickle
 # Primary uses OpenCode Zen free tier
 ENV HERMES_AGENT_MODEL=opencode-zen/big-pickle
 
-# OpenCode Zen free models (best free tier)
-# NOTE: qwen3-coder → qwen3.5-plus, minimax-m2.7 → minimax-m2.5 (correct names)
-ENV HERMES_AGENT_FALLBACK_1=opencode-zen/qwen3.5-plus
-ENV HERMES_AGENT_FALLBACK_2=opencode-zen/kimi-k2.5
-ENV HERMES_AGENT_FALLBACK_3=opencode-zen/minimax-m2.5
-ENV HERMES_AGENT_FALLBACK_4=opencode-zen/glm-5
-ENV HERMES_AGENT_FALLBACK_5=opencode-zen/gemini-3-flash
+# OpenCode Zen free models (only working ones as of 2025-04-22)
+ENV HERMES_AGENT_FALLBACK_1=opencode-zen/minimax-m2.5-free
+ENV HERMES_AGENT_FALLBACK_2=opencode-zen/ling-2.6-flash-free
+ENV HERMES_AGENT_FALLBACK_3=opencode-zen/gpt-5-nano
+ENV HERMES_AGENT_FALLBACK_4=opencode-zen/trinity-large-preview-free
+ENV HERMES_AGENT_FALLBACK_5=opencode-zen/nemotron-3-super-free
 
 # OpenCode Go models ($10/month subscription)
 ENV HERMES_AGENT_FALLBACK_6=opencode-go/glm-5

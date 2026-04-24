@@ -26,7 +26,9 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _CORS_HEADERS,
+    _align_runtime_with_explicit_model,
     _derive_chat_session_id,
+    _explicit_provider_from_model,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -148,6 +150,63 @@ class TestAdapterInit:
             "http://localhost:3000",
             "http://127.0.0.1:3000",
         )
+
+
+class TestExplicitModelRuntimeAlignment:
+    def test_explicit_provider_from_model_detects_safe_provider_prefixes(self):
+        assert _explicit_provider_from_model("opencode-zen/big-pickle") == "opencode-zen"
+        assert _explicit_provider_from_model("openrouter/google/gemma-3-5b-eu:free") == "openrouter"
+        assert _explicit_provider_from_model("google/gemma-3-5b-eu:free") == ""
+
+    def test_align_runtime_with_explicit_model_overrides_auto_provider(self, monkeypatch):
+        runtime_kwargs = {
+            "provider": "openai-codex",
+            "api_key": "codex-key",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+        }
+
+        def _resolve_runtime_provider(*, requested=None, **_kwargs):
+            assert requested == "opencode-zen"
+            return {
+                "provider": "opencode-zen",
+                "api_key": "zen-key",
+                "base_url": "https://opencode.ai/zen/v1",
+                "api_mode": "chat_completions",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            _resolve_runtime_provider,
+        )
+
+        aligned = _align_runtime_with_explicit_model(runtime_kwargs, "opencode-zen/big-pickle")
+        assert aligned["provider"] == "opencode-zen"
+        assert aligned["api_key"] == "zen-key"
+        assert aligned["base_url"] == "https://opencode.ai/zen/v1"
+        assert aligned["api_mode"] == "chat_completions"
+
+    def test_align_runtime_with_explicit_model_keeps_ambiguous_vendor_prefix(self, monkeypatch):
+        called = {"value": False}
+
+        def _resolve_runtime_provider(**_kwargs):
+            called["value"] = True
+            raise AssertionError("should not resolve provider for ambiguous vendor prefix")
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            _resolve_runtime_provider,
+        )
+
+        runtime_kwargs = {
+            "provider": "openrouter",
+            "api_key": "or-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        }
+        aligned = _align_runtime_with_explicit_model(runtime_kwargs, "google/gemma-3-5b-eu:free")
+        assert aligned == runtime_kwargs
+        assert called["value"] is False
 
 
 # ---------------------------------------------------------------------------

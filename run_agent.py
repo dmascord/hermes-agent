@@ -37,11 +37,13 @@ import time
 import threading
 from types import SimpleNamespace
 import uuid
+from contextlib import contextmanager
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 import fire
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 
@@ -112,6 +114,46 @@ from agent.trajectory import (
     save_trajectory as _save_trajectory_to_file,
 )
 from utils import atomic_json_write, env_var_enabled
+
+
+_PROVIDER_CONCURRENCY_GUARDS_LOCK = threading.Lock()
+_PROVIDER_CONCURRENCY_GUARDS: dict[str, threading.BoundedSemaphore] = {}
+
+
+def _load_provider_concurrency_limits() -> dict[str, int]:
+    """Return per-provider concurrency caps.
+
+    Defaults are intentionally conservative for providers/plans with hard
+    parallel-request ceilings. Users can override or extend via:
+
+        HERMES_PROVIDER_CONCURRENCY_LIMITS="arliai=2,openai-codex=3"
+    """
+    limits: dict[str, int] = {"arliai": 2, "zai": 1}
+    raw = str(os.getenv("HERMES_PROVIDER_CONCURRENCY_LIMITS", "") or "").strip()
+    if not raw:
+        return limits
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip().lower()
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            continue
+        if key and parsed > 0:
+            limits[key] = parsed
+    return limits
+
+
+def _get_provider_concurrency_guard(key: str, limit: int) -> threading.BoundedSemaphore:
+    with _PROVIDER_CONCURRENCY_GUARDS_LOCK:
+        guard = _PROVIDER_CONCURRENCY_GUARDS.get(key)
+        if guard is None:
+            guard = threading.BoundedSemaphore(limit)
+            _PROVIDER_CONCURRENCY_GUARDS[key] = guard
+        return guard
 
 
 
@@ -3475,6 +3517,65 @@ class AIAgent:
 
         return None
 
+    @staticmethod
+    def _normalize_client_tool_args(function_name: str, raw_args: Any) -> Dict[str, Any]:
+        """Best-effort normalization for client-routed tool arguments.
+
+        Only perform low-risk schema repairs here. Do not invent missing
+        semantic intent beyond obvious formatting recovery.
+        """
+        parsed: Any = raw_args
+        if isinstance(raw_args, str):
+            stripped = raw_args.strip()
+            if not stripped:
+                parsed = {}
+            else:
+                try:
+                    parsed = json.loads(stripped)
+                except Exception:
+                    if function_name in {"bash", "terminal"}:
+                        parsed = {"command": stripped}
+                    else:
+                        parsed = {}
+        elif raw_args is None:
+            parsed = {}
+
+        if not isinstance(parsed, dict):
+            return {}
+
+        normalized = dict(parsed)
+
+        if function_name in {"bash", "terminal"}:
+            if "command" not in normalized:
+                for alias in ("cmd", "shell_command"):
+                    value = normalized.get(alias)
+                    if isinstance(value, str) and value.strip():
+                        normalized["command"] = value.strip()
+                        break
+
+            if "workdir" not in normalized:
+                for alias in ("cwd", "directory"):
+                    value = normalized.get(alias)
+                    if isinstance(value, str) and value.strip():
+                        normalized["workdir"] = value.strip()
+                        break
+
+            timeout = normalized.get("timeout")
+            if isinstance(timeout, str) and timeout.strip():
+                try:
+                    normalized["timeout"] = int(float(timeout.strip()))
+                except ValueError:
+                    pass
+
+            command = normalized.get("command")
+            if isinstance(command, str):
+                normalized["command"] = command.strip()
+
+            if "description" not in normalized and isinstance(normalized.get("command"), str):
+                normalized["description"] = f"Execute command: {normalized['command'][:100]}"
+
+        return normalized
+
     def _invalidate_system_prompt(self):
         """
         Invalidate the cached system prompt, forcing a rebuild on the next turn.
@@ -4355,6 +4456,52 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _provider_concurrency_limit(self) -> tuple[Optional[str], Optional[int]]:
+        limits = _load_provider_concurrency_limits()
+        provider_key = (getattr(self, "provider", "") or "").strip().lower()
+        if provider_key in limits:
+            return provider_key, limits[provider_key]
+        base_url = str(getattr(self, "base_url", "") or "").strip()
+        if base_url:
+            try:
+                hostname = (urlparse(base_url).hostname or "").lower()
+            except Exception:
+                hostname = ""
+            if hostname == "api.arliai.com":
+                return "arliai", limits.get("arliai", 2)
+            if hostname and "z.ai" in hostname:
+                return "zai", limits.get("zai", 1)
+        return None, None
+
+    @contextmanager
+    def _provider_concurrency_slot(self, *, purpose: str):
+        key, limit = self._provider_concurrency_limit()
+        if not key or not limit or limit <= 0:
+            yield
+            return
+
+        guard = _get_provider_concurrency_guard(key, limit)
+        wait_started = None
+        while True:
+            if guard.acquire(timeout=0.5):
+                break
+            if self._interrupt_requested:
+                raise KeyboardInterrupt("Interrupted while waiting for provider concurrency slot")
+            if wait_started is None:
+                wait_started = time.time()
+                self._emit_status(
+                    f"⏳ Waiting for {key} capacity ({limit} max concurrent requests)"
+                )
+            elif time.time() - wait_started >= 5.0:
+                self._touch_activity(
+                    f"waiting for provider slot ({key}, purpose={purpose}, limit={limit})"
+                )
+                wait_started = time.time()
+        try:
+            yield
+        finally:
+            guard.release()
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -4880,62 +5027,63 @@ class AIAgent:
         _call_start = time.time()
         self._touch_activity("waiting for non-streaming API response")
 
-        t = threading.Thread(target=_call, daemon=True)
-        t.start()
-        _poll_count = 0
-        while t.is_alive():
-            t.join(timeout=0.3)
-            _poll_count += 1
+        with self._provider_concurrency_slot(purpose="non_streaming_api_call"):
+            t = threading.Thread(target=_call, daemon=True)
+            t.start()
+            _poll_count = 0
+            while t.is_alive():
+                t.join(timeout=0.3)
+                _poll_count += 1
 
-            # Touch activity every ~30s so the gateway's inactivity
-            # monitor knows we're alive while waiting for the response.
-            if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
-                _elapsed = time.time() - _call_start
-                self._touch_activity(
-                    f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
-                )
-
-            # Stale-call detector: kill the connection if no response
-            # arrives within the configured timeout.
-            _elapsed = time.time() - _call_start
-            if _elapsed > _stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-                logger.warning(
-                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                    "model=%s context=~%s tokens. Killing connection.",
-                    _elapsed, _stale_timeout,
-                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-                )
-                self._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Aborting call."
-                )
-                try:
-                    if self.api_mode == "anthropic_messages":
-                        from agent.anthropic_adapter import build_anthropic_client
-
-                        self._anthropic_client.close()
-                        self._anthropic_client = build_anthropic_client(
-                            self._anthropic_api_key,
-                            getattr(self, "_anthropic_base_url", None),
-                        )
-                    else:
-                        rc = request_client_holder.get("client")
-                        if rc is not None:
-                            self._close_request_openai_client(rc, reason="stale_call_kill")
-                except Exception:
-                    pass
-                self._touch_activity(
-                    f"stale non-streaming call killed after {int(_elapsed)}s"
-                )
-                # Wait briefly for the thread to notice the closed connection.
-                t.join(timeout=2.0)
-                if result["error"] is None and result["response"] is None:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
+                # Touch activity every ~30s so the gateway's inactivity
+                # monitor knows we're alive while waiting for the response.
+                if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
+                    _elapsed = time.time() - _call_start
+                    self._touch_activity(
+                        f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
                     )
+
+                # Stale-call detector: kill the connection if no response
+                # arrives within the configured timeout.
+                _elapsed = time.time() - _call_start
+                if _elapsed > _stale_timeout:
+                    _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+                    logger.warning(
+                        "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+                        "model=%s context=~%s tokens. Killing connection.",
+                        _elapsed, _stale_timeout,
+                        api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    )
+                    self._emit_status(
+                        f"⚠️ No response from provider for {int(_elapsed)}s "
+                        f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"Aborting call."
+                    )
+                    try:
+                        if self.api_mode == "anthropic_messages":
+                            from agent.anthropic_adapter import build_anthropic_client
+
+                            self._anthropic_client.close()
+                            self._anthropic_client = build_anthropic_client(
+                                self._anthropic_api_key,
+                                getattr(self, "_anthropic_base_url", None),
+                            )
+                        else:
+                            rc = request_client_holder.get("client")
+                            if rc is not None:
+                                self._close_request_openai_client(rc, reason="stale_call_kill")
+                    except Exception:
+                        pass
+                    self._touch_activity(
+                        f"stale non-streaming call killed after {int(_elapsed)}s"
+                    )
+                    # Wait briefly for the thread to notice the closed connection.
+                    t.join(timeout=2.0)
+                    if result["error"] is None and result["response"] is None:
+                        result["error"] = TimeoutError(
+                            f"Non-streaming API call timed out after {int(_elapsed)}s "
+                            f"with no response (threshold: {int(_stale_timeout)}s)"
+                        )
                 break
 
             if self._interrupt_requested:
@@ -5242,6 +5390,8 @@ class AIAgent:
                     self._fire_reasoning_delta(reasoning_text)
 
                 # Accumulate text content — fire callback only when no tool calls
+                # GLM models stream both reasoning_content (thinking) and content (final answer)
+                # as separate fields. We accumulate both independently.
                 if delta and delta.content:
                     content_parts.append(delta.content)
                     if not tool_calls_acc:
@@ -5348,11 +5498,13 @@ class AIAgent:
                 effective_finish_reason = "length"
 
             full_reasoning = "".join(reasoning_parts) or None
+            # Only add reasoning_content for providers that support it
+            reasoning_content_to_use = full_reasoning if self._should_include_reasoning_content() else None
             mock_message = SimpleNamespace(
                 role=role,
                 content=full_content,
                 tool_calls=mock_tool_calls,
-                reasoning_content=full_reasoning,
+                reasoning_content=reasoning_content_to_use,
             )
             mock_choice = SimpleNamespace(
                 index=0,
@@ -5585,65 +5737,66 @@ class AIAgent:
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
 
-        t = threading.Thread(target=_call, daemon=True)
-        t.start()
-        while t.is_alive():
-            t.join(timeout=0.3)
+        with self._provider_concurrency_slot(purpose="streaming_api_call"):
+            t = threading.Thread(target=_call, daemon=True)
+            t.start()
+            while t.is_alive():
+                t.join(timeout=0.3)
 
-            # Detect stale streams: connections kept alive by SSE pings
-            # but delivering no real chunks.  Kill the client so the
-            # inner retry loop can start a fresh connection.
-            _stale_elapsed = time.time() - last_chunk_time["t"]
-            if _stale_elapsed > _stream_stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-                logger.warning(
-                    "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
-                    "model=%s context=~%s tokens. Killing connection.",
-                    _stale_elapsed, _stream_stale_timeout,
-                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-                )
-                self._emit_status(
-                    f"⚠️ No response from provider for {int(_stale_elapsed)}s "
-                    f"(model: {api_kwargs.get('model', 'unknown')}, "
-                    f"context: ~{_est_ctx:,} tokens). "
-                    f"Reconnecting..."
-                )
-                try:
-                    rc = request_client_holder.get("client")
-                    if rc is not None:
-                        self._close_request_openai_client(rc, reason="stale_stream_kill")
-                except Exception:
-                    pass
-                # Rebuild the primary client too — its connection pool
-                # may hold dead sockets from the same provider outage.
-                try:
-                    self._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
-                except Exception:
-                    pass
-                # Reset the timer so we don't kill repeatedly while
-                # the inner thread processes the closure.
-                last_chunk_time["t"] = time.time()
-                self._touch_activity(
-                    f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
-                )
+                # Detect stale streams: connections kept alive by SSE pings
+                # but delivering no real chunks.  Kill the client so the
+                # inner retry loop can start a fresh connection.
+                _stale_elapsed = time.time() - last_chunk_time["t"]
+                if _stale_elapsed > _stream_stale_timeout:
+                    _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+                    logger.warning(
+                        "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                        "model=%s context=~%s tokens. Killing connection.",
+                        _stale_elapsed, _stream_stale_timeout,
+                        api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    )
+                    self._emit_status(
+                        f"⚠️ No response from provider for {int(_stale_elapsed)}s "
+                        f"(model: {api_kwargs.get('model', 'unknown')}, "
+                        f"context: ~{_est_ctx:,} tokens). "
+                        f"Reconnecting..."
+                    )
+                    try:
+                        rc = request_client_holder.get("client")
+                        if rc is not None:
+                            self._close_request_openai_client(rc, reason="stale_stream_kill")
+                    except Exception:
+                        pass
+                    # Rebuild the primary client too — its connection pool
+                    # may hold dead sockets from the same provider outage.
+                    try:
+                        self._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
+                    except Exception:
+                        pass
+                    # Reset the timer so we don't kill repeatedly while
+                    # the inner thread processes the closure.
+                    last_chunk_time["t"] = time.time()
+                    self._touch_activity(
+                        f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
+                    )
 
-            if self._interrupt_requested:
-                try:
-                    if self.api_mode == "anthropic_messages":
-                        from agent.anthropic_adapter import build_anthropic_client
+                if self._interrupt_requested:
+                    try:
+                        if self.api_mode == "anthropic_messages":
+                            from agent.anthropic_adapter import build_anthropic_client
 
-                        self._anthropic_client.close()
-                        self._anthropic_client = build_anthropic_client(
-                            self._anthropic_api_key,
-                            getattr(self, "_anthropic_base_url", None),
-                        )
-                    else:
-                        request_client = request_client_holder.get("client")
-                        if request_client is not None:
-                            self._close_request_openai_client(request_client, reason="stream_interrupt_abort")
-                except Exception:
-                    pass
-                raise InterruptedError("Agent interrupted during streaming API call")
+                            self._anthropic_client.close()
+                            self._anthropic_client = build_anthropic_client(
+                                self._anthropic_api_key,
+                                getattr(self, "_anthropic_base_url", None),
+                            )
+                        else:
+                            request_client = request_client_holder.get("client")
+                            if request_client is not None:
+                                self._close_request_openai_client(request_client, reason="stream_interrupt_abort")
+                    except Exception:
+                        pass
+                    raise InterruptedError("Agent interrupted during streaming API call")
         if result["error"] is not None:
             if deltas_were_sent["yes"]:
                 # Streaming failed AFTER some tokens were already delivered to
@@ -6730,6 +6883,58 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
+    def _should_include_reasoning_content(self) -> bool:
+        """Determine if reasoning_content field should be included for the provider.
+        
+        Only certain providers (Moonshot AI, Kimi, Novita, OpenRouter) support and require
+        the reasoning_content field for tool calling with reasoning models. Including
+        this field for other providers (like OpenCode Go/Zen) causes HTTP 400 errors.
+        
+        However, when using Kimi models (kimi-k2.5, kimi-k2-thinking, etc.) via
+        opencode-go or opencode-zen, reasoning_content IS required because the
+        underlying model is Moonshot AI's Kimi.
+        
+        Returns:
+            bool: True if reasoning_content should be included, False otherwise.
+        """
+        provider = (getattr(self, "provider", "") or "").lower()
+        base = (getattr(self, "base_url", "") or "").lower()
+        model = (getattr(self, "model", "") or "").lower()
+        
+        # DEBUG: Log all values
+        print(f"[REASONING_DEBUG] provider={provider}, base={base}, model={model}", flush=True)
+        
+        # Providers that support reasoning_content
+        reasoning_providers = {
+            "moonshot",
+            "moonshot-cn", 
+            "kimi-coding",  # Kimi is Moonshot AI's international service
+            "novita",
+            "openrouter",
+            "zai",  # GLM models (GLM-4.7, GLM-5, etc.) send reasoning_content during streaming
+        }
+        
+        # Check by provider name
+        if provider in reasoning_providers:
+            print(f"[REASONING_DEBUG] Match by provider: {provider}", flush=True)
+            return True
+            
+        # Check by base URL patterns (kimi.com = Kimi/Moonshot)
+        reasoning_patterns = ["moonshot", "kimi", "novita", "openrouter"]
+        if any(pattern in base for pattern in reasoning_patterns):
+            print(f"[REASONING_DEBUG] Match by base: {base}", flush=True)
+            return True
+            
+        # Check if model is Kimi (even when accessed via opencode-go or opencode-zen)
+        # These models require reasoning_content even when accessed through a gateway
+        kimi_models = {"kimi-k2.5", "kimi-k2-thinking", "kimi-k2-thinking-turbo", "kimi-k2-turbo-preview", "kimi-k2-0905-preview"}
+        if any(kimi_model in model for kimi_model in kimi_models):
+            print(f"[REASONING_DEBUG] Match by kimi model: {model}", flush=True)
+            return True
+        
+        print(f"[REASONING_DEBUG] No match - returning False", flush=True)
+        return False
+
     def flush_memories(self, messages: list = None, min_turns: int = None):
         """Give the model one turn to persist memories before context is lost.
 
@@ -6774,7 +6979,7 @@ class AIAgent:
                 api_msg = msg.copy()
                 if msg.get("role") == "assistant":
                     reasoning = msg.get("reasoning")
-                    if reasoning:
+                    if reasoning and self._should_include_reasoning_content():
                         api_msg["reasoning_content"] = reasoning
                 api_msg.pop("reasoning", None)
                 api_msg.pop("finish_reason", None)
@@ -6903,11 +7108,17 @@ class AIAgent:
             (compressed_messages, new_system_prompt) tuple
         """
         _pre_msg_count = len(messages)
-        logger.info(
-            "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
-            self.session_id or "none", _pre_msg_count,
-            f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
-            focus_topic,
+        
+        # Calculate pre-compression stats for detailed logging
+        _pre_chars = sum(len(str(m.get("content") or "")) for m in messages)
+        _pre_tool_calls = sum(len(m.get("tool_calls") or []) for m in messages)
+        
+        logger.warning(
+            "[CONTEXT_COMPRESSION] Session %s starting compression: "
+            "messages=%d, chars=%d, tool_calls=%d, tokens~%s, model=%s, focus=%r",
+            self.session_id or "none", _pre_msg_count, _pre_chars, _pre_tool_calls,
+            f"{approx_tokens:,}" if approx_tokens else "unknown", 
+            self.model, focus_topic,
         )
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
@@ -6998,10 +7209,21 @@ class AIAgent:
         except Exception:
             pass
 
-        logger.info(
-            "context compression done: session=%s messages=%d->%d tokens=~%s",
-            self.session_id or "none", _pre_msg_count, len(compressed),
+        # Calculate post-compression stats
+        _post_chars = sum(len(str(m.get("content") or "")) for m in compressed)
+        
+        logger.warning(
+            "[CONTEXT_COMPRESSION] Session %s completed: "
+            "messages=%d->%d (%d dropped), chars=%d->%d (saved %d), "
+            "tokens~%s, model=%s, new_session=%s, parent_session=%s, compression_count=%d",
+            self.session_id or "none", 
+            _pre_msg_count, len(compressed), _pre_msg_count - len(compressed),
+            _pre_chars, _post_chars, _pre_chars - _post_chars,
             f"{_compressed_est:,}",
+            self.model,
+            self.session_id,  # new session ID
+            locals().get('old_session_id', 'unknown'),  # parent session
+            _cc,
         )
         return compressed, new_system_prompt
 
@@ -7398,15 +7620,12 @@ class AIAgent:
             # Instead of executing locally, we'll return the tool call in the response
             # so the client (opencode) can execute it locally
             if hasattr(self, 'client_tool_names') and function_name in self.client_tool_names:
-                # Mark this tool call to route back to client
-                tool_call._route_to_client = True
-
                 # Fix: Populate missing required parameters from tool schema
                 # The model may omit required fields, but the client expects complete arguments
-                try:
-                    function_args = json.loads(tool_call.function.arguments)
-                except (json.JSONDecodeError, TypeError):
-                    function_args = {}
+                function_args = self._normalize_client_tool_args(
+                    function_name,
+                    getattr(tool_call.function, "arguments", None),
+                )
                 if isinstance(function_args, dict):
                     # Look up the tool schema to find required parameters
                     required_params = set()
@@ -7435,9 +7654,36 @@ class AIAgent:
                     if function_name in ("bash", "terminal") and "description" not in function_args:
                         function_args["description"] = f"Execute command: {function_args.get('command', '')[:100]}"
 
+                    missing_required = []
+                    for req_param in required_params:
+                        value = function_args.get(req_param)
+                        if req_param == "command":
+                            if not isinstance(value, str) or not value.strip():
+                                missing_required.append(req_param)
+                            continue
+                        if value is None:
+                            missing_required.append(req_param)
+
+                    if missing_required:
+                        missing_str = ", ".join(sorted(missing_required))
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": (
+                                f"Error: Missing required tool argument(s) for '{function_name}': {missing_str}. "
+                                "Retry with complete JSON arguments that satisfy the tool schema."
+                            ),
+                        })
+                        if not self.quiet_mode:
+                            print(f"  ⚠️  Client tool rejected: {function_name} missing {missing_str}")
+                        continue
+
                     # Re-serialize the enriched arguments
                     enriched_args = json.dumps(function_args, ensure_ascii=False)
                     tool_call.function.arguments = enriched_args
+
+                # Mark this tool call to route back to client only after validation
+                tool_call._route_to_client = True
 
                 # Add to messages as pending - client will handle execution
                 pending_msg = {
@@ -7802,6 +8048,19 @@ class AIAgent:
         from agent.display import format_context_pressure, format_context_pressure_gateway
 
         threshold_pct = compressor.threshold_tokens / compressor.context_length if compressor.context_length else 0.5
+        
+        # Log context pressure state
+        logger.warning(
+            "[CONTEXT_PRESSURE] Session %s context pressure: progress=%.1f%% threshold=%.1f%% "
+            "(%s/%s tokens) model=%s compression_enabled=%s",
+            self.session_id or "none",
+            compaction_progress * 100,
+            threshold_pct * 100,
+            f"{compressor.threshold_tokens:,}",
+            f"{compressor.context_length:,}",
+            self.model,
+            self.compression_enabled,
+        )
 
         # CLI output — always shown (these are user-facing status notifications,
         # not verbose debug output, so they bypass quiet_mode).
@@ -8200,12 +8459,15 @@ class AIAgent:
             )
 
             if _preflight_tokens >= self.context_compressor.threshold_tokens:
-                logger.info(
-                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                logger.warning(
+                    "[CONTEXT_PRESSURE] Session %s preflight compression triggered: "
+                    "~%s tokens >= %s threshold (model %s, ctx %s, msg_count=%d)",
+                    self.session_id or "none",
                     f"{_preflight_tokens:,}",
                     f"{self.context_compressor.threshold_tokens:,}",
                     self.model,
                     f"{self.context_compressor.context_length:,}",
+                    len(messages),
                 )
                 if not self.quiet_mode:
                     self._safe_print(
@@ -8396,7 +8658,7 @@ class AIAgent:
                 # This ensures multi-turn reasoning context is preserved
                 if msg.get("role") == "assistant":
                     reasoning_text = msg.get("reasoning")
-                    if reasoning_text:
+                    if reasoning_text and self._should_include_reasoning_content():
                         # Add reasoning_content for API compatibility (Moonshot AI, Novita, OpenRouter)
                         api_msg["reasoning_content"] = reasoning_text
 
@@ -9863,6 +10125,19 @@ class AIAgent:
                                     _retry_after = max(1, int(float(_ra_raw)))
                                 except (TypeError, ValueError):
                                     pass
+                        if not _retry_after:
+                            _cooldown_hint = self._summarize_api_error(api_error).lower()
+                            if any(token in _cooldown_hint for token in (
+                                "freeusagelimiterror",
+                                "free usage limit",
+                                "rate limit exceeded",
+                                "usage limit",
+                            )):
+                                # Some gateways omit Retry-After for quota/rate-limit
+                                # failures. Persist a short cooldown anyway so later
+                                # requests can skip the known-bad primary model and
+                                # fail over immediately.
+                                _retry_after = 300
                     if is_rate_limited and _retry_after:
                         self._record_current_model_cooldown(
                             _retry_after,
