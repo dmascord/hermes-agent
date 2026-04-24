@@ -1230,9 +1230,12 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 user_message = ""
                 history = conversation_messages
-        # Derive a temporary session ID from conversation for logging before real session is established
-        _pre_session_id = f"pre-session-{hash(str(conversation_messages[:3]))}"
-        history = _compact_message_history(history, session_id=_pre_session_id)
+        # NOTE: Message history is NOT pre-truncated here. The agent's own
+        # context compressor (agent/context_compressor.py) handles context
+        # overflow adaptively based on the actual model's context window.
+        # Pre-truncation was destroying context for large conversations.
+        # Dynamic model selection now picks a model with enough context
+        # for the conversation size, so pre-truncation is unnecessary.
 
         # Tool loop prevention: allow legitimate OpenAI tool continuation
         # (assistant tool_calls -> tool results), but reject orphaned tool-only
@@ -1309,7 +1312,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
-        history = _compact_message_history(history, session_id=session_id)
+        # NOTE: Message history is NOT pre-truncated. Agent's context compressor
+        # handles overflow based on actual model's context window.
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -2353,10 +2357,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("truncation") == "auto" and len(conversation_history) > 100:
             conversation_history = conversation_history[-100:]
 
-        # Compact message history to keep request bodies bounded
-        # Use temporary session ID since session_id not yet established
-        _pre_session_id = f"responses-pre-{hash(str(conversation_history[:3]))}"
-        conversation_history = _compact_message_history(conversation_history, session_id=_pre_session_id)
+        # NOTE: Message history is NOT pre-truncated. Agent's context compressor
+        # handles overflow based on actual model's context window.
 
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
