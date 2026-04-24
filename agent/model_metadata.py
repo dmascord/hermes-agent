@@ -133,6 +133,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Official docs: https://help.aliyun.com/zh/model-studio/developer-reference/
     "qwen3-coder-plus": 1000000,  # 1M context
     "qwen3-coder": 262144,        # 256K context
+    "qwen3.5-plus": 131072,       # 131K context (Alibaba/DashScope qwen3.5-plus-02-15)
     "qwen": 131072,
     # MiniMax — official docs: 204,800 context for all models
     # https://platform.minimax.io/docs/api-reference/text-anthropic-api

@@ -898,6 +898,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     runtime_kwargs["base_url"] = "https://api.z.ai/api/coding/paas/v4"
                     runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
                     runtime_kwargs["provider"] = "zai"
+                # Handle Qwen models via Alibaba DashScope on OpenCode Zen
+                elif provider_prefix == "qwen":
+                    runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+                    runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
+                    runtime_kwargs["provider"] = "alibaba"
                 # Handle OpenRouter models (default)
                 elif provider_prefix != "local":
                     runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
@@ -2389,14 +2394,43 @@ class APIServerAdapter(BasePlatformAdapter):
         swarm_model_pool = None
         if _model_name == "hermes-swarm":
             swarm_mode = True
+            # Build the full fallback chain (same as streaming handler)
+            _fallback_chain = [
+                os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
+            ]
+            for idx in range(1, 33):
+                fb = os.getenv(f"HERMES_SWARM_FALLBACK_{idx}", "").strip()
+                if fb:
+                    _fallback_chain.append(fb)
+
+            from agent.model_metadata import get_model_context_length_quick, estimate_request_tokens_rough
+            _approx_tokens = 0
+            try:
+                _approx_tokens = estimate_request_tokens_rough(
+                    conversation_history or [],
+                    system_prompt=instructions or "",
+                    tools=None,
+                )
+            except Exception:
+                pass
+
+            _selected_model = _fallback_chain[0]
+            _selected_ctx = get_model_context_length_quick(_selected_model)
+            for _m in _fallback_chain[1:]:
+                _ctx = get_model_context_length_quick(_m)
+                if _ctx > _selected_ctx and _approx_tokens < int(_ctx * 0.70):
+                    _selected_model = _m
+                    _selected_ctx = _ctx
+                    break
+
             swarm_model_pool = {
-                "primary": os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
-                "fallbacks": [
-                    os.getenv("HERMES_SWARM_FALLBACK_1", "openrouter/free"),
-                    os.getenv("HERMES_SWARM_FALLBACK_2", "nvidia/nemotron-nano-9b-v2:free"),
-                    os.getenv("HERMES_SWARM_FALLBACK_3", "google/gemma-4-26b-a4b-it:free"),
-                ],
+                "primary": _selected_model,
+                "fallbacks": _fallback_chain,
                 "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
+                "large_context_fallbacks": [
+                    m for m in _fallback_chain
+                    if get_model_context_length_quick(m) > _selected_ctx
+                ],
             }
 
         stream = bool(body.get("stream", False))

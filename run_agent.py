@@ -6901,9 +6901,6 @@ class AIAgent:
         base = (getattr(self, "base_url", "") or "").lower()
         model = (getattr(self, "model", "") or "").lower()
         
-        # DEBUG: Log all values
-        print(f"[REASONING_DEBUG] provider={provider}, base={base}, model={model}", flush=True)
-        
         # Providers that support reasoning_content
         reasoning_providers = {
             "moonshot",
@@ -6916,23 +6913,19 @@ class AIAgent:
         
         # Check by provider name
         if provider in reasoning_providers:
-            print(f"[REASONING_DEBUG] Match by provider: {provider}", flush=True)
             return True
             
         # Check by base URL patterns (kimi.com = Kimi/Moonshot)
         reasoning_patterns = ["moonshot", "kimi", "novita", "openrouter"]
         if any(pattern in base for pattern in reasoning_patterns):
-            print(f"[REASONING_DEBUG] Match by base: {base}", flush=True)
             return True
             
         # Check if model is Kimi (even when accessed via opencode-go or opencode-zen)
         # These models require reasoning_content even when accessed through a gateway
         kimi_models = {"kimi-k2.5", "kimi-k2-thinking", "kimi-k2-thinking-turbo", "kimi-k2-turbo-preview", "kimi-k2-0905-preview"}
         if any(kimi_model in model for kimi_model in kimi_models):
-            print(f"[REASONING_DEBUG] Match by kimi model: {model}", flush=True)
             return True
         
-        print(f"[REASONING_DEBUG] No match - returning False", flush=True)
         return False
 
     def flush_memories(self, messages: list = None, min_turns: int = None):
