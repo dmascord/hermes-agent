@@ -1,0 +1,85 @@
+services:
+  hermes-swarm:
+    image: hermes-agent:latest
+    container_name: hermes-swarm
+    restart: unless-stopped
+    networks:
+      - traefik
+    volumes:
+      - /srv/opencode/hermes-swarm-home:/home/tusker/.hermes
+    environment:
+      # ── API Server ──────────────────────────────────────────────
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: "0.0.0.0"
+      API_SERVER_PORT: "8642"
+      API_SERVER_CORS_ORIGINS: "*"
+      API_SERVER_KEY: "${API_SERVER_KEY}"
+
+      # ── Hermes-Swarm Model Pool ────────────────────────────────
+      # Primary model (cheapest credits on OpenCode Zen)
+      HERMES_SWARM_PRIMARY_MODEL: "qwen3.5-plus"
+
+      # Fallback chain — scanned left-to-right; code selects the best-fit
+      # model based on estimated request size (context-aware routing).
+      # Duplicate entries have been removed.
+      HERMES_SWARM_FALLBACK_1: "opencode-go/minimax-m2.7"
+      HERMES_SWARM_FALLBACK_2: "zai/glm-4.7"
+      HERMES_SWARM_FALLBACK_3: "opencode-zen/big-pickle"
+      HERMES_SWARM_FALLBACK_4: "opencode-zen/minimax-m2.5-free"
+      HERMES_SWARM_FALLBACK_5: "opencode-zen/gpt-5-nano"
+      HERMES_SWARM_FALLBACK_6: "opencode-zen/nemotron-3-super-free"
+      HERMES_SWARM_FALLBACK_7: "opencode-zen/hy3-preview-free"
+      HERMES_SWARM_FALLBACK_8: "opencode-zen/ling-2.6-flash-free"
+      HERMES_SWARM_FALLBACK_9: "openai/gpt-5.3-codex"
+      HERMES_SWARM_FALLBACK_10: "openai/gpt-5.2-codex"
+      HERMES_SWARM_FALLBACK_11: "openai/gpt-5-mini"
+      HERMES_SWARM_FALLBACK_12: "github-copilot/gpt-5-mini"
+      HERMES_SWARM_FALLBACK_13: "google/gemma-4-26b-a4b-it:free"
+      HERMES_SWARM_FALLBACK_14: "google/gemini-2.5-flash"
+      HERMES_SWARM_FALLBACK_15: "nvidia/nemotron-nano-9b-v2:free"
+      HERMES_SWARM_FALLBACK_16: "nvidia/nemotron-3-super-120b-a12b:free"
+      HERMES_SWARM_FALLBACK_17: "openrouter/google/gemma-3-5b-eu:free"
+      HERMES_SWARM_FALLBACK_18: "openrouter/meta-llama/llama-3.1-8b-instruct:free"
+      HERMES_SWARM_FALLBACK_19: "openrouter/mistralai/mistral-7b-instruct:free"
+
+      HERMES_SWARM_SELECTION_POLICY: "cost-balanced"
+      HERMES_SWARM_MAX_TOKENS: "4000"
+      HERMES_SWARM_DAILY_TOKEN_LIMIT: "50000"
+
+      # ── Hermes-Code & Hermes-Agent ────────────────────────────
+      HERMES_INFERENCE_PROVIDER: "zai"
+      HERMES_CODE_MODEL: "openai/gpt-5.4"
+      HERMES_AGENT_MODEL: "opencode-zen/big-pickle"
+      HERMES_AGENTIC_FULL_MODEL: "opencode-zen/big-pickle"
+      HERMES_AGENTIC_REMOTE_MODEL: "opencode-zen/big-pickle"
+
+      # ── Provider API Keys ─────────────────────────────────────
+      # OpenCode platforms
+      OPENCODE_ZEN_API_KEY: "${OPENCODE_ZEN_API_KEY}"
+      OPENCODE_GO_API_KEY: "${OPENCODE_GO_API_KEY}"
+      # Third-party providers
+      ZAI_API_KEY: "${ZAI_API_KEY}"
+      GLM_API_KEY: "${GLM_API_KEY}"
+      MINIMAX_API_KEY: "${MINIMAX_API_KEY}"
+      GROQ_API_KEY: "${GROQ_API_KEY}"
+      COHERE_API_KEY: "${COHERE_API_KEY}"
+      CEREBRAS_API_KEY: "${CEREBRAS_API_KEY}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      ARCEEAI_API_KEY: "${ARCEEAI_API_KEY}"
+
+      # ── Gateway ───────────────────────────────────────────────
+      GATEWAY_ALLOW_ALL_USERS: "true"
+
+    # Traefik labels — routes https://hermes.tusker.net.au to this container
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.hermes-swarm.rule=Host(`hermes.tusker.net.au`)"
+      - "traefik.http.routers.hermes-swarm.entrypoints=websecure"
+      - "traefik.http.routers.hermes-swarm.tls=true"
+      - "traefik.http.services.hermes-swarm.loadbalancer.server.port=8642"
+      - "traefik.docker.network=traefik"
+
+networks:
+  traefik:
+    external: true
