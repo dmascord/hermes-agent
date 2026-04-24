@@ -16,8 +16,8 @@ services:
       API_SERVER_KEY: "${API_SERVER_KEY}"
 
       # ── Hermes-Swarm Model Pool ────────────────────────────────
-      # Primary model (cheapest credits on OpenCode Zen)
-      HERMES_SWARM_PRIMARY_MODEL: "qwen3.5-plus"
+      # Primary model (cheapest credits on OpenCode Go)
+      HERMES_SWARM_PRIMARY_MODEL: "opencode-go/qwen3.5-plus"
 
       # Fallback chain — scanned left-to-right; code selects the best-fit
       # model based on estimated request size (context-aware routing).
