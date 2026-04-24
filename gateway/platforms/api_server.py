@@ -1346,54 +1346,45 @@ class APIServerAdapter(BasePlatformAdapter):
         swarm_model_pool = None
         if model_name == "hermes-swarm":
             swarm_mode = True
-            # Build the fallback chain for potential dynamic context switching
-            _fallback_chain = [
-                os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
-            ]
+            # Build the full fallback chain for potential dynamic context switching.
+            # IMPORTANT: Always use HERMES_SWARM_PRIMARY_MODEL as the primary.
+            # Context-aware pre-selection is NOT applied — the primary model is used
+            # as-is. When context overflow occurs at API call time, _resolve_swarm_model()
+            # will automatically switch to a large-context fallback.
+            # This ensures the primary model is always used (e.g. qwen3.5-plus on OpenCode Go)
+            # instead of being swapped out for a different model based on token estimates.
+            _primary_model = os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free")
+            _fallback_chain = [_primary_model]
             for idx in range(1, 33):
                 fb = os.getenv(f"HERMES_SWARM_FALLBACK_{idx}", "").strip()
                 if fb:
                     _fallback_chain.append(fb)
-            
-            # Dynamic context switching: estimate request size and pick the right model.
-            # If the conversation is large and we have larger-context options, 
-            # use them first instead of compressing.
-            from agent.model_metadata import get_model_context_length_quick, estimate_request_tokens_rough
-            _approx_tokens = 0
-            try:
-                _approx_tokens = estimate_request_tokens_rough(
-                    conversation_history or [],
-                    system_prompt=instructions or "",
-                    tools=tools,
-                )
-            except Exception:
-                pass
-            
-            # Find the best model: scan chain for first model with enough context (>80% of its limit)
-            _selected_model = _fallback_chain[0]
-            _selected_ctx = get_model_context_length_quick(_selected_model)
-            for _m in _fallback_chain:
-                _ctx = get_model_context_length_quick(_m)
-                # Use this model if it's significantly larger than current pick
-                # and the estimated tokens fit within ~70% of its capacity
-                if _ctx > _selected_ctx and _approx_tokens < int(_ctx * 0.70):
-                    _selected_model = _m
-                    _selected_ctx = _ctx
-                    break  # First sufficiently-large model wins
-            
+
+            # Deduplicate while preserving order
+            _seen = set()
+            _deduped = []
+            for m in _fallback_chain:
+                if m not in _seen:
+                    _seen.add(m)
+                    _deduped.append(m)
+            _fallback_chain = _deduped
+
+            from agent.model_metadata import get_model_context_length_quick
+            _primary_ctx = get_model_context_length_quick(_primary_model)
+
             swarm_model_pool = {
-                "primary": _selected_model,
+                "primary": _primary_model,
                 "fallbacks": _fallback_chain,
                 "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
                 "large_context_fallbacks": [
                     m for m in _fallback_chain
-                    if get_model_context_length_quick(m) > _selected_ctx
+                    if get_model_context_length_quick(m) > _primary_ctx
                 ],
             }
             logger.info(
-                "[api_server] swarm context estimate: %s tokens, selected model: %s (ctx %s), "
+                "[api_server] swarm pool: primary=%s (ctx %s), fallbacks=%d models, "
                 "large-context options: %s",
-                _approx_tokens, _selected_model, _selected_ctx,
+                _primary_model, _primary_ctx, len(_fallback_chain),
                 swarm_model_pool["large_context_fallbacks"],
             )
         
