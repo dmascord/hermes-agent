@@ -933,6 +933,44 @@ def _resolve_nous_context_length(model: str) -> Optional[int]:
     return None
 
 
+def get_model_context_length_quick(model: str, *, base_url: str = "", api_key: str = "", provider: str = "") -> int:
+    """Fast context-length lookup without network probes.
+
+    Returns context length from (in order):
+    1. Persistent disk cache
+    2. Hardcoded DEFAULT_CONTEXT_LENGTHS table
+    3. DEFAULT_FALLBACK_CONTEXT (128K)
+
+    Skips all network calls (OpenRouter, models.dev, etc.) so it's
+    safe to call for every request without adding latency.
+    """
+    # Normalize
+    if "/" in model:
+        base = model.split("/")[-1].lower()
+    else:
+        base = model.lower()
+
+    # 1. Cache lookup
+    key = f"{model}@{base_url}"
+    cache = _load_context_cache()
+    if key in cache:
+        return cache[key]
+
+    # 2. Hardcoded table (longest-match wins)
+    best = 0
+    best_name = ""
+    for key_name, ctx_len in DEFAULT_CONTEXT_LENGTHS.items():
+        if key_name in base:
+            if len(key_name) > len(best_name):
+                best = ctx_len
+                best_name = key_name
+    if best:
+        return best
+
+    # 3. Default fallback
+    return DEFAULT_FALLBACK_CONTEXT
+
+
 def get_model_context_length(
     model: str,
     base_url: str = "",

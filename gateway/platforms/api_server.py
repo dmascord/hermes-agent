@@ -52,12 +52,32 @@ logger = logging.getLogger(__name__)
 # Default settings
 
 
-def _resolve_swarm_model(pool):
-    """Resolve a model from the swarm pool based on selection policy."""
+def _resolve_swarm_model(pool, *, context_overflow: bool = False):
+    """Resolve a model from the swarm pool based on selection policy.
+
+    When context_overflow is True and large_context_fallbacks are available,
+    switch to the largest available model (no compression needed).
+    """
     import random, os
     primary = pool.get("primary", "")
     fallbacks = pool.get("fallbacks", [])
+    large_context_fallbacks = pool.get("large_context_fallbacks", [])
     policy = pool.get("selection_policy", "cost-balanced")
+    
+    # Context overflow path: use a large-context model instead of compressing
+    if context_overflow and large_context_fallbacks:
+        from agent.model_metadata import get_model_context_length_quick
+        # Sort large-context models by context length descending, pick the largest
+        _sorted = sorted(
+            large_context_fallbacks,
+            key=lambda m: get_model_context_length_quick(m),
+            reverse=True,
+        )
+        if _sorted:
+            logger.info(f"[api_server] context overflow — switching to large-context model: {_sorted[0]}")
+            return _sorted[0]
+        # Fall through to normal selection if large-context list is empty
+    
     if primary:
         return primary
     if not fallbacks:
@@ -68,6 +88,23 @@ def _resolve_swarm_model(pool):
         cheap = [m for m in fallbacks if any(x in m for x in ["gemma", "free", "nemotron"])]
         return random.choice(cheap) if cheap else fallbacks[0]
     return fallbacks[0]
+
+
+# Pattern for detecting context overflow errors
+_CONTEXT_OVERFLOW_PATTERNS = (
+    "context length", "context size", "maximum context", "token limit",
+    "too many tokens", "context window", "prompt is too long",
+    "context length exceeded", "context overflow", "too many input tokens",
+    "maximum tokens", "output tokens", "context_exceeded",
+)
+
+
+def _is_context_overflow_error(error_msg: str) -> bool:
+    """Return True if error_msg indicates a context-length overflow."""
+    if not error_msg:
+        return False
+    msg_lower = error_msg.lower()
+    return any(pat in msg_lower for pat in _CONTEXT_OVERFLOW_PATTERNS)
 
 
 _EXPLICIT_MODEL_PROVIDER_ALIASES = {
@@ -1300,15 +1337,56 @@ class APIServerAdapter(BasePlatformAdapter):
         swarm_model_pool = None
         if model_name == "hermes-swarm":
             swarm_mode = True
+            # Build the fallback chain for potential dynamic context switching
+            _fallback_chain = [
+                os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
+            ]
+            for idx in range(1, 33):
+                fb = os.getenv(f"HERMES_SWARM_FALLBACK_{idx}", "").strip()
+                if fb:
+                    _fallback_chain.append(fb)
+            
+            # Dynamic context switching: estimate request size and pick the right model.
+            # If the conversation is large and we have larger-context options, 
+            # use them first instead of compressing.
+            from agent.model_metadata import get_model_context_length_quick, estimate_request_tokens_rough
+            _approx_tokens = 0
+            try:
+                _approx_tokens = estimate_request_tokens_rough(
+                    conversation_history or [],
+                    system_prompt=instructions or "",
+                    tools=tools,
+                )
+            except Exception:
+                pass
+            
+            # Find the best model: scan chain for first model with enough context (>80% of its limit)
+            _selected_model = _fallback_chain[0]
+            _selected_ctx = get_model_context_length_quick(_selected_model)
+            for _m in _fallback_chain:
+                _ctx = get_model_context_length_quick(_m)
+                # Use this model if it's significantly larger than current pick
+                # and the estimated tokens fit within ~70% of its capacity
+                if _ctx > _selected_ctx and _approx_tokens < int(_ctx * 0.70):
+                    _selected_model = _m
+                    _selected_ctx = _ctx
+                    break  # First sufficiently-large model wins
+            
             swarm_model_pool = {
-                "primary": os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
-                "fallbacks": [
-                    os.getenv("HERMES_SWARM_FALLBACK_1", "openrouter/free"),
-                    os.getenv("HERMES_SWARM_FALLBACK_2", "nvidia/nemotron-nano-9b-v2:free"),
-                    os.getenv("HERMES_SWARM_FALLBACK_3", "google/gemma-4-26b-a4b-it:free"),
-                ],
+                "primary": _selected_model,
+                "fallbacks": _fallback_chain,
                 "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
+                "large_context_fallbacks": [
+                    m for m in _fallback_chain
+                    if get_model_context_length_quick(m) > _selected_ctx
+                ],
             }
+            logger.info(
+                "[api_server] swarm context estimate: %s tokens, selected model: %s (ctx %s), "
+                "large-context options: %s",
+                _approx_tokens, _selected_model, _selected_ctx,
+                swarm_model_pool["large_context_fallbacks"],
+            )
         
         created = int(time.time())
 
@@ -1426,6 +1504,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 force_connection_close=force_connection_close,
+                swarm_model_pool=swarm_model_pool,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1580,7 +1659,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        force_connection_close: bool = False,
+        force_connection_close: bool = False, swarm_model_pool: dict = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
