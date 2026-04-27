@@ -11,14 +11,18 @@
 #   - .env file in the hermes-agent directory (copy from .env.swarm.example)
 #   - Being on the remote server (or running with SSH agent forwarded)
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-# Source .env if it exists
+export COMPOSE_BAKE=false
+
 if [[ -f .env ]]; then
-  export $(grep -v '^#' .env | xargs) 2>/dev/null || true
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
 fi
 
 NO_BUILD=false
@@ -56,7 +60,7 @@ echo "=== Building hermes-agent Docker image ==="
 if [[ "$NO_BUILD" == "true" ]]; then
   echo "[skip] --no-build flag set"
 else
-  docker compose build --no-cache
+  docker build -t hermes-agent:latest .
 fi
 
 echo ""
@@ -71,21 +75,27 @@ echo ""
 echo "=== Waiting for health check ==="
 for i in $(seq 1 15); do
   sleep 2
-  HEALTH=$(curl -sf --max-time 5 "https://hermes.tusker.net.au/health" \
+  HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:8642/health" \
     -H "Authorization: Bearer ${API_SERVER_KEY}" 2>/dev/null || echo "waiting...")
   if [[ "$HEALTH" == *"ok"* ]]; then
-    echo "✓ hermes-swarm is healthy"
+    echo "✓ hermes-swarm is healthy on localhost"
     break
   fi
   echo "  attempt $i/15 — $HEALTH"
 done
 
 echo ""
-echo "=== Container status ==="
-docker compose ps
-
-echo ""
 echo "=== Public health check ==="
 curl -sf --max-time 5 "https://hermes.tusker.net.au/health" \
   -H "Authorization: Bearer ${API_SERVER_KEY}" \
-  && echo "" || echo "Health check failed — check logs with: $0 --logs"
+  >/dev/null && echo "✓ public /health reachable" || echo "Public /health check failed — check logs with: $0 --logs"
+
+echo ""
+echo "=== Public models check ==="
+curl -sf --max-time 5 "https://hermes.tusker.net.au/v1/models" \
+  -H "Authorization: Bearer ${API_SERVER_KEY}" \
+  >/dev/null && echo "✓ public /v1/models reachable" || echo "Public /v1/models check failed — check logs with: $0 --logs"
+
+echo ""
+echo "=== Container status ==="
+docker compose ps

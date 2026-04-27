@@ -209,6 +209,34 @@ class TestExplicitModelRuntimeAlignment:
         assert called["value"] is False
 
 
+class TestSwarmRuntimeKwargs:
+    def test_runtime_kwargs_for_openai_model_uses_codex_when_only_oauth_exists(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_OAUTH_TOKEN", "oauth-token")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        runtime_kwargs, model_name = adapter._runtime_kwargs_for_model("openai/gpt-5.4")
+
+        assert model_name == "gpt-5.4"
+        assert runtime_kwargs["provider"] == "openai-codex"
+        assert runtime_kwargs["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert runtime_kwargs["api_key"] == "oauth-token"
+
+    def test_runtime_kwargs_for_openai_model_uses_direct_api_with_openai_key(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        monkeypatch.delenv("OPENAI_OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        runtime_kwargs, model_name = adapter._runtime_kwargs_for_model("openai/gpt-5.4")
+
+        assert model_name == "gpt-5.4"
+        assert runtime_kwargs["provider"] == "openai"
+        assert runtime_kwargs["base_url"] == "https://api.openai.com/v1"
+        assert runtime_kwargs["api_key"] == "sk-openai"
+
+
 # ---------------------------------------------------------------------------
 # Auth checking
 # ---------------------------------------------------------------------------

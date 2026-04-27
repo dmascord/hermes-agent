@@ -81,6 +81,7 @@ _PROVIDER_ALIASES = {
     "claude-local": "claude-cli",
     "claude-code-cli": "claude-cli",
     "claude-code-mcp": "claude-code-mcp",
+    "github-copilot": "copilot",
 }
 
 
@@ -726,6 +727,15 @@ def _read_codex_access_token() -> Optional[str]:
     fallback-to-Codex working when the pool state is stale but the stored OAuth
     token is still valid.
     """
+    env_token = (
+        os.getenv("OPENAI_CODEX_API_KEY", "").strip()
+        or os.getenv("OPENAI_OAUTH_TOKEN", "").strip()
+        or os.getenv("OPENAI_CODEX_TOKEN", "").strip()
+        or os.getenv("CODEX_ACCESS_TOKEN", "").strip()
+    )
+    if env_token:
+        return env_token
+
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         token = _pool_runtime_api_key(entry)

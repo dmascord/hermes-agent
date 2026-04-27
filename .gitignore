@@ -62,3 +62,7 @@ mini-swe-agent/
 .direnv/
 result
 website/static/api/skills-index.json
+
+# Local investigation / backup artifacts
+*.bak
+*.bak.*

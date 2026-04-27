@@ -935,14 +935,14 @@ class AIAgent:
                 if effective_key and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
         else:
-            if api_key and base_url:
+            if api_key and (base_url or self.provider == "openai-codex"):
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
-                client_kwargs = {"api_key": api_key, "base_url": base_url}
+                effective_base = base_url or "https://chatgpt.com/backend-api/codex"
+                client_kwargs = {"api_key": api_key, "base_url": effective_base}
                 if self.provider == "copilot-acp":
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
-                effective_base = base_url
                 if "openrouter" in effective_base.lower():
                     client_kwargs["default_headers"] = {
                         "HTTP-Referer": "https://hermes-agent.nousresearch.com",
@@ -2352,6 +2352,48 @@ class AIAgent:
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
 
+    @staticmethod
+    def _sanitize_message_for_persistence(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Drop transient artifacts and normalize assistant/tool turns before persistence."""
+        if not isinstance(msg, dict):
+            return None
+        if msg.get("_flush_sentinel"):
+            return None
+        if msg.get("_pending_client_execution"):
+            return None
+
+        cleaned = dict(msg)
+        role = str(cleaned.get("role") or "").strip().lower()
+
+        if role == "assistant":
+            if cleaned.get("finish_reason") == "incomplete":
+                return None
+            tool_calls = cleaned.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                # Keep tool call structure for continuity, but don't persist
+                # mixed prose/tool commentary that can be stitched into later
+                # summaries or compaction artifacts.
+                cleaned["content"] = ""
+            # Strip reasoning_content - it should only be used for streaming display
+            # (via _fire_reasoning_delta), NOT persisted to session history.
+            # Persisting it causes corrupted/stitched text in subsequent LLM calls
+            # when models receive reasoning_content fields they don't expect.
+            cleaned.pop("reasoning_content", None)
+        elif role == "tool":
+            content = str(cleaned.get("content") or "")
+            if content.startswith("[Tool '") and "queued for client execution" in content:
+                return None
+
+        return cleaned
+
+    def _messages_for_persistence(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        persisted: List[Dict[str, Any]] = []
+        for msg in messages or []:
+            cleaned = self._sanitize_message_for_persistence(msg)
+            if cleaned is not None:
+                persisted.append(cleaned)
+        return persisted
+
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -2362,6 +2404,7 @@ class AIAgent:
         if not self._session_db:
             return
         self._apply_persist_user_message_override(messages)
+        persisted_messages = self._messages_for_persistence(messages)
         try:
             # If create_session() failed at startup (e.g. transient lock), the
             # session row may not exist yet.  ensure_session() uses INSERT OR
@@ -2371,9 +2414,10 @@ class AIAgent:
                 source=self.platform or "cli",
                 model=self.model,
             )
-            start_idx = len(conversation_history) if conversation_history else 0
+            persisted_history = self._messages_for_persistence(conversation_history or [])
+            start_idx = len(persisted_history) if persisted_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
-            for msg in messages[flush_from:]:
+            for msg in persisted_messages[flush_from:]:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 tool_calls_data = None
@@ -2396,7 +2440,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                 )
-            self._last_flushed_db_idx = len(messages)
+            self._last_flushed_db_idx = len(persisted_messages)
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 
@@ -2901,6 +2945,9 @@ class AIAgent:
         Overwritten after each turn so it always reflects the latest state.
         """
         messages = messages or self._session_messages
+        if not messages:
+            return
+        messages = self._messages_for_persistence(messages)
         if not messages:
             return
 
@@ -4981,6 +5028,22 @@ class AIAgent:
         the main retry loop can try again with backoff / credential rotation /
         provider fallback.
         """
+        # Codex Responses already streams incrementally inside _run_codex_stream().
+        # Running that path inside the worker-thread wrapper has been observed to
+        # return None even when the direct client call succeeds and produces a
+        # valid ParsedResponse. Execute Codex synchronously here to preserve the
+        # successful response object for downstream normalization.
+        if self.api_mode == "codex_responses":
+            request_client = self._create_request_openai_client(reason="codex_stream_request")
+            try:
+                return self._run_codex_stream(
+                    api_kwargs,
+                    client=request_client,
+                    on_first_delta=getattr(self, "_codex_on_first_delta", None),
+                )
+            finally:
+                self._close_request_openai_client(request_client, reason="request_complete")
+
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
 
@@ -8654,6 +8717,12 @@ class AIAgent:
                     if reasoning_text and self._should_include_reasoning_content():
                         # Add reasoning_content for API compatibility (Moonshot AI, Novita, OpenRouter)
                         api_msg["reasoning_content"] = reasoning_text
+
+                # Strip reasoning_content if provider doesn't support it - left over from
+                # shallow copy or previous turns. Prevents corrupted responses when models
+                # receive reasoning_content fields they don't understand.
+                if msg.get("role") == "assistant" and not self._should_include_reasoning_content():
+                    api_msg.pop("reasoning_content", None)
 
                 # Remove 'reasoning' field - it's for trajectory storage only
                 # We've copied it to 'reasoning_content' for the API above

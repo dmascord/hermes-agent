@@ -433,118 +433,34 @@ automatically scope to the active profile.
    This is intentional — it lets `hermes -p coder profile list` see all profiles regardless
    of which one is active.
 
-## Docker Development & Code Sync
+## Remote hermes-swarm deployment workflow
 
-### Keeping Local and Remote in Sync
+Use this workflow for the live Docker deployment on `tusker@10.0.0.231`:
 
-The hermes-agent code runs both:
-- **Locally**: For development/testing
-- **Remote**: Docker container (via Tailscale at 100.120.14.122:8642)
-
-### Option 1: Docker Volume Mount (Recommended)
-
-Mount the local code into the container so edits are instantly visible:
-
-```bash
-# In docker run command, mount local code:
-docker run -v /Users/tusker/dev/opencode/hermes-agent:/srv/opencode/hermes-agent hermes-agent:latest
-
-# The container reads from /srv/opencode which maps to your local directory
-# No rebuild needed - changes appear immediately!
-```
-
-### Option 2: rsync Script
-
-For one-way sync when volume mount isn't available:
-
-```bash
-# Quick sync local → remote
-rsync -avz --exclude='*.pyc' --exclude='__pycache__' \
-    /Users/tusker/dev/opencode/hermes-agent/ \
-    tusker@100.120.14.122:/srv/opencode/hermes-agent/
-```
-
-Or use the sync script:
-```bash
-./scripts/sync_to_remote.sh
-```
-
-### Option 3: Git-based Sync (Best for Version Control)
-
-```bash
-# Push local changes
-git add .
-git commit -m "Describe changes"
-git push origin main
-
-# Pull on remote
-ssh tusker@100.120.14.122
-cd /srv/opencode/hermes-agent && git pull
-```
-
-### Avoiding Divergence
-
-1. **Pick ONE approach and use it consistently**
-2. **Never edit files directly in the container** - always edit locally
-3. **Use volume mount for development** - no sync needed
-4. **Add a reminder comment at top of edited files**:
-   ```python
-   # SYNC: local <-> remote (via rsync/docker mount)
+1. Edit code locally in the repo.
+2. Sync the repo to `/srv/opencode/hermes-agent/` on the remote host.
+3. Rebuild the image from the synced source:
+   ```bash
+   docker build -t hermes-agent:latest .
    ```
+4. Recreate the service from the rebuilt image:
+   ```bash
+   docker compose down && docker compose up -d
+   ```
+5. Verify both:
+   - `http://127.0.0.1:8642/health`
+   - `https://hermes.tusker.net.au/v1/models`
 
-### Syncing Specific Files
+Rules:
 
-```bash
-# Sync just api_server.py
-rsync -vz /Users/tusker/dev/opencode/hermes-agent/gateway/platforms/api_server.py \
-    tusker@100.120.14.122:/srv/opencode/hermes-agent/gateway/platforms/
-
-# Then restart to pick up changes
-ssh tusker@100.120.14.122 "docker restart hermes-swarm"
-```
-
-### Proper Development Workflow
-
-**Always develop and test locally first, then deploy to remote!**
-
-```bash
-# 1. Make changes locally in /Users/tusker/dev/opencode/hermes-agent/
-# 2. Test locally if possible
-# 3. Sync to remote: 
-./scripts/sync_to_remote.sh
-# 4. Restart container: 
-ssh tusker@100.120.14.122 "docker restart hermes-swarm"
-```
-
-**Common issues when fixing remotely:**
-- Direct edits in container get lost on restart
-- .pyc cache files cause stale code to run
-- Forgetting to restart after sync
-
-### Container Restart After Sync
-
-```bash
-# Always clear Python cache after syncing
-ssh tusker@100.120.14.122 "find /srv/opencode -name '*.pyc' -delete && docker restart hermes-swarm"
-```
-
-## hermes-swarm Bug Fix Notes
-
-### Issue
-The `/v1/runs` endpoint (OpenAI Responses API) wasn't passing `swarm_mode` and `swarm_model_pool` to the `_create_agent` function. Instead it used hardcoded `provider_mode=True` which ignored the model name from the request.
-
-### Fix Locations
-Three places in `gateway/platforms/api_server.py`:
-1. Line ~2199: Extract `_model_name` and set `_swarm_mode` before agent creation
-2. Line ~3019: Pass `swarm_mode` and `swarm_model_pool` to `_create_agent` call
-3. Line ~800: Check swarm_mode FIRST in `_create_agent` before calling `_resolve_runtime_agent_kwargs()`
-
-### Testing
-After fix, hermes-swarm should route to the configured pool models (e.g., opencode-zen/big-pickle). If you see "No inference provider configured", check that API keys are set in the container environment.
+- Do **not** hot-patch containers with `docker cp`, ad-hoc file copies into the container, or direct in-container edits.
+- Do **not** treat the running container filesystem as the source of truth.
+- Do **not** use `docker restart` as the normal code-deploy mechanism after source changes; rebuild first.
+- Keep deployment notes and scripts aligned with the rebuild-and-recreate workflow above.
 
 ---
 
-## Docker Development & Code Sync
+## Important implementation notes
 
 ### DO NOT hardcode `~/.hermes` paths
 Use `get_hermes_home()` from `hermes_constants` for code paths. Use `display_hermes_home()`

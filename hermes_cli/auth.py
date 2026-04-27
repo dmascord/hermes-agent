@@ -1531,7 +1531,56 @@ def resolve_codex_runtime_credentials(
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> Dict[str, Any]:
-    """Resolve runtime credentials from Hermes's own Codex token store."""
+    """Resolve runtime credentials from Hermes's own Codex token store.
+
+    First checks the credential_pool (for multi-account setups), then falls back
+    to providers.openai-codex (for legacy single-account storage).
+    """
+    # First, check the credential pool for multi-account Codex tokens
+    pool = read_credential_pool("openai-codex")
+    if pool and isinstance(pool, list) and pool:
+        # Select a non-suppressed entry with lowest error count
+        best_entry = None
+        best_score = float("inf")
+        for entry in pool:
+            if entry.get("suppress"):
+                continue
+            # Score: priority (lower is better) + error count
+            score = entry.get("priority", 999) + entry.get("error_count", 0) * 100
+            if score < best_score:
+                best_score = score
+                best_entry = entry
+        
+        if best_entry:
+            access_token = str(best_entry.get("access_token", "")).strip()
+            if access_token:
+                if refresh_if_expiring and _codex_access_token_is_expiring(access_token, refresh_skew_seconds):
+                    refresh_token = best_entry.get("refresh_token")
+                    if refresh_token and best_entry.get("id"):
+                        try:
+                            _refresh_codex_token_if_needed(
+                                "openai-codex",
+                                best_entry["id"],
+                                force_refresh=True,
+                                refresh_skew_seconds=refresh_skew_seconds,
+                            )
+                            refreshed_pool = read_credential_pool("openai-codex") or []
+                            for entry in refreshed_pool:
+                                if entry.get("id") == best_entry["id"]:
+                                    access_token = str(entry.get("access_token", "")).strip() or access_token
+                                    best_entry = entry
+                                    break
+                        except Exception:
+                            pass
+
+                return {
+                    "api_key": access_token,
+                    "base_url": best_entry.get("base_url", DEFAULT_CODEX_BASE_URL).rstrip("/"),
+                    "last_refresh": best_entry.get("last_refresh"),
+                    "source": "credential-pool",
+                }
+
+    # Fall back to legacy providers.openai-codex storage
     try:
         data = _read_codex_tokens()
     except AuthError as orig_err:

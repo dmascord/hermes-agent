@@ -21,6 +21,7 @@ Requires:
 """
 
 import asyncio
+import ast
 import hashlib
 import hmac
 import json
@@ -49,27 +50,80 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+_SWARM_PREMIUM_MODEL_HINTS = (
+    "github-copilot/gpt-5.4",
+    "zai/glm-4.7",
+    "minimax/MiniMax-M2.7",
+)
+
+_SWARM_BALANCED_MODEL_HINTS = (
+    "github-copilot/gpt-5-mini",
+    "openai/gpt-5-mini",
+    "google/gemini-2.5-flash",
+)
+
+_SWARM_CHEAP_MODEL_HINTS = (
+    "opencode-zen/gpt-5-nano",
+    "opencode-zen/ling-2.6-flash-free",
+    "google/gemma-4-26b-a4b-it:free",
+)
+
 # Default settings
 
 
-def _resolve_swarm_model(pool, *, context_overflow: bool = False):
+def _resolve_swarm_model(pool, *, context_overflow: bool = False, estimated_tokens: int = 0):
     """Resolve a model from the swarm pool based on selection policy.
 
     When context_overflow is True and large_context_fallbacks are available,
     switch to the largest available model (no compression needed).
+
+    When estimated_tokens > 0, models whose context window cannot safely
+    hold the request are excluded from consideration, preventing 413 errors.
     """
     import random, os
     primary = pool.get("primary", "")
     fallbacks = pool.get("fallbacks", [])
     large_context_fallbacks = pool.get("large_context_fallbacks", [])
     policy = pool.get("selection_policy", "cost-balanced")
-    
+    available_fallbacks = [m for m in fallbacks if _swarm_model_has_credentials(m)]
+    available_large_context = [m for m in large_context_fallbacks if _swarm_model_has_credentials(m)]
+    primary_available = bool(primary) and _swarm_model_has_credentials(primary)
+
+    def _model_safe_for_tokens(model: str, tokens: int) -> bool:
+        """Return True if model's context window can safely hold `tokens` tokens."""
+        if tokens <= 0:
+            return True
+        ctx_len = _model_context_length(model)
+        if ctx_len <= 0:
+            return True  # Unknown context — skip filtering
+        # Use 85% of context window as safe limit (leaves room for output + buffer)
+        safe_limit = int(ctx_len * 0.85)
+        return tokens <= safe_limit
+
+    # Filter candidates by context fit when we have an estimate
+    if estimated_tokens > 0:
+        _ctx_filtered_fallbacks = [m for m in available_fallbacks if _model_safe_for_tokens(m, estimated_tokens)]
+        _ctx_filtered_large = [m for m in available_large_context if _model_safe_for_tokens(m, estimated_tokens)]
+        _ctx_filtered_primary = _model_safe_for_tokens(primary, estimated_tokens)
+        if _ctx_filtered_fallbacks:
+            available_fallbacks = _ctx_filtered_fallbacks
+        if _ctx_filtered_large:
+            available_large_context = _ctx_filtered_large
+        if not _ctx_filtered_primary:
+            primary_available = False
+        logger.info(
+            "[api_server] context filter: estimated_tokens=%d, primary_fit=%s, "
+            "fallbacks_context_fit=%s, large_context_fit=%s",
+            estimated_tokens, _ctx_filtered_primary,
+            [m for m in available_fallbacks], [m for m in available_large_context],
+        )
+
     # Context overflow path: use a large-context model instead of compressing
-    if context_overflow and large_context_fallbacks:
+    if context_overflow and available_large_context:
         from agent.model_metadata import get_model_context_length_quick
         # Sort large-context models by context length descending, pick the largest
         _sorted = sorted(
-            large_context_fallbacks,
+            available_large_context,
             key=lambda m: get_model_context_length_quick(m),
             reverse=True,
         )
@@ -78,16 +132,91 @@ def _resolve_swarm_model(pool, *, context_overflow: bool = False):
             return _sorted[0]
         # Fall through to normal selection if large-context list is empty
     
-    if primary:
-        return primary
     if not fallbacks:
         return "openrouter/free"
+    if primary and not primary_available:
+        logger.warning("[api_server] primary swarm model unavailable (missing credentials): %s", primary)
+    candidates = available_fallbacks or fallbacks
+    if policy == "complexity-aware":
+        routing_hint = pool.get("routing_hint") or {}
+        logger.info("[api_server] complexity-aware selection: estimated_tokens=%s routing_hint=%s", estimated_tokens, routing_hint)
+        recommended_tier = str(routing_hint.get("recommended_tier") or "").strip().lower()
+        task_type = str(routing_hint.get("task_type") or "").strip().lower()
+        needs_instruction_following = bool(routing_hint.get("needs_instruction_following"))
+        needs_repo_reasoning = bool(routing_hint.get("needs_repo_reasoning"))
+        needs_bug_judgement = bool(routing_hint.get("needs_bug_judgement"))
+
+        def _pick(preferred: tuple[str, ...]) -> Optional[str]:
+            for preferred_model in preferred:
+                for candidate in candidates:
+                    if candidate == preferred_model:
+                        return candidate
+            return None
+
+        def _pick_stronger_than_primary() -> Optional[str]:
+            for preferred_model in (
+                "google/gemini-2.5-flash",
+                "openai/gpt-5-mini",
+                "github-copilot/gpt-5-mini",
+            ):
+                for candidate in candidates:
+                    if candidate == preferred_model and candidate != primary:
+                        return candidate
+            for candidate in candidates:
+                if candidate != primary:
+                    return candidate
+            return None
+
+        if recommended_tier == "premium":
+            premium_choice = _pick(_SWARM_PREMIUM_MODEL_HINTS)
+            if premium_choice:
+                logger.info("[api_server] scout escalation → premium model: %s", premium_choice)
+                return premium_choice
+            stronger_choice = _pick_stronger_than_primary()
+            if stronger_choice:
+                logger.info("[api_server] premium requested but unavailable; using strongest available non-primary model: %s", stronger_choice)
+                return stronger_choice
+        elif recommended_tier == "balanced":
+            balanced_choice = _pick(_SWARM_BALANCED_MODEL_HINTS)
+            if balanced_choice:
+                logger.info("[api_server] scout routing → balanced model: %s", balanced_choice)
+                return balanced_choice
+        elif recommended_tier == "cheap":
+            cheap_choice = _pick(_SWARM_CHEAP_MODEL_HINTS)
+            if cheap_choice:
+                logger.info("[api_server] scout routing → cheap model: %s", cheap_choice)
+                return cheap_choice
+
+        if task_type in {"repo_review", "debugging", "implementation", "architecture"} or (
+            needs_instruction_following and (needs_repo_reasoning or needs_bug_judgement)
+        ):
+            premium_choice = _pick(_SWARM_PREMIUM_MODEL_HINTS)
+            if premium_choice:
+                logger.info("[api_server] heuristic escalation → premium model: %s", premium_choice)
+                return premium_choice
+
+        if estimated_tokens > 8000:
+            premium = [m for m in candidates if "gpt-5.3-codex" in m or "gpt-5.2-codex" in m]
+            if premium:
+                logger.info("[api_server] HIGH complexity (%s tokens) — using premium: %s", estimated_tokens, premium[0])
+                return premium[0]
+        if estimated_tokens > 2000:
+            balanced = [m for m in candidates if m in {"github-copilot/gpt-5-mini", "openai/gpt-5-mini", "google/gemini-2.5-flash"}]
+            if balanced:
+                logger.info("[api_server] MEDIUM complexity (%s tokens) — using: %s", estimated_tokens, balanced[0])
+                return balanced[0]
+        if primary_available:
+            logger.info("[api_server] SIMPLE task — using primary: %s", primary)
+            return primary
+        return candidates[0]
+    if primary_available:
+        return primary
     if policy == "round-robin":
-        return fallbacks[0]
+        return candidates[0]
     elif policy == "cost-balanced":
-        cheap = [m for m in fallbacks if any(x in m for x in ["gemma", "free", "nemotron"])]
-        return random.choice(cheap) if cheap else fallbacks[0]
-    return fallbacks[0]
+        cheap = [m for m in candidates if any(x in m for x in ["gemma", "free", "nemotron"])]
+        return random.choice(cheap) if cheap else candidates[0]
+    return candidates[0]
 
 
 # Pattern for detecting context overflow errors
@@ -202,21 +331,84 @@ MAX_HISTORY_MESSAGES = 200
 MAX_HISTORY_TEXT_LENGTH = 240_000
 
 
-def _compact_message_history(messages: List[Dict[str, Any]], session_id: str = "unknown") -> List[Dict[str, Any]]:
-    """Keep recent history bounded so provider request bodies stay sane."""
+def _model_context_length(model_name: str) -> int:
+    """Look up the context window size for a model, or 0 if unknown."""
+    try:
+        from agent.model_metadata import get_model_context_length
+        return get_model_context_length(model_name) or 0
+    except Exception:
+        return 0
+
+
+def _messages_token_count(messages: List[Dict[str, Any]], system_prompt: str = "") -> int:
+    """Estimate token count for messages + optional system prompt."""
+    try:
+        from agent.model_metadata import estimate_messages_tokens_rough
+        total = estimate_messages_tokens_rough(messages)
+        if system_prompt:
+            total += estimate_messages_tokens_rough([{"role": "system", "content": system_prompt}])
+        return total
+    except Exception:
+        # Fallback: rough char-based estimate
+        total = len(system_prompt)
+        for msg in messages:
+            total += len(str(msg.get("content") or ""))
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    total += len(str(tc.get("function", {}).get("arguments") or ""))
+        return total // 4  # ~4 chars per token
+
+
+def _model_can_handle_context(model_name: str, estimated_tokens: int, margin_fraction: float = 0.85) -> bool:
+    """Return True if the model's context window can safely hold the estimated tokens."""
+    ctx_len = _model_context_length(model_name)
+    if ctx_len <= 0:
+        return True  # Unknown context — assume it's fine
+    safe_limit = int(ctx_len * margin_fraction)
+    return estimated_tokens <= safe_limit
+
+
+def _compact_message_history(
+    messages: List[Dict[str, Any]],
+    session_id: str = "unknown",
+    *,
+    system_prompt: str = "",
+    target_model: str = "",
+) -> List[Dict[str, Any]]:
+    """Keep recent history bounded so provider request bodies stay sane.
+
+    Applies two filters:
+    1. Hard cap: last MAX_HISTORY_MESSAGES messages.
+    2. Token-aware cap: if target_model is known, truncate to its safe context limit.
+       Falls back to MAX_HISTORY_TEXT_LENGTH chars when target_model is unknown.
+
+    This prevents 413 errors by ensuring the final payload fits the model's window
+    before it reaches the LLM API call.
+    """
     import logging
     _logger = logging.getLogger(__name__)
-    
+
     if not messages:
         return []
 
-    trimmed = list(messages[-MAX_HISTORY_MESSAGES:])
     original_count = len(messages)
+    trimmed = list(messages[-MAX_HISTORY_MESSAGES:])
     trimmed_count = len(trimmed)
+
+    # Determine the effective token budget from target model (or fallback to chars)
+    estimated_tokens = _messages_token_count(trimmed, system_prompt)
+    target_ctx = _model_context_length(target_model)
+    if target_ctx > 0:
+        # Use 85% of context window as the safe token budget (leaves room for output)
+        effective_budget = int(target_ctx * 0.85)
+        token_based = True
+    else:
+        # Fallback: use char-based budget scaled to ~4 chars/token
+        effective_budget = MAX_HISTORY_TEXT_LENGTH // 4
+        token_based = False
 
     def _msg_cost(msg: Dict[str, Any]) -> int:
         cost = len(str(msg.get("content") or ""))
-        # Account for reasoning_content which can be substantial for reasoning models
         reasoning_content = msg.get("reasoning_content")
         if isinstance(reasoning_content, str):
             cost += len(reasoning_content)
@@ -227,18 +419,17 @@ def _compact_message_history(messages: List[Dict[str, Any]], session_id: str = "
                     fn = tc.get("function")
                     if isinstance(fn, dict):
                         cost += len(str(fn.get("arguments") or ""))
-        return cost
+        return cost // 4  # convert chars to rough token estimate
 
-    total = sum(_msg_cost(msg) for msg in trimmed)
-    
-    # Log if we're hitting message count limit
+    total_cost = sum(_msg_cost(msg) for msg in trimmed)
+
     if original_count > MAX_HISTORY_MESSAGES:
         _logger.warning(
-            "[CONTEXT] Session %s compacting: %d messages -> %d (limit: %d, total chars: %d/%d)",
-            session_id, original_count, trimmed_count, MAX_HISTORY_MESSAGES, total, MAX_HISTORY_TEXT_LENGTH
+            "[CONTEXT] Session %s compacting: %d messages -> %d (limit: %d, total ~%d tokens)",
+            session_id, original_count, trimmed_count, MAX_HISTORY_MESSAGES, total_cost,
         )
-    
-    if total <= MAX_HISTORY_TEXT_LENGTH:
+
+    if total_cost <= effective_budget:
         return trimmed
 
     kept: List[Dict[str, Any]] = []
@@ -246,25 +437,25 @@ def _compact_message_history(messages: List[Dict[str, Any]], session_id: str = "
     dropped_count = 0
     for msg in reversed(trimmed):
         cost = _msg_cost(msg)
-        if kept and running + cost > MAX_HISTORY_TEXT_LENGTH:
+        if kept and running + cost > effective_budget:
             dropped_count += 1
             continue
         kept.append(msg)
         running += cost
-        if running >= MAX_HISTORY_TEXT_LENGTH:
+        if running >= effective_budget:
             break
 
     kept.reverse()
-    
-    # Log if we're hitting text length limit
+
     if dropped_count > 0:
+        budget_desc = f"~{effective_budget:,} tokens ({target_model})" if token_based else f"{MAX_HISTORY_TEXT_LENGTH:,} chars"
         _logger.warning(
-            "[CONTEXT] Session %s TRUNCATED: dropped %d messages due to text length limit (%d/%d chars). "
-            "Original messages: %d, Kept: %d, Total chars: %d",
-            session_id, dropped_count, total, MAX_HISTORY_TEXT_LENGTH,
-            original_count, len(kept), running
+            "[CONTEXT] Session %s TRUNCATED: dropped %d messages (budget: %s, ~%d total tokens). "
+            "Original messages: %d, Kept: %d",
+            session_id, dropped_count, budget_desc, running,
+            original_count, len(kept),
         )
-    
+
     return kept
 
 
@@ -348,9 +539,10 @@ def _fallback_provider_for_model(model_id: str) -> tuple[str, str]:
     rest = rest.strip()
     if prefix == "openai":
         return "openai-codex", raw
-    if prefix in {"github-copilot", "opencode-go", "opencode-zen"}:
+    if prefix in {"github-copilot", "opencode-go", "opencode-zen", "zai", "minimax"}:
         # CRITICAL FIX: Return bare model name (rest) without provider prefix for OpenCode providers
-        # These APIs only accept bare model names (e.g., "kimi-k2.5", not "opencode-go/kimi-k2.5")
+        # and direct API providers (zai, minimax). These APIs only accept bare model names
+        # (e.g., "glm-4.7", not "zai/glm-4.7")
         return prefix, rest
     if prefix == "openrouter":
         return "openrouter", rest
@@ -372,13 +564,377 @@ def _build_env_fallback_chain(prefix: str) -> List[Dict[str, Any]]:
             runtime = resolve_runtime_provider(requested=provider)
         except Exception:
             runtime = {}
+        # Use provider from runtime if available, otherwise fall back to requested_provider or raw provider.
+        # runtime["provider"] is the resolved canonical name (e.g., "copilot").
+        # runtime["requested_provider"] may be an alias (e.g., "github-copilot") which is not a valid provider key.
+        resolved_provider = runtime.get("provider") or ""
+        normalized_provider = str(resolved_provider or runtime.get("requested_provider") or provider).strip()
         chain.append({
-            "provider": provider,
+            "provider": normalized_provider,
             "model": resolved_model,
             "base_url": str(runtime.get("base_url") or "").strip(),
             "api_key": str(runtime.get("api_key") or "").strip(),
         })
     return chain
+
+
+def _build_swarm_model_pool(*, estimated_tokens: int = 0) -> Dict[str, Any]:
+    """Build hermes-swarm routing config from environment variables."""
+    primary = os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free").strip()
+    fallback_chain = [primary] if primary else []
+    for idx in range(1, 33):
+        fb = os.getenv(f"HERMES_SWARM_FALLBACK_{idx}", "").strip()
+        if fb:
+            fallback_chain.append(fb)
+
+    seen = set()
+    deduped: List[str] = []
+    for model in fallback_chain:
+        if model and model not in seen:
+            seen.add(model)
+            deduped.append(model)
+    fallback_chain = deduped
+
+    large_context_fallbacks: List[str] = []
+    for idx in range(1, 17):
+        fb = os.getenv(f"HERMES_SWARM_LARGE_CONTEXT_FALLBACK_{idx}", "").strip()
+        if fb and fb not in large_context_fallbacks:
+            large_context_fallbacks.append(fb)
+
+    if not large_context_fallbacks:
+        from agent.model_metadata import get_model_context_length_quick
+        primary_ctx = get_model_context_length_quick(primary) if primary else 0
+        large_context_fallbacks = [
+            model for model in fallback_chain
+            if get_model_context_length_quick(model) > primary_ctx
+        ]
+
+    return {
+        "primary": primary,
+        "fallbacks": fallback_chain,
+        "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
+        "large_context_fallbacks": large_context_fallbacks,
+        "estimated_tokens": estimated_tokens,
+        "routing_hint": {},
+    }
+
+
+def _summarize_swarm_messages(
+    *,
+    system_prompt: str = "",
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    user_message: str = "",
+) -> str:
+    history = conversation_history or []
+    parts: List[str] = []
+    if system_prompt:
+        parts.append(f"SYSTEM:\n{system_prompt}")
+    if history:
+        trimmed = history[-8:]
+        rendered = []
+        for msg in trimmed:
+            role = str(msg.get("role") or "user").lower().strip()
+            if role != "user":
+                continue
+            content = str(msg.get("content") or "").strip()
+            if not content:
+                continue
+            rendered.append(f"USER_HISTORY: {content[:1200]}")
+        if rendered:
+            parts.append("HISTORY:\n" + "\n".join(rendered))
+    if user_message:
+        parts.append(f"USER:\n{user_message[:2000]}")
+    return "\n\n".join(parts)
+
+
+def _heuristic_swarm_routing_hint(
+    *,
+    system_prompt: str = "",
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    user_message: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+    estimated_tokens: int = 0,
+) -> Dict[str, Any]:
+    text = _summarize_swarm_messages(
+        system_prompt=system_prompt,
+        conversation_history=conversation_history,
+        user_message=user_message,
+    ).lower()
+    task_type = "general"
+    recommended_tier = "primary"
+    needs_instruction_following = False
+    needs_repo_reasoning = False
+    needs_bug_judgement = False
+
+    inline_instruction_context = any(
+        k in text for k in (
+            "repo instructions say:",
+            "agents excerpt:",
+            "agants excerpt:",
+            "use only the provided context",
+            "use only the context below",
+        )
+    )
+
+    if any(k in text for k in ("agents.md", "workspace", "repo", "repository", "codebase", "readme", "package", "custom_components/")):
+        needs_instruction_following = True
+        needs_repo_reasoning = True
+    if any(k in text for k in ("review", "analy", "find bug", "likely bug", "correctness", "why is", "root cause", "debug", "fix this", "regression")):
+        needs_bug_judgement = True
+    if any(k in text for k in ("implement", "patch", "modify", "change code", "refactor")):
+        task_type = "implementation"
+        recommended_tier = "premium"
+    elif any(k in text for k in ("review", "code review", "likely bug", "correctness")):
+        task_type = "repo_review"
+        recommended_tier = "premium"
+    elif any(k in text for k in ("debug", "root cause", "why is", "broken")):
+        task_type = "debugging"
+        recommended_tier = "premium"
+    elif any(k in text for k in ("architecture", "design", "best approach", "tradeoff")):
+        task_type = "architecture"
+        recommended_tier = "premium"
+
+    if tools:
+        needs_repo_reasoning = True
+        if recommended_tier == "primary":
+            recommended_tier = "balanced"
+
+    if estimated_tokens > 6000 and recommended_tier == "primary":
+        recommended_tier = "balanced"
+
+    if needs_instruction_following and needs_repo_reasoning and recommended_tier == "primary":
+        recommended_tier = "balanced"
+    if inline_instruction_context and needs_instruction_following:
+        recommended_tier = "premium"
+    if needs_bug_judgement and recommended_tier != "premium":
+        recommended_tier = "premium"
+
+    return {
+        "task_type": task_type,
+        "recommended_tier": recommended_tier,
+        "needs_instruction_following": needs_instruction_following,
+        "needs_repo_reasoning": needs_repo_reasoning,
+        "needs_bug_judgement": needs_bug_judgement,
+        "provided_context_only": any(
+            k in text for k in (
+                "use only the context below",
+                "use only the provided context",
+                "provided snippets only",
+                "do not assume file access",
+            )
+        ),
+        "source": "heuristic",
+        "confidence": 0.55,
+    }
+
+
+def _swarm_execution_system_prompt(routing_hint: Optional[Dict[str, Any]]) -> str:
+    hint = routing_hint or {}
+    parts = [
+        "For hermes-swarm tasks: prioritize correctness over style, avoid hallucinating filesystem/tool access, and explicitly distinguish provided context from inferred assumptions.",
+        "If AGENTS.md is not available on disk, treat that as missing optional repo guidance, not as a hard failure. Continue with standard assumptions unless the user explicitly required the physical file to be read.",
+    ]
+    if hint.get("needs_instruction_following"):
+        parts.append(
+            "If the user supplies AGENTS.md or workflow instructions in the prompt, treat those quoted instructions as authoritative even if you cannot access the repo directly."
+        )
+        parts.append(
+            "When AGENTS.md instructions are supplied inline, never answer that you cannot proceed just because the real file was not found. Use the supplied instructions."
+        )
+    if hint.get("provided_context_only"):
+        parts.append(
+            "Use only the context provided in the request. Do not claim files are missing, unreadable, or present unless the prompt itself states that."
+        )
+        parts.append(
+            "Do not say that AGENTS.md, helper scripts, or repo files are missing when their relevant contents are already quoted in the prompt."
+        )
+    if hint.get("needs_bug_judgement"):
+        parts.append(
+            "Rank real correctness issues above style or micro-optimizations, and prefer saying 'only 2 high-confidence issues' over inventing a weak third issue."
+        )
+    return "\n".join(parts)
+
+
+def _extract_agent_result_text(result: Any) -> str:
+    """Best-effort extraction of assistant text from agent results."""
+    if isinstance(result, str):
+        return result.strip()
+    if not isinstance(result, dict):
+        return ""
+    final_response = str(result.get("final_response") or "").strip()
+    if final_response:
+        return final_response
+    for msg in reversed(list(result.get("messages", []))):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    error_text = str(result.get("error") or "").strip()
+    return error_text
+
+
+def _parse_loose_json_object(response_text: str) -> Dict[str, Any]:
+    """Parse a JSON-ish object from model output."""
+    text = str(response_text or "").strip()
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    candidate = match.group(0) if match else text
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    parsed = ast.literal_eval(candidate)
+    if isinstance(parsed, dict):
+        return parsed
+    raise ValueError(f"No JSON object found: {text[:200]}")
+
+
+def _client_tool_names(tools: Any) -> set[str]:
+    names: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        func = tool.get("function") if tool.get("type") == "function" else tool
+        if isinstance(func, dict):
+            name = str(func.get("name") or "").strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def _extract_tool_result_by_call_id(messages: List[Dict[str, Any]], call_id: str) -> Optional[str]:
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "tool" and str(msg.get("tool_call_id") or "") == call_id:
+            return str(msg.get("content") or "")
+    return None
+
+
+def _extract_first_path_from_search_result(raw: str) -> Optional[str]:
+    try:
+        data = _parse_loose_json_object(raw)
+    except Exception:
+        return None
+
+    def _walk(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            for key in ("path", "file", "filepath"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            for nested in value.values():
+                found = _walk(nested)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = _walk(item)
+                if found:
+                    return found
+        return None
+
+    return _walk(data)
+
+
+def _needs_agents_prefetch(user_message: str, system_prompt: Optional[str], tools: Any, messages: Optional[List[Dict[str, Any]]] = None) -> bool:
+    tool_names = _client_tool_names(tools)
+    if not {"search_files", "read_file"}.issubset(tool_names):
+        return False
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            if str(tc.get("id") or "").startswith("agents_prefetch_"):
+                return True
+        if str(msg.get("tool_call_id") or "").startswith("agents_prefetch_"):
+            return True
+    text = f"{system_prompt or ''}\n{user_message or ''}".lower()
+    return any(marker in text for marker in (
+        "agents.md",
+        "read agents",
+        "repo instructions",
+        "workspace",
+        "codebase",
+    ))
+
+
+def _build_agents_prefetch_tool_call(name: str, call_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(arguments),
+        },
+    }
+
+
+def _determine_agents_prefetch_action(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    search_call_id = "agents_prefetch_search"
+    read_call_id = "agents_prefetch_read"
+    search_result = _extract_tool_result_by_call_id(messages, search_call_id)
+    read_result = _extract_tool_result_by_call_id(messages, read_call_id)
+    if read_result:
+        return {"status": "done", "agents_text": read_result}
+    if search_result:
+        path = _extract_first_path_from_search_result(search_result)
+        if path:
+            return {
+                "status": "need_read",
+                "tool_call": _build_agents_prefetch_tool_call(
+                    "read_file",
+                    read_call_id,
+                    {"path": path, "offset": 1, "limit": 260},
+                ),
+            }
+        return {"status": "done", "agents_text": "No AGENTS.md found in client workspace; proceed with standard assumptions."}
+    return {
+        "status": "need_search",
+        "tool_call": _build_agents_prefetch_tool_call(
+            "search_files",
+            search_call_id,
+            {"pattern": "AGENTS.md", "target": "files", "path": ".", "limit": 5},
+        ),
+    }
+
+
+def _swarm_model_has_credentials(model: str) -> bool:
+    raw = str(model or "").strip()
+    if not raw:
+        return False
+    if "/" not in raw:
+        return True
+    prefix = raw.split("/", 1)[0].strip().lower()
+    if prefix == "github-copilot":
+        try:
+            from hermes_cli.copilot_auth import resolve_copilot_token
+            token, _source = resolve_copilot_token()
+            return bool(token)
+        except Exception:
+            return bool(os.getenv("GITHUB_COPILOT_API_KEY", "").strip())
+    if prefix == "opencode-go":
+        return bool(os.getenv("OPENCODE_GO_API_KEY", "").strip())
+    if prefix == "opencode-zen":
+        return bool(os.getenv("OPENCODE_ZEN_API_KEY", "").strip())
+    if prefix == "zai":
+        return bool(os.getenv("ZAI_API_KEY", "").strip())
+    if prefix == "minimax":
+        return bool(os.getenv("MINIMAX_API_KEY", "").strip())
+    if prefix == "local":
+        return False
+    if prefix == "openai":
+        return bool(
+            os.getenv("OPENAI_API_KEY", "").strip()
+            or os.getenv("OPENAI_CODEX_API_KEY", "").strip()
+            or os.getenv("OPENAI_CODEX_TOKEN", "").strip()
+            or os.getenv("CODEX_ACCESS_TOKEN", "").strip()
+            or os.getenv("OPENAI_OAUTH_TOKEN", "").strip()
+        )
+    return bool(os.getenv("OPENROUTER_API_KEY", "").strip())
 
 
 def _is_opencode_user_agent(user_agent: str) -> bool:
@@ -869,63 +1425,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # Swarm mode: select from free/cheap model pool FIRST
         # This must happen before _resolve_runtime_agent_kwargs() to avoid provider resolution errors
         if swarm_mode and swarm_model_pool:
-            model = _resolve_swarm_model(swarm_model_pool)
+            model = _resolve_swarm_model(
+                swarm_model_pool,
+                estimated_tokens=swarm_model_pool.get("estimated_tokens", 0),
+            )
             logging.warning(f"[API_SERVER] Swarm mode: resolved model={model}")
-            # Set up runtime_kwargs with swarm model config before general provider resolution
-            runtime_kwargs = {}
-            if "/" in model:
-                provider_prefix = model.split("/")[0].strip().lower()
-                # Handle OpenCode Zen models
-                if provider_prefix == "opencode-zen":
-                    runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
-                    runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
-                    runtime_kwargs["provider"] = "opencode-zen"
-                # Handle OpenCode Go models
-                elif provider_prefix == "opencode-go":
-                    runtime_kwargs["base_url"] = os.getenv("OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1")
-                    runtime_kwargs["api_key"] = os.getenv("OPENCODE_GO_API_KEY", "")
-                    runtime_kwargs["provider"] = "opencode-go"
-                # Handle OpenAI models (maps to openai-codex for Codex OAuth)
-                elif provider_prefix == "openai":
-                    runtime_kwargs["provider"] = "openai-codex"
-                # Handle GitHub Copilot models
-                elif provider_prefix == "github-copilot":
-                    runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
-                    runtime_kwargs["api_key"] = os.getenv("GITHUB_COPILOT_API_KEY", "")
-                    runtime_kwargs["provider"] = "github-copilot"
-                # Handle ZAI models
-                elif provider_prefix == "zai":
-                    runtime_kwargs["base_url"] = "https://api.z.ai/api/coding/paas/v4"
-                    runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
-                    runtime_kwargs["provider"] = "zai"
-                # Handle Qwen models via Alibaba DashScope on OpenCode Zen
-                elif provider_prefix == "qwen":
-                    runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
-                    runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
-                    runtime_kwargs["provider"] = "alibaba"
-                # Handle OpenRouter models (default)
-                elif provider_prefix != "local":
-                    runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-                    runtime_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
-                    runtime_kwargs["provider"] = "openrouter"
-                else:
-                    runtime_kwargs["provider"] = provider_prefix
-            else:
-                # No provider prefix in model name, try to detect from model
-                from hermes_cli.model_normalize import detect_vendor
-                detected_provider = detect_vendor(model)
-                if detected_provider:
-                    runtime_kwargs["provider"] = detected_provider
+            runtime_kwargs, model = self._runtime_kwargs_for_model(model)
             # Don't add model to runtime_kwargs since it's passed separately to AIAgent()
             logging.warning(f"[API_SERVER] Swarm: runtime_kwargs={runtime_kwargs}")
-            
-            # CRITICAL FIX: Strip provider prefix from OpenCode Go/Zen models before passing to AIAgent()
-            # These providers only accept bare model names (e.g., "kimi-k2.5", not "opencode-go/kimi-k2.5")
-            if provider_prefix in ("opencode-go", "opencode-zen"):
-                if "/" in model:
-                    model = model.split("/", 1)[1].strip()
-                    logging.warning(f"[API_SERVER] Stripped prefix: now using model={model}")
-        
+
         # Only resolve credentials if NOT in swarm mode (swarm mode already has runtime_kwargs)
         # This prevents unnecessary Codex credential checks when using other providers
         if not swarm_mode:
@@ -938,8 +1446,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(model_cfg, dict):
                     requested_provider = str(model_cfg.get("provider") or "").strip() or None
             
+            # When provider_mode=True (hermes-code), check if the HERMES_CODE_MODEL is set
+            # and if its prefix matches the requested provider. If not, resolve provider
+            # from the model prefix instead of using HERMES_INFERENCE_PROVIDER.
+            code_model = os.getenv("HERMES_CODE_MODEL", "").strip()
+            code_model_prefix = code_model.split("/")[0].lower() if code_model and "/" in code_model else ""
+            
             if requested_provider and requested_provider.lower() in ("zai", "opencode-go", "opencode-zen"):
-                if requested_provider.lower() == "zai":
+                # If provider_mode and model prefix doesn't match provider, resolve provider
+                # from the model prefix instead of using HERMES_INFERENCE_PROVIDER.
+                # e.g., HERMES_CODE_MODEL="openai/gpt-5.4" with HERMES_INFERENCE_PROVIDER="zai"
+                # should route to openai-codex, not zai
+                if provider_mode and code_model_prefix and code_model_prefix != requested_provider.lower():
+                    # Resolve provider from model prefix, not from HERMES_INFERENCE_PROVIDER
+                    # Map the prefix through _EXPLICIT_MODEL_PROVIDER_ALIASES (e.g., "openai" -> "openai-codex")
+                    from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
+                    try:
+                        # Map model prefix to canonical provider name
+                        model_provider = _EXPLICIT_MODEL_PROVIDER_ALIASES.get(code_model_prefix, code_model_prefix)
+                        runtime = resolve_runtime_provider(requested=model_provider)
+                        runtime_kwargs = {
+                            "api_key": runtime.get("api_key"),
+                            "base_url": runtime.get("base_url"),
+                            "provider": runtime.get("provider"),
+                            "api_mode": runtime.get("api_mode"),
+                            "command": runtime.get("command"),
+                            "args": list(runtime.get("args") or []),
+                            "credential_pool": runtime.get("credential_pool"),
+                        }
+                    except Exception as exc:
+                        raise RuntimeError(format_runtime_provider_error(exc)) from exc
+                elif requested_provider.lower() == "zai":
                     runtime_kwargs = {
                         "base_url": "https://api.z.ai/api/coding/paas/v4",
                         "api_key": os.getenv("ZAI_API_KEY", ""),
@@ -970,6 +1507,12 @@ class APIServerAdapter(BasePlatformAdapter):
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         skip_memory = False
         skip_context_files = False
+        if swarm_mode and swarm_model_pool:
+            swarm_prompt = _swarm_execution_system_prompt(swarm_model_pool.get("routing_hint"))
+            if swarm_prompt:
+                ephemeral_system_prompt = (
+                    f"{ephemeral_system_prompt}\n\n{swarm_prompt}" if ephemeral_system_prompt else swarm_prompt
+                )
         if provider_mode:
             enabled_toolsets = []
             skip_memory = True
@@ -1346,48 +1889,108 @@ class APIServerAdapter(BasePlatformAdapter):
         swarm_model_pool = None
         if model_name == "hermes-swarm":
             swarm_mode = True
-            # Build the full fallback chain for potential dynamic context switching.
-            # IMPORTANT: Always use HERMES_SWARM_PRIMARY_MODEL as the primary.
-            # Context-aware pre-selection is NOT applied — the primary model is used
-            # as-is. When context overflow occurs at API call time, _resolve_swarm_model()
-            # will automatically switch to a large-context fallback.
-            # This ensures the primary model is always used (e.g. qwen3.5-plus on OpenCode Go)
-            # instead of being swapped out for a different model based on token estimates.
-            _primary_model = os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free")
-            _fallback_chain = [_primary_model]
-            for idx in range(1, 33):
-                fb = os.getenv(f"HERMES_SWARM_FALLBACK_{idx}", "").strip()
-                if fb:
-                    _fallback_chain.append(fb)
-
-            # Deduplicate while preserving order
-            _seen = set()
-            _deduped = []
-            for m in _fallback_chain:
-                if m not in _seen:
-                    _seen.add(m)
-                    _deduped.append(m)
-            _fallback_chain = _deduped
-
-            from agent.model_metadata import get_model_context_length_quick
-            _primary_ctx = get_model_context_length_quick(_primary_model)
-
-            swarm_model_pool = {
-                "primary": _primary_model,
-                "fallbacks": _fallback_chain,
-                "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
-                "large_context_fallbacks": [
-                    m for m in _fallback_chain
-                    if get_model_context_length_quick(m) > _primary_ctx
-                ],
-            }
-            logger.info(
-                "[api_server] swarm pool: primary=%s (ctx %s), fallbacks=%d models, "
-                "large-context options: %s",
-                _primary_model, _primary_ctx, len(_fallback_chain),
-                swarm_model_pool["large_context_fallbacks"],
+            from agent.model_metadata import estimate_request_tokens_rough
+            _approx_tokens = 0
+            try:
+                _approx_tokens = estimate_request_tokens_rough(
+                    history or [],
+                    system_prompt=system_prompt or "",
+                    tools=tools,
+                )
+            except Exception:
+                pass
+            swarm_model_pool = await self._prepare_swarm_model_pool(
+                system_prompt=system_prompt or "",
+                conversation_history=history,
+                user_message=user_message,
+                tools=tools,
+                estimated_tokens=_approx_tokens,
             )
-        
+            logger.info(
+                "[api_server] swarm pool: primary=%s, fallbacks=%d models, "
+                "large-context options: %s routing_hint=%s",
+                swarm_model_pool["primary"], len(swarm_model_pool["fallbacks"]),
+                swarm_model_pool["large_context_fallbacks"],
+                swarm_model_pool.get("routing_hint"),
+            )
+
+            # Token-aware pre-truncation: ensure history fits the primary model's context.
+            # Uses 85% of context window as safe budget. This prevents 413 errors before
+            # they reach the LLM API. _resolve_swarm_model already filters candidate lists.
+            _primary_model = swarm_model_pool.get("primary", "")
+            if _primary_model and history:
+                _history_tokens = _messages_token_count(history, system_prompt or "")
+                _ctx_len = _model_context_length(_primary_model)
+                if _ctx_len > 0 and _history_tokens > int(_ctx_len * 0.85):
+                    history = _compact_message_history(
+                        history,
+                        session_id,
+                        system_prompt=system_prompt or "",
+                        target_model=_primary_model,
+                    )
+                    logger.info(
+                        "[api_server] history pre-truncated: ~%d tokens -> ~%d, model=%s",
+                        _history_tokens, _messages_token_count(history, system_prompt or ""), _primary_model,
+                    )
+
+        agents_prefetch_text = ""
+        if swarm_mode and _needs_agents_prefetch(user_message, system_prompt, tools, conversation_messages):
+            prefetch = _determine_agents_prefetch_action(conversation_messages)
+            status = prefetch.get("status")
+            if status in {"need_search", "need_read"}:
+                prefetch_call = prefetch.get("tool_call")
+                response_data = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": _enrich_client_tool_calls([prefetch_call]) if prefetch_call else [],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+                headers = {"X-Hermes-Session-Id": session_id}
+                if not stream:
+                    return web.json_response(response_data, headers=headers)
+                sse_headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+                response = web.StreamResponse(status=200, headers=sse_headers)
+                await response.prepare(request)
+                chunk = {
+                    "id": response_data["id"],
+                    "object": "chat.completion.chunk",
+                    "created": response_data["created"],
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": response_data["choices"][0]["message"]["tool_calls"]},
+                        "finish_reason": None,
+                    }],
+                }
+                finish = {
+                    "id": response_data["id"],
+                    "object": "chat.completion.chunk",
+                    "created": response_data["created"],
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                }
+                await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                await response.write(f"data: {json.dumps(finish)}\n\n".encode())
+                await response.write(b"data: [DONE]\n\n")
+                return response
+            agents_prefetch_text = str(prefetch.get("agents_text") or "").strip()
+
+        if agents_prefetch_text:
+            system_prompt = (
+                f"{system_prompt}\n\n[Deterministic AGENTS preflight]\n{agents_prefetch_text}"
+                if system_prompt else f"[Deterministic AGENTS preflight]\n{agents_prefetch_text}"
+            )
+
         created = int(time.time())
 
         if stream:
@@ -2385,44 +2988,23 @@ class APIServerAdapter(BasePlatformAdapter):
         swarm_model_pool = None
         if _model_name == "hermes-swarm":
             swarm_mode = True
-            # Build the full fallback chain (same as streaming handler)
-            _fallback_chain = [
-                os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free"),
-            ]
-            for idx in range(1, 33):
-                fb = os.getenv(f"HERMES_SWARM_FALLBACK_{idx}", "").strip()
-                if fb:
-                    _fallback_chain.append(fb)
-
-            from agent.model_metadata import get_model_context_length_quick, estimate_request_tokens_rough
+            from agent.model_metadata import estimate_request_tokens_rough
             _approx_tokens = 0
             try:
                 _approx_tokens = estimate_request_tokens_rough(
                     conversation_history or [],
                     system_prompt=instructions or "",
-                    tools=None,
+                    tools=tools,
                 )
             except Exception:
                 pass
-
-            _selected_model = _fallback_chain[0]
-            _selected_ctx = get_model_context_length_quick(_selected_model)
-            for _m in _fallback_chain[1:]:
-                _ctx = get_model_context_length_quick(_m)
-                if _ctx > _selected_ctx and _approx_tokens < int(_ctx * 0.70):
-                    _selected_model = _m
-                    _selected_ctx = _ctx
-                    break
-
-            swarm_model_pool = {
-                "primary": _selected_model,
-                "fallbacks": _fallback_chain,
-                "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
-                "large_context_fallbacks": [
-                    m for m in _fallback_chain
-                    if get_model_context_length_quick(m) > _selected_ctx
-                ],
-            }
+            swarm_model_pool = await self._prepare_swarm_model_pool(
+                system_prompt=instructions or "",
+                conversation_history=conversation_history,
+                user_message=user_message,
+                tools=tools,
+                estimated_tokens=_approx_tokens,
+            )
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -3053,6 +3635,47 @@ class APIServerAdapter(BasePlatformAdapter):
                 task_id="default",
             )
             if (
+                swarm_mode
+                and swarm_model_pool
+                and not stream_delta_callback
+                and isinstance(result, dict)
+                and str(result.get("final_response") or "").strip()
+            ):
+                routing_hint = swarm_model_pool.get("routing_hint") or {}
+                should_verify = os.getenv("HERMES_SWARM_ENABLE_VERIFIER", "true").strip().lower() not in {"0", "false", "no"}
+                should_verify = should_verify and str(routing_hint.get("recommended_tier") or "") in {"balanced", "premium"}
+                if should_verify:
+                    try:
+                        verification = self._run_swarm_verifier_sync(
+                            system_prompt=ephemeral_system_prompt or "",
+                            conversation_history=conversation_history,
+                            user_message=user_message,
+                            candidate_response=str(result.get("final_response") or ""),
+                            swarm_model_pool=swarm_model_pool,
+                        )
+                        if str(verification.get("verdict") or "").strip().lower() == "revise":
+                            revised = str(verification.get("revised_response") or "").strip()
+                            if revised:
+                                logger.info("[api_server] swarm verifier revised final response")
+                                if not isinstance(result, dict):
+                                    result = {"final_response": revised, "messages": []}
+                                else:
+                                    result["final_response"] = revised
+                                if isinstance(result.get("messages"), list):
+                                    for msg in reversed(result["messages"]):
+                                        if isinstance(msg, dict) and msg.get("role") == "assistant":
+                                            msg["content"] = revised
+                                            break
+                                meta = result.get("meta")
+                                if not isinstance(meta, dict):
+                                    meta = {}
+                                    result["meta"] = meta
+                                meta["swarm_verifier"] = verification
+                        else:
+                            logger.info("[api_server] swarm verifier accepted final response")
+                    except Exception as exc:
+                        logger.warning("[api_server] swarm verifier failed: %s", exc)
+            if (
                 isinstance(result, dict)
                 and generated_tool_calls
                 and getattr(agent, "_external_tool_mode", "none") in ("broker", "inband")
@@ -3080,6 +3703,285 @@ class APIServerAdapter(BasePlatformAdapter):
             return result, usage
 
         return await loop.run_in_executor(None, _run)
+
+    def _runtime_kwargs_for_model(self, model: str) -> tuple[Dict[str, Any], str]:
+        runtime_kwargs: Dict[str, Any] = {}
+        provider_prefix = ""
+        normalized_model = str(model or "").strip()
+        if "/" in normalized_model:
+            provider_prefix = normalized_model.split("/", 1)[0].strip().lower()
+            if provider_prefix == "opencode-zen":
+                runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+                runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
+                runtime_kwargs["provider"] = "opencode-zen"
+            elif provider_prefix == "opencode-go":
+                runtime_kwargs["base_url"] = os.getenv("OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1")
+                runtime_kwargs["api_key"] = os.getenv("OPENCODE_GO_API_KEY", "")
+                runtime_kwargs["provider"] = "opencode-go"
+            elif provider_prefix == "openai":
+                openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+                openai_base = os.getenv("OPENAI_BASE_URL", "").strip()
+                codex_key = (
+                    os.getenv("OPENAI_CODEX_API_KEY", "").strip()
+                    or os.getenv("OPENAI_OAUTH_TOKEN", "").strip()
+                    or os.getenv("OPENAI_CODEX_TOKEN", "").strip()
+                    or os.getenv("CODEX_ACCESS_TOKEN", "").strip()
+                )
+                if openai_api_key:
+                    # Direct OpenAI API if an actual OpenAI API key is configured.
+                    runtime_kwargs["base_url"] = "https://api.openai.com/v1"
+                    if openai_base:
+                        runtime_kwargs["base_url"] = openai_base
+                    runtime_kwargs["provider"] = "openai"
+                elif openai_base:
+                    # Custom OpenAI-compatible gateway/proxy.
+                    runtime_kwargs["base_url"] = openai_base
+                    runtime_kwargs["provider"] = "openai"
+                else:
+                    # Default to the Codex endpoint for openai/<model> routing.
+                    runtime_kwargs["base_url"] = os.getenv("OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex")
+                    runtime_kwargs["provider"] = "openai-codex"
+                runtime_kwargs["api_key"] = openai_api_key or codex_key
+            elif provider_prefix == "github-copilot":
+                _copilot_token = os.getenv("GITHUB_COPILOT_API_KEY", "")
+                if not _copilot_token:
+                    try:
+                        from hermes_cli.copilot_auth import resolve_copilot_token
+                        _copilot_token, _copilot_source = resolve_copilot_token()
+                        if _copilot_token:
+                            logging.warning(f"[API_SERVER] Swarm: resolved Copilot token from {_copilot_source}")
+                    except Exception as exc:
+                        logging.warning(f"[API_SERVER] Swarm: failed to resolve Copilot token: {exc}")
+                runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
+                runtime_kwargs["api_key"] = _copilot_token
+                runtime_kwargs["provider"] = "copilot"
+            elif provider_prefix == "minimax":
+                runtime_kwargs["base_url"] = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+                runtime_kwargs["api_key"] = os.getenv("MINIMAX_API_KEY", "")
+                runtime_kwargs["provider"] = "minimax"
+            elif provider_prefix == "zai":
+                runtime_kwargs["base_url"] = "https://api.z.ai/api/coding/paas/v4"
+                runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
+                runtime_kwargs["provider"] = "zai"
+            elif provider_prefix == "qwen":
+                runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+                runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
+                runtime_kwargs["provider"] = "alibaba"
+            elif provider_prefix != "local":
+                runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+                runtime_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
+                runtime_kwargs["provider"] = "openrouter"
+            else:
+                runtime_kwargs["provider"] = provider_prefix
+        else:
+            from hermes_cli.model_normalize import detect_vendor
+            detected_provider = detect_vendor(normalized_model)
+            if detected_provider:
+                runtime_kwargs["provider"] = detected_provider
+
+        if provider_prefix in ("opencode-go", "opencode-zen") and "/" in normalized_model:
+            normalized_model = normalized_model.split("/", 1)[1].strip()
+        return runtime_kwargs, normalized_model
+
+    def _run_swarm_scout_sync(
+        self,
+        *,
+        system_prompt: str = "",
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        user_message: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        swarm_model_pool: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        pool = swarm_model_pool or {}
+        # Scout model selection: prefer cheapest model with credentials that can
+        # safely handle the estimated token count. When context is small, gpt-5-mini
+        # (cheap/Copilot) is selected. When context is large, MiniMax-M2.7 (200K)
+        # passes the context filter and is selected instead.
+        estimated_tokens = swarm_model_pool.get("estimated_tokens", 0)
+        preferred_models = [
+            os.getenv("HERMES_SWARM_SCOUT_MODEL", "").strip(),
+            pool.get("primary", ""),
+            "github-copilot/gpt-5-mini",
+            "openai/gpt-5-mini",
+            "minimax/MiniMax-M2.7",
+        ]
+        scout_model = ""
+        for candidate in preferred_models:
+            if candidate and _swarm_model_has_credentials(candidate):
+                # Skip models that can't hold the estimated context (prevents 413 on scout itself)
+                if not _model_safe_for_tokens(candidate, estimated_tokens):
+                    logger.info("[api_server] scout skipping %s (context %d > safe limit)", candidate, estimated_tokens)
+                    continue
+                scout_model = candidate
+                break
+        if not scout_model:
+            raise RuntimeError("No available scout model with credentials")
+
+        runtime_kwargs, scout_model_name = self._runtime_kwargs_for_model(scout_model)
+        from run_agent import AIAgent
+
+        scout_prompt = (
+            "Classify this task for routing. Return ONLY compact JSON with keys: "
+            "task_type, recommended_tier, needs_instruction_following, needs_repo_reasoning, "
+            "needs_bug_judgement, confidence, reason. "
+            "recommended_tier must be one of cheap, primary, balanced, premium. "
+            "Use premium for repo review, debugging, implementation, or architectural tasks. "
+            "Use balanced for instruction-sensitive workspace analysis. "
+            "If AGENTS.md instructions are quoted inline, treat them as authoritative and do not say the file is missing. "
+            "Do not solve the task itself.\n\n"
+            + _summarize_swarm_messages(
+                system_prompt=system_prompt,
+                conversation_history=conversation_history,
+                user_message=user_message,
+            )
+        )
+        if tools:
+            scout_prompt += f"\n\nTOOLS_PRESENT: {len(tools)}"
+
+        agent = AIAgent(
+            model=scout_model_name,
+            **runtime_kwargs,
+            max_iterations=2,
+            quiet_mode=True,
+            verbose_logging=False,
+            ephemeral_system_prompt="You are a routing classifier.",
+            enabled_toolsets=[],
+            session_id=f"swarm-scout-{uuid.uuid4().hex[:8]}",
+            platform="api_server",
+            session_db=None,
+            skip_memory=True,
+            skip_context_files=True,
+            tools=[],
+        )
+        result = agent.run_conversation(
+            user_message=scout_prompt,
+            conversation_history=[],
+            task_id="swarm_scout",
+        )
+        response_text = _extract_agent_result_text(result)
+        if not response_text:
+            raise RuntimeError("Empty scout response")
+        logger.info("[api_server] swarm scout raw response: %s", response_text[:400])
+        parsed = _parse_loose_json_object(response_text)
+        parsed["source"] = "scout"
+        parsed["model"] = scout_model
+        return parsed
+
+    def _run_swarm_verifier_sync(
+        self,
+        *,
+        system_prompt: str = "",
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        user_message: str = "",
+        candidate_response: str = "",
+        swarm_model_pool: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        pool = swarm_model_pool or {}
+        preferred_models = [
+            os.getenv("HERMES_SWARM_VERIFY_MODEL", "").strip(),
+            "openai/gpt-5.5",
+            "openai/gpt-5.3-codex",
+            "google/gemini-2.5-flash",
+            "openai/gpt-5-mini",
+        ]
+        preferred_models.extend(pool.get("fallbacks", []))
+        verify_model = ""
+        primary = str(pool.get("primary") or "").strip()
+        for candidate in preferred_models:
+            if candidate and candidate != primary and _swarm_model_has_credentials(candidate):
+                verify_model = candidate
+                break
+        if not verify_model:
+            raise RuntimeError("No available verifier model with credentials")
+
+        runtime_kwargs, verify_model_name = self._runtime_kwargs_for_model(verify_model)
+        from run_agent import AIAgent
+
+        verifier_prompt = (
+            "Review the candidate answer for correctness and grounding. Return ONLY compact JSON with keys: "
+            "verdict, issues, revised_response. verdict must be one of ok or revise. "
+            "Revise if the answer hallucinates missing files/access, ignores supplied AGENTS instructions, "
+            "or misses an obvious higher-severity issue that is visible from the provided context. "
+            "Treat missing AGENTS.md on disk as non-fatal when equivalent instructions are quoted inline. "
+            "issues must be an array of short strings. If verdict is ok, revised_response should be empty.\n\n"
+            + _summarize_swarm_messages(
+                system_prompt=system_prompt,
+                conversation_history=conversation_history,
+                user_message=user_message,
+            )
+            + f"\n\nCANDIDATE_RESPONSE:\n{candidate_response[:12000]}"
+        )
+
+        agent = AIAgent(
+            model=verify_model_name,
+            **runtime_kwargs,
+            max_iterations=2,
+            quiet_mode=True,
+            verbose_logging=False,
+            ephemeral_system_prompt="You are a strict answer verifier.",
+            enabled_toolsets=[],
+            session_id=f"swarm-verify-{uuid.uuid4().hex[:8]}",
+            platform="api_server",
+            session_db=None,
+            skip_memory=True,
+            skip_context_files=True,
+            tools=[],
+        )
+        result = agent.run_conversation(
+            user_message=verifier_prompt,
+            conversation_history=[],
+            task_id="swarm_verify",
+        )
+        response_text = _extract_agent_result_text(result)
+        if not response_text:
+            raise RuntimeError("Empty verifier response")
+        logger.info("[api_server] swarm verifier raw response: %s", response_text[:400])
+        if response_text.lower().startswith("invalid api response after"):
+            return {"verdict": "ok", "issues": [response_text[:120]], "revised_response": "", "model": verify_model}
+        parsed = _parse_loose_json_object(response_text)
+        parsed["model"] = verify_model
+        return parsed
+
+    async def _prepare_swarm_model_pool(
+        self,
+        *,
+        system_prompt: str = "",
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        user_message: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        estimated_tokens: int = 0,
+    ) -> Dict[str, Any]:
+        pool = _build_swarm_model_pool(estimated_tokens=estimated_tokens)
+        heuristic_hint = _heuristic_swarm_routing_hint(
+            system_prompt=system_prompt,
+            conversation_history=conversation_history,
+            user_message=user_message,
+            tools=tools,
+            estimated_tokens=estimated_tokens,
+        )
+        pool["routing_hint"] = heuristic_hint
+
+        should_scout = os.getenv("HERMES_SWARM_ENABLE_SCOUT", "true").strip().lower() not in {"0", "false", "no"}
+        if should_scout and heuristic_hint.get("recommended_tier") in {"balanced", "premium"}:
+            try:
+                loop = asyncio.get_running_loop()
+                scout_hint = await loop.run_in_executor(
+                    None,
+                    lambda: self._run_swarm_scout_sync(
+                        system_prompt=system_prompt,
+                        conversation_history=conversation_history,
+                        user_message=user_message,
+                        tools=tools,
+                        swarm_model_pool=pool,
+                    ),
+                )
+                if isinstance(scout_hint, dict):
+                    merged_hint = dict(heuristic_hint)
+                    merged_hint.update(scout_hint)
+                    pool["routing_hint"] = merged_hint
+            except Exception as exc:
+                logger.warning("[api_server] swarm scout failed, falling back to heuristics: %s", exc)
+        return pool
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

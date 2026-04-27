@@ -476,6 +476,40 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert response.output[0].content[0].text == "streamed create ok"
 
 
+def test_interruptible_api_call_runs_codex_synchronously(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    response = _codex_message_response("sync ok")
+    request_client = object()
+    seen = {"create": 0, "run": 0, "close": 0}
+
+    def _fake_create_request_openai_client(**kwargs):
+        seen["create"] += 1
+        return request_client
+
+    def _fake_run_codex_stream(api_kwargs, client=None, on_first_delta=None):
+        seen["run"] += 1
+        assert client is request_client
+        assert on_first_delta is None
+        return response
+
+    def _fake_close_request_openai_client(client, **kwargs):
+        seen["close"] += 1
+        assert client is request_client
+
+    monkeypatch.setattr(agent, "_create_request_openai_client", _fake_create_request_openai_client)
+    monkeypatch.setattr(agent, "_run_codex_stream", _fake_run_codex_stream)
+    monkeypatch.setattr(agent, "_close_request_openai_client", _fake_close_request_openai_client)
+
+    result = agent._interruptible_api_call(
+        agent._preflight_codex_api_kwargs(agent._build_api_kwargs([
+            {"role": "user", "content": "Say hello in 3 words"}
+        ]))
+    )
+
+    assert result is response
+    assert seen == {"create": 1, "run": 1, "close": 1}
+
+
 def test_run_conversation_codex_plain_text(monkeypatch):
     agent = _build_agent(monkeypatch)
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: _codex_message_response("OK"))

@@ -558,6 +558,25 @@ def _resolve_explicit_runtime(
         }
 
     if provider == "openai-codex":
+        # Check environment variables first for Codex-compatible bearer tokens.
+        env_token = (
+            explicit_api_key
+            or os.getenv("OPENAI_CODEX_API_KEY", "").strip()
+            or os.getenv("OPENAI_OAUTH_TOKEN", "").strip()
+            or os.getenv("OPENAI_CODEX_TOKEN", "").strip()
+            or os.getenv("CODEX_ACCESS_TOKEN", "").strip()
+        )
+        if env_token:
+            base_url = explicit_base_url or os.getenv("OPENAI_CODEX_BASE_URL", "").strip() or DEFAULT_CODEX_BASE_URL
+            return {
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": base_url.rstrip("/"),
+                "api_key": env_token,
+                "source": "env",
+                "requested_provider": requested_provider,
+            }
+        # Fall back to Hermes auth store tokens
         base_url = explicit_base_url or DEFAULT_CODEX_BASE_URL
         api_key = explicit_api_key
         last_refresh = None
@@ -913,6 +932,21 @@ def resolve_runtime_provider(
         if guardrail_config:
             runtime["guardrail_config"] = guardrail_config
         return runtime
+
+    # OpenAI direct API — uses OAuth token for api.openai.com (Responses API for GPT-5.x).
+    # Keep this separate from openai-codex so Codex/OAuth tokens do not silently
+    # get routed to the wrong endpoint.
+    if provider == "openai":
+        openai_key = explicit_api_key or os.getenv("OPENAI_API_KEY", "").strip()
+        base_url = explicit_base_url or os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
+        return {
+            "provider": "openai",
+            "api_mode": "codex_responses",
+            "base_url": base_url.rstrip("/"),
+            "api_key": openai_key,
+            "source": "env",
+            "requested_provider": requested_provider,
+        }
 
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
