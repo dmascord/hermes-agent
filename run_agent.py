@@ -662,7 +662,7 @@ class AIAgent:
             api_key (str): API key for authentication (optional, uses env var if not provided)
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
-            model (str): Model name to use (default: "anthropic/claude-opus-4.6")
+            model (str): Model name to use (default: empty — resolved from runtime/provider)
             max_iterations (int): Maximum number of tool calling iterations (default: 90)
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
@@ -755,13 +755,26 @@ class AIAgent:
             pass
 
         # GPT-5.x models require the Responses API path — they are rejected
-        # on /v1/chat/completions by both OpenAI and OpenRouter.  Also
-        # auto-upgrade for direct OpenAI URLs (api.openai.com) since all
-        # newer tool-calling models prefer Responses there.
-        if self.api_mode == "chat_completions" and (
-            self._is_direct_openai_url()
-            or self._model_requires_responses_api(self.model)
-        ):
+        # on /v1/chat/completions by both OpenAI and OpenRouter. Also
+        # auto-upgrade for direct OpenAI URLs (api.openai.com) since newer
+        # tool-calling models prefer Responses there. For Copilot provider,
+        # use Copilot-specific logic to exclude gpt-5-mini which uses chat_completions.
+        use_responses = False
+        if self.api_mode == "chat_completions":
+            if self._is_direct_openai_url():
+                use_responses = True
+            else:
+                try:
+                    if self.provider == "copilot":
+                        from hermes_cli.models import _should_use_copilot_responses_api
+
+                        use_responses = _should_use_copilot_responses_api(self.model)
+                    else:
+                        use_responses = self._model_requires_responses_api(self.model)
+                except Exception:
+                    # Fallback to the generic heuristic on any error
+                    use_responses = self._model_requires_responses_api(self.model)
+        if use_responses:
             self.api_mode = "codex_responses"
 
         # Pre-warm OpenRouter model metadata cache in a background thread.
@@ -7082,7 +7095,13 @@ class AIAgent:
                 codex_kwargs["tools"] = self._responses_tools([memory_tool_def])
                 codex_kwargs["temperature"] = 0.3
                 if "max_output_tokens" in codex_kwargs:
-                    codex_kwargs["max_output_tokens"] = 5120
+                    # Codex Responses API (chatgpt.com) rejects max_output_tokens
+                    # with HTTP 400 "Unsupported parameter: max_output_tokens".
+                    # Remove it for the Codex backend; keep for api.openai.com.
+                    if is_codex_backend:
+                        codex_kwargs.pop("max_output_tokens", None)
+                    else:
+                        codex_kwargs["max_output_tokens"] = 5120
                 response = self._run_codex_stream(codex_kwargs)
             elif not _aux_available and self.api_mode == "anthropic_messages":
                 # Native Anthropic — use the Anthropic client directly
@@ -9815,7 +9834,38 @@ class AIAgent:
                         FailoverReason.rate_limit,
                         FailoverReason.billing,
                     )
-                    if is_rate_limited and self._fallback_index < len(self._fallback_chain):
+
+                    # For rate limits, respect the Retry-After header if present
+                    _retry_after = None
+                    if is_rate_limited:
+                        _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                        if _resp_headers and hasattr(_resp_headers, "get"):
+                            _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
+                            if _ra_raw:
+                                try:
+                                    _retry_after = max(1, int(float(_ra_raw)))
+                                except (TypeError, ValueError):
+                                    pass
+                        if not _retry_after:
+                            _cooldown_hint = self._summarize_api_error(api_error).lower()
+                            if any(token in _cooldown_hint for token in (
+                                "freeusagelimiterror",
+                                "free usage limit",
+                                "rate limit exceeded",
+                                "usage limit",
+                            )):
+                                # Some gateways omit Retry-After for quota/rate-limit
+                                # failures. Persist a short cooldown anyway so later
+                                # requests can skip the known-bad primary model and
+                                # fail over immediately.
+                                _retry_after = 300
+                    if is_rate_limited and _retry_after: # Moved from ~L10203
+                        self._record_current_model_cooldown( # Moved from ~L10204
+                            _retry_after,
+                            reason=self._summarize_api_error(api_error),
+                        )
+
+                    if is_rate_limited and self._fallback_index < len(self._fallback_chain): # Start of eager fallback, now safe
                         # Don't eagerly fallback if credential pool rotation may
                         # still recover.  The pool's retry-then-rotate cycle needs
                         # at least one more attempt to fire — jumping to a fallback
@@ -10176,35 +10226,6 @@ class AIAgent:
                             "error": _final_summary,
                         }
 
-                    # For rate limits, respect the Retry-After header if present
-                    _retry_after = None
-                    if is_rate_limited:
-                        _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                        if _resp_headers and hasattr(_resp_headers, "get"):
-                            _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                            if _ra_raw:
-                                try:
-                                    _retry_after = max(1, int(float(_ra_raw)))
-                                except (TypeError, ValueError):
-                                    pass
-                        if not _retry_after:
-                            _cooldown_hint = self._summarize_api_error(api_error).lower()
-                            if any(token in _cooldown_hint for token in (
-                                "freeusagelimiterror",
-                                "free usage limit",
-                                "rate limit exceeded",
-                                "usage limit",
-                            )):
-                                # Some gateways omit Retry-After for quota/rate-limit
-                                # failures. Persist a short cooldown anyway so later
-                                # requests can skip the known-bad primary model and
-                                # fail over immediately.
-                                _retry_after = 300
-                    if is_rate_limited and _retry_after:
-                        self._record_current_model_cooldown(
-                            _retry_after,
-                            reason=self._summarize_api_error(api_error),
-                        )
                     if is_rate_limited and _retry_after and _retry_after > 5:
                         self._emit_status(
                             f"⚠️ Upstream requested a long cooldown ({_retry_after}s) — trying fallback/provider failover before waiting..."
@@ -10274,6 +10295,7 @@ class AIAgent:
                             )
             
             # If the API call was interrupted, skip response processing
+
             if interrupted:
                 _turn_exit_reason = "interrupted_during_api_call"
                 break
