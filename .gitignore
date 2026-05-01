@@ -10,3 +10,16 @@ data/*
 Hermes/
  hermes-logs/
 hermes-swarm-handover.md
+# local secrets & envs
+.env
+.env.local
+.claude/
+venv/
+__pycache__/
+*.pyc
+hermes_agent.egg-info/
+node_modules/
+dist/
+*.tsbuildinfo
+*.env
+.env.*
