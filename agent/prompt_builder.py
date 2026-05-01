@@ -247,7 +247,7 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Grounding: are factual claims backed by tool outputs or provided context?\n"
     "- Formatting: does the output match the requested format or schema?\n"
     "- Safety: if the next step has side effects (file writes, commands, API calls), "
-    "confirm scope before executing.\n"
+    "execute directly when it is within the user's stated scope; only ask for confirmation when approval policy or explicit user constraints require it.\n"
     "</verification>\n"
     "\n"
     "<missing_context>\n"
@@ -948,18 +948,38 @@ def _load_hermes_md(cwd_path: Path) -> str:
 
 
 def _load_agents_md(cwd_path: Path) -> str:
-    """AGENTS.md — top-level only (no recursive walk)."""
-    for name in ["AGENTS.md", "agents.md"]:
-        candidate = cwd_path / name
-        if candidate.exists():
-            try:
-                content = candidate.read_text(encoding="utf-8").strip()
-                if content:
-                    content = _scan_context_content(content, name)
-                    result = f"## {name}\n\n{content}"
-                    return _truncate_content(result, "AGENTS.md")
-            except Exception as e:
-                logger.debug("Could not read %s: %s", candidate, e)
+    """AGENTS.md — prefer cwd, then walk ancestors up to git root."""
+    git_root = _find_git_root(cwd_path)
+    current = cwd_path
+    candidate_dirs = [cwd_path]
+    while current.parent != current:
+        current = current.parent
+        candidate_dirs.append(current)
+        if git_root is not None and current == git_root:
+            break
+
+    seen = set()
+    for directory in candidate_dirs:
+        resolved = directory.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        for name in ["AGENTS.md", "agents.md"]:
+            candidate = directory / name
+            if candidate.exists():
+                try:
+                    content = candidate.read_text(encoding="utf-8").strip()
+                    if content:
+                        rel = name
+                        try:
+                            rel = str(candidate.relative_to(cwd_path))
+                        except ValueError:
+                            pass
+                        content = _scan_context_content(content, rel)
+                        result = f"## {rel}\n\n{content}"
+                        return _truncate_content(result, "AGENTS.md")
+                except Exception as e:
+                    logger.debug("Could not read %s: %s", candidate, e)
     return ""
 
 
@@ -1014,7 +1034,7 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
 
     Priority (first found wins — only ONE project context type is loaded):
       1. .hermes.md / HERMES.md  (walk to git root)
-      2. AGENTS.md / agents.md   (cwd only)
+      2. AGENTS.md / agents.md   (cwd, then ancestors up to git root)
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 

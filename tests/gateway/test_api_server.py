@@ -25,14 +25,24 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    ROLE_ALIAS_CONFIG,
     _CORS_HEADERS,
     _align_runtime_with_explicit_model,
     _derive_chat_session_id,
+    _determine_agents_prefetch_action,
     _explicit_provider_from_model,
+    _get_role_alias_config,
+    _needs_agents_prefetch,
+    _openai_error,
+    _resolve_role_alias,
+    _resolve_swarm_model,
+    _swarm_model_is_available,
+    _runtime_kwargs_for_model_id,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
 )
+
 
 
 # ---------------------------------------------------------------------------
@@ -210,10 +220,72 @@ class TestExplicitModelRuntimeAlignment:
 
 
 class TestSwarmRuntimeKwargs:
+    def test_get_role_alias_config(self):
+        cfg = _get_role_alias_config("hermes-gateway/hermes-translator")
+        assert cfg is not None
+        assert cfg["mode"] == "swarm"
+        assert cfg["hint"]["role"] == "translator"
+        assert cfg["hint"]["recommended_tier"] == "premium"
+
+    def test_resolve_role_alias_is_disabled_for_dynamic_aliases(self):
+        assert _resolve_role_alias("hermes-gateway/hermes-translator") is None
+        assert _resolve_role_alias("HERMES-GATEWAY/HERMES-TRIAGE") is None
+        assert _resolve_role_alias("unknown/model") is None
+
+    def test_runtime_kwargs_for_role_alias_preserves_virtual_model(self):
+        runtime_kwargs, model_name = _runtime_kwargs_for_model_id("hermes-gateway/hermes-translator")
+
+        assert model_name == "hermes-translator"
+        assert runtime_kwargs["provider"] == "openrouter"
+
+    def test_runtime_kwargs_for_model_id_resolves_copilot_base_url(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
+        monkeypatch.setenv("GITHUB_COPILOT_API_KEY", "copilot-token")
+        # Mock resolve_runtime_provider so auth store doesn't override the test token
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **kw: {"api_key": "copilot-token", "base_url": "https://api.githubcopilot.com", "provider": "copilot"},
+        )
+
+        runtime_kwargs, model_name = _runtime_kwargs_for_model_id("github-copilot/gpt-5-mini")
+
+        assert model_name == "gpt-5-mini"
+        assert runtime_kwargs["provider"] == "copilot"
+        assert runtime_kwargs["base_url"] == "https://api.githubcopilot.com"
+        assert runtime_kwargs["api_key"] == "copilot-token"
+
+    def test_swarm_model_is_available_checks_base_url_scoped_cooldown(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
+        monkeypatch.setenv("GITHUB_COPILOT_API_KEY", "copilot-token")
+        seen = {}
+
+        def _remaining(provider, model, *, base_url=""):
+            seen["provider"] = provider
+            seen["model"] = model
+            seen["base_url"] = base_url
+            return 120
+
+        monkeypatch.setattr(
+            "agent.model_cooldown_db.model_cooldown_remaining",
+            _remaining,
+        )
+
+        assert _swarm_model_is_available("github-copilot/gpt-5-mini") is False
+        assert seen == {
+            "provider": "copilot",
+            "model": "gpt-5-mini",
+            "base_url": "https://api.githubcopilot.com",
+        }
+
     def test_runtime_kwargs_for_openai_model_uses_codex_when_only_oauth_exists(self, monkeypatch):
         monkeypatch.setenv("OPENAI_OAUTH_TOKEN", "oauth-token")
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        # Mock resolve_runtime_provider so auth store doesn't override the test token
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **kw: {},
+        )
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         runtime_kwargs, model_name = adapter._runtime_kwargs_for_model("openai/gpt-5.4")
@@ -327,6 +399,40 @@ def auth_adapter():
     return _make_adapter(api_key="sk-secret")
 
 
+class TestAGENTSPrefetchHelpers:
+    def test_needs_agents_prefetch_supports_opencode_tool_names(self):
+        tools = [
+            {"type": "function", "function": {"name": "glob"}},
+            {"type": "function", "function": {"name": "read"}},
+        ]
+        assert _needs_agents_prefetch("please read AGENTS.md", None, tools, []) is True
+
+    def test_determine_agents_prefetch_action_uses_glob_and_read_for_opencode_tools(self):
+        tools = [
+            {"type": "function", "function": {"name": "glob"}},
+            {"type": "function", "function": {"name": "read"}},
+        ]
+        action = _determine_agents_prefetch_action([], tools)
+        assert action["status"] == "need_search"
+        assert action["tool_call"]["function"]["name"] == "glob"
+        assert '"pattern": "**/AGENTS.md"' in action["tool_call"]["function"]["arguments"]
+
+    def test_determine_agents_prefetch_action_reads_opencode_path_shape(self):
+        tools = [
+            {"type": "function", "function": {"name": "glob"}},
+            {"type": "function", "function": {"name": "read"}},
+        ]
+        messages = [{
+            "role": "tool",
+            "tool_call_id": "agents_prefetch_search",
+            "content": json.dumps({"paths": ["/tmp/project/AGENTS.md"]}),
+        }]
+        action = _determine_agents_prefetch_action(messages, tools)
+        assert action["status"] == "need_read"
+        assert action["tool_call"]["function"]["name"] == "read"
+        assert '"filePath": "/tmp/project/AGENTS.md"' in action["tool_call"]["function"]["arguments"]
+
+
 # ---------------------------------------------------------------------------
 # /health endpoint
 # ---------------------------------------------------------------------------
@@ -431,9 +537,11 @@ class TestModelsEndpoint:
             assert resp.status == 200
             data = await resp.json()
             assert data["object"] == "list"
-            assert len(data["data"]) == 1
-            assert data["data"][0]["id"] == "hermes-agent"
-            assert data["data"][0]["owned_by"] == "hermes"
+            # The models endpoint lists multiple hermes modes; ensure hermes-agent is present
+            model_ids = [m["id"] for m in data["data"]]
+            assert "hermes-agent" in model_ids
+            hermes_agent = next(m for m in data["data"] if m["id"] == "hermes-agent")
+            assert hermes_agent["owned_by"] == "hermes"
 
     @pytest.mark.asyncio
     async def test_models_returns_profile_name(self):
@@ -455,6 +563,17 @@ class TestModelsEndpoint:
         config = PlatformConfig(enabled=True, extra=extra)
         adapter = APIServerAdapter(config)
         assert adapter._model_name == "my-custom-agent"
+
+    @pytest.mark.asyncio
+    async def test_models_returns_role_aliases(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            assert resp.status == 200
+            data = await resp.json()
+            model_ids = [m["id"] for m in data["data"]]
+            for alias in ROLE_ALIAS_CONFIG:
+                assert alias in model_ids
 
     def test_resolve_model_name_explicit(self):
         assert APIServerAdapter._resolve_model_name("my-bot") == "my-bot"
@@ -738,16 +857,27 @@ class TestChatCompletionsEndpoint:
 
     @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
+        """A request with only a system message (no user message) is accepted
+        and forwarded to the agent — the agent receives an empty user prompt.
+        The handler no longer rejects this with 400; only orphaned tool
+        results without user/assistant context are rejected."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "test",
-                    "messages": [{"role": "system", "content": "You are helpful."}],
-                },
-            )
-            assert resp.status == 400
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "OK", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "system", "content": "You are helpful."}],
+                    },
+                )
+                # The endpoint now accepts system-only messages and forwards
+                # them to the agent rather than rejecting with 400.
+                assert resp.status == 200
 
     @pytest.mark.asyncio
     async def test_successful_completion(self, adapter):

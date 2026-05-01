@@ -47,8 +47,76 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
-
 logger = logging.getLogger(__name__)
+
+# Dynamic role aliases exposed by Hermes Gateway. These are virtual models
+# from the client's point of view, but they route through hermes-swarm using
+# role-specific routing hints instead of a fixed backend mapping.
+ROLE_ALIAS_CONFIG = {
+    "hermes-gateway/hermes-translator": {
+        "mode": "swarm",
+        "hint": {
+            "role": "translator",
+            "task_type": "translation",
+            "recommended_tier": "premium",
+        },
+    },
+    "hermes-gateway/hermes-triage": {
+        "mode": "swarm",
+        "hint": {
+            "role": "triage",
+            "task_type": "triage",
+            "recommended_tier": "balanced",
+        },
+    },
+    "hermes-gateway/hermes-duplicate-pr": {
+        "mode": "swarm",
+        "hint": {
+            "role": "duplicate-pr",
+            "task_type": "repo_review",
+            "recommended_tier": "balanced",
+        },
+    },
+    "hermes-gateway/hermes-fast": {
+        "mode": "swarm",
+        "hint": {
+            "role": "fast",
+            "task_type": "general",
+            "recommended_tier": "cheap",
+        },
+    },
+    "hermes-gateway/hermes-balanced": {
+        "mode": "swarm",
+        "hint": {
+            "role": "balanced",
+            "task_type": "general",
+            "recommended_tier": "balanced",
+        },
+    },
+}
+
+
+def _get_role_alias_config(model: str) -> Optional[Dict[str, Any]]:
+    raw = str(model or "").strip().lower()
+    if not raw:
+        return None
+    for alias, cfg in ROLE_ALIAS_CONFIG.items():
+        if alias.lower() == raw:
+            return cfg
+    return None
+
+
+def _resolve_role_alias(model: str) -> str | None:
+    """Legacy fixed mapping lookup.
+
+    Dynamic aliases defined in ROLE_ALIAS_CONFIG are handled by swarm routing
+    and intentionally do not resolve to a single concrete backend here.
+    """
+    if _get_role_alias_config(model):
+        return None
+    return None
+
+
 
 _SWARM_PREMIUM_MODEL_HINTS = (
     "github-copilot/gpt-5.4",
@@ -59,14 +127,74 @@ _SWARM_PREMIUM_MODEL_HINTS = (
 _SWARM_BALANCED_MODEL_HINTS = (
     "github-copilot/gpt-5-mini",
     "openai/gpt-5-mini",
-    "google/gemini-2.5-flash",
+    "opencode-zen/gpt-5-nano",
 )
 
 _SWARM_CHEAP_MODEL_HINTS = (
     "opencode-zen/gpt-5-nano",
     "opencode-zen/ling-2.6-flash-free",
-    "google/gemma-4-26b-a4b-it:free",
+    "ollama/qwen3-coder-next",
 )
+
+_OPENROUTER_FREE_CACHE: Dict[str, tuple[float, bool]] = {}
+_OPENROUTER_FREE_CACHE_TTL_SECONDS = 300.0
+
+
+def _openrouter_model_free_cached(model_id: str) -> bool:
+    """Best-effort free-tier check for OpenRouter models.
+
+    Fast path: models explicitly suffixed with ``:free`` are treated as free.
+    Otherwise, query OpenRouter model metadata and only allow models whose
+    prompt and completion pricing are both zero. Results are cached briefly so
+    repeated swarm checks don't hammer the models endpoint.
+    """
+    raw = str(model_id or "").strip()
+    if not raw:
+        return False
+    if ":free" in raw.lower():
+        return True
+
+    now = time.time()
+    cached = _OPENROUTER_FREE_CACHE.get(raw)
+    if cached and (now - cached[0]) < _OPENROUTER_FREE_CACHE_TTL_SECONDS:
+        return bool(cached[1])
+
+    is_free = False
+    try:
+        import httpx
+
+        headers = {}
+        token = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        response = httpx.get(
+            os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/") + "/models",
+            headers=headers,
+            timeout=5.0,
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            for item in payload.get("data", []):
+                if str(item.get("id") or "").strip() != raw:
+                    continue
+                pricing = item.get("pricing") or {}
+
+                def _as_float(value: Any) -> float:
+                    try:
+                        return float(value)
+                    except Exception:
+                        return 0.0
+
+                prompt_cost = _as_float(pricing.get("prompt", 0))
+                completion_cost = _as_float(pricing.get("completion", 0))
+                is_free = (prompt_cost == 0.0 and completion_cost == 0.0)
+                break
+    except Exception:
+        is_free = False
+
+    _OPENROUTER_FREE_CACHE[raw] = (now, is_free)
+    return is_free
+
 
 # Default settings
 
@@ -85,9 +213,10 @@ def _resolve_swarm_model(pool, *, context_overflow: bool = False, estimated_toke
     fallbacks = pool.get("fallbacks", [])
     large_context_fallbacks = pool.get("large_context_fallbacks", [])
     policy = pool.get("selection_policy", "cost-balanced")
-    available_fallbacks = [m for m in fallbacks if _swarm_model_has_credentials(m)]
-    available_large_context = [m for m in large_context_fallbacks if _swarm_model_has_credentials(m)]
-    primary_available = bool(primary) and _swarm_model_has_credentials(primary)
+    # Use _swarm_model_is_available to check both credentials AND cooldown status
+    available_fallbacks = [m for m in fallbacks if _swarm_model_is_available(m)]
+    available_large_context = [m for m in large_context_fallbacks if _swarm_model_is_available(m)]
+    primary_available = bool(primary) and _swarm_model_is_available(primary)
 
     def _model_safe_for_tokens(model: str, tokens: int) -> bool:
         """Return True if model's context window can safely hold `tokens` tokens."""
@@ -135,7 +264,7 @@ def _resolve_swarm_model(pool, *, context_overflow: bool = False, estimated_toke
     if not fallbacks:
         return "openrouter/free"
     if primary and not primary_available:
-        logger.warning("[api_server] primary swarm model unavailable (missing credentials): %s", primary)
+        logger.warning("[api_server] primary swarm model unavailable (missing credentials or in cooldown): %s", primary)
     candidates = available_fallbacks or fallbacks
     if policy == "complexity-aware":
         routing_hint = pool.get("routing_hint") or {}
@@ -267,6 +396,7 @@ _EXPLICIT_MODEL_PROVIDER_ALIASES = {
     "bedrock": "bedrock",
     "qwen-oauth": "qwen-oauth",
     "ollama-cloud": "ollama-cloud",
+    "ollama": "ollama-cloud",
 }
 
 
@@ -338,6 +468,23 @@ def _model_context_length(model_name: str) -> int:
         return get_model_context_length(model_name) or 0
     except Exception:
         return 0
+
+
+def _model_safe_for_tokens(model: str, tokens: int, margin_fraction: float = 0.85) -> bool:
+    """Return True if model's context window can safely hold `tokens` tokens.
+
+    This module-level helper mirrors the in-function implementation used by
+    _resolve_swarm_model but ensures other code paths (like the swarm scout)
+    can call it without raising NameError if the local inner function isn't in
+    scope.
+    """
+    if tokens <= 0:
+        return True
+    ctx_len = _model_context_length(model)
+    if ctx_len <= 0:
+        return True  # Unknown context — skip filtering
+    safe_limit = int(ctx_len * margin_fraction)
+    return tokens <= safe_limit
 
 
 def _messages_token_count(messages: List[Dict[str, Any]], system_prompt: str = "") -> int:
@@ -578,7 +725,7 @@ def _build_env_fallback_chain(prefix: str) -> List[Dict[str, Any]]:
     return chain
 
 
-def _build_swarm_model_pool(*, estimated_tokens: int = 0) -> Dict[str, Any]:
+def _build_swarm_model_pool(*, estimated_tokens: int = 0, routing_hint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build hermes-swarm routing config from environment variables."""
     primary = os.getenv("HERMES_SWARM_PRIMARY_MODEL", "google/gemma-4-26b-a4b-it:free").strip()
     fallback_chain = [primary] if primary else []
@@ -609,13 +756,32 @@ def _build_swarm_model_pool(*, estimated_tokens: int = 0) -> Dict[str, Any]:
             if get_model_context_length_quick(model) > primary_ctx
         ]
 
+    scout_fallbacks: List[str] = []
+    for idx in range(1, 17):
+        fb = os.getenv(f"HERMES_SWARM_SCOUT_FALLBACK_{idx}", "").strip()
+        if fb and fb not in scout_fallbacks:
+            scout_fallbacks.append(fb)
+
+    if not scout_fallbacks:
+        scout_fallbacks = [
+            "github-copilot/gpt-5-mini",
+            "github-copilot/gpt-5.4",
+            "openai/gpt-5.4",
+            "openai/gpt-5.3-codex",
+            "minimax/MiniMax-M2.7",
+            primary,
+        ]
+
+    scout_fallbacks = [m for m in scout_fallbacks if m]
+
     return {
         "primary": primary,
         "fallbacks": fallback_chain,
         "selection_policy": os.getenv("HERMES_SWARM_SELECTION_POLICY", "cost-balanced"),
         "large_context_fallbacks": large_context_fallbacks,
+        "scout_fallbacks": scout_fallbacks,
         "estimated_tokens": estimated_tokens,
-        "routing_hint": {},
+        "routing_hint": dict(routing_hint or {}),
     }
 
 
@@ -805,6 +971,19 @@ def _client_tool_names(tools: Any) -> set[str]:
     return names
 
 
+def _agents_prefetch_tool_names(tool_names: set[str]) -> Optional[tuple[str, str]]:
+    """Return the search/read tool pair available for AGENTS prefetch.
+
+    Supports both Hermes-native API tool names (search_files/read_file) and the
+    OpenCode client tool names exposed through hermes-swarm (glob/read).
+    """
+    if {"search_files", "read_file"}.issubset(tool_names):
+        return ("search_files", "read_file")
+    if {"glob", "read"}.issubset(tool_names):
+        return ("glob", "read")
+    return None
+
+
 def _extract_tool_result_by_call_id(messages: List[Dict[str, Any]], call_id: str) -> Optional[str]:
     for msg in messages:
         if not isinstance(msg, dict):
@@ -826,6 +1005,11 @@ def _extract_first_path_from_search_result(raw: str) -> Optional[str]:
                 candidate = value.get(key)
                 if isinstance(candidate, str) and candidate.strip():
                     return candidate.strip()
+            paths = value.get("paths")
+            if isinstance(paths, list):
+                for candidate in paths:
+                    if isinstance(candidate, str) and candidate.strip():
+                        return candidate.strip()
             for nested in value.values():
                 found = _walk(nested)
                 if found:
@@ -842,7 +1026,7 @@ def _extract_first_path_from_search_result(raw: str) -> Optional[str]:
 
 def _needs_agents_prefetch(user_message: str, system_prompt: Optional[str], tools: Any, messages: Optional[List[Dict[str, Any]]] = None) -> bool:
     tool_names = _client_tool_names(tools)
-    if not {"search_files", "read_file"}.issubset(tool_names):
+    if _agents_prefetch_tool_names(tool_names) is None:
         return False
     for msg in messages or []:
         if not isinstance(msg, dict):
@@ -873,31 +1057,44 @@ def _build_agents_prefetch_tool_call(name: str, call_id: str, arguments: Dict[st
     }
 
 
-def _determine_agents_prefetch_action(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _determine_agents_prefetch_action(messages: List[Dict[str, Any]], tools: Any = None) -> Dict[str, Any]:
     search_call_id = "agents_prefetch_search"
     read_call_id = "agents_prefetch_read"
     search_result = _extract_tool_result_by_call_id(messages, search_call_id)
     read_result = _extract_tool_result_by_call_id(messages, read_call_id)
+    tool_names = _client_tool_names(tools)
+    tool_pair = _agents_prefetch_tool_names(tool_names) or ("search_files", "read_file")
+    search_tool, read_tool = tool_pair
     if read_result:
         return {"status": "done", "agents_text": read_result}
     if search_result:
         path = _extract_first_path_from_search_result(search_result)
         if path:
+            read_args: Dict[str, Any] = {"offset": 1, "limit": 260}
+            if read_tool == "read_file":
+                read_args["path"] = path
+            else:
+                read_args["filePath"] = path
             return {
                 "status": "need_read",
                 "tool_call": _build_agents_prefetch_tool_call(
-                    "read_file",
+                    read_tool,
                     read_call_id,
-                    {"path": path, "offset": 1, "limit": 260},
+                    read_args,
                 ),
             }
         return {"status": "done", "agents_text": "No AGENTS.md found in client workspace; proceed with standard assumptions."}
+    search_args: Dict[str, Any]
+    if search_tool == "search_files":
+        search_args = {"pattern": "AGENTS.md", "target": "files", "path": ".", "limit": 5}
+    else:
+        search_args = {"pattern": "**/AGENTS.md", "path": "."}
     return {
         "status": "need_search",
         "tool_call": _build_agents_prefetch_tool_call(
-            "search_files",
+            search_tool,
             search_call_id,
-            {"pattern": "AGENTS.md", "target": "files", "path": ".", "limit": 5},
+            search_args,
         ),
     }
 
@@ -924,17 +1121,272 @@ def _swarm_model_has_credentials(model: str) -> bool:
         return bool(os.getenv("ZAI_API_KEY", "").strip())
     if prefix == "minimax":
         return bool(os.getenv("MINIMAX_API_KEY", "").strip())
+    if prefix == "synthetic":
+        return bool(os.getenv("SYNTHETIC_API_KEY", "").strip())
+    if prefix == "google":
+        # Direct Google API key takes priority; otherwise we fall back to OpenRouter
+        if (
+            os.getenv("GOOGLE_API_KEY", "").strip()
+            or os.getenv("GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY", "").strip()
+        ):
+            return True
+        # No direct key — will route via OpenRouter, so check for that key
+        return bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    if prefix == "nvidia":
+        if os.getenv("NVIDIA_API_KEY", "").strip() or os.getenv("NVCLOUD_API_KEY", "").strip():
+            return True
+        return bool(os.getenv("OPENROUTER_API_KEY", "").strip())
     if prefix == "local":
         return False
     if prefix == "openai":
-        return bool(
+        # Check env vars first, then fall back to Hermes auth store for Codex OAuth tokens
+        if (
             os.getenv("OPENAI_API_KEY", "").strip()
             or os.getenv("OPENAI_CODEX_API_KEY", "").strip()
             or os.getenv("OPENAI_CODEX_TOKEN", "").strip()
             or os.getenv("CODEX_ACCESS_TOKEN", "").strip()
             or os.getenv("OPENAI_OAUTH_TOKEN", "").strip()
-        )
+        ):
+            return True
+        # Check auth store for OpenAI Codex OAuth tokens
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            resolved = resolve_runtime_provider(requested="openai-codex")
+            return bool(resolved.get("api_key"))
+        except Exception:
+            pass
+        return False
     return bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+
+
+def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
+    runtime_kwargs: Dict[str, Any] = {}
+    provider_prefix = ""
+    normalized_model = str(model or "").strip()
+
+    if "/" in normalized_model:
+        provider_prefix = normalized_model.split("/", 1)[0].strip().lower()
+        if provider_prefix == "opencode-zen":
+            runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+            runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
+            runtime_kwargs["provider"] = "opencode-zen"
+        elif provider_prefix == "opencode-go":
+            runtime_kwargs["base_url"] = os.getenv("OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1")
+            runtime_kwargs["api_key"] = os.getenv("OPENCODE_GO_API_KEY", "")
+            runtime_kwargs["provider"] = "opencode-go"
+        elif provider_prefix == "openai":
+            openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+            openai_base = os.getenv("OPENAI_BASE_URL", "").strip()
+            codex_key = (
+                os.getenv("OPENAI_CODEX_API_KEY", "").strip()
+                or os.getenv("OPENAI_OAUTH_TOKEN", "").strip()
+                or os.getenv("OPENAI_CODEX_TOKEN", "").strip()
+                or os.getenv("CODEX_ACCESS_TOKEN", "").strip()
+            )
+            if openai_api_key:
+                runtime_kwargs["base_url"] = openai_base or "https://api.openai.com/v1"
+                runtime_kwargs["provider"] = "openai"
+            elif openai_base:
+                runtime_kwargs["base_url"] = openai_base
+                runtime_kwargs["provider"] = "openai"
+            else:
+                # Try auth store for Codex OAuth tokens before defaulting
+                _codex_resolved = False
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    resolved = resolve_runtime_provider(requested="openai-codex")
+                    _codex_api_key = resolved.get("api_key", "")
+                    _codex_base_url = resolved.get("base_url", "")
+                    if _codex_api_key:
+                        runtime_kwargs["base_url"] = _codex_base_url or os.getenv("OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex")
+                        runtime_kwargs["api_key"] = _codex_api_key
+                        runtime_kwargs["provider"] = "openai-codex"
+                        runtime_kwargs["api_mode"] = "codex_responses"
+                        _codex_resolved = True
+                except Exception:
+                    pass
+                if not _codex_resolved:
+                    runtime_kwargs["base_url"] = os.getenv("OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex")
+                    runtime_kwargs["provider"] = "openai-codex"
+            if not runtime_kwargs.get("api_key"):
+                runtime_kwargs["api_key"] = openai_api_key or codex_key
+        elif provider_prefix == "github-copilot":
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                resolved = resolve_runtime_provider(requested="copilot")
+                runtime_kwargs["base_url"] = resolved.get("base_url") or os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
+                runtime_kwargs["api_key"] = resolved.get("api_key") or ""
+                runtime_kwargs["provider"] = resolved.get("provider") or "copilot"
+                runtime_kwargs["api_mode"] = resolved.get("api_mode")
+                runtime_kwargs["credential_pool"] = resolved.get("credential_pool")
+            except Exception as exc:
+                logging.warning(f"[API_SERVER] Swarm: failed to resolve Copilot runtime provider: {exc}")
+                _copilot_token = os.getenv("GITHUB_COPILOT_API_KEY", "")
+                if not _copilot_token:
+                    try:
+                        from hermes_cli.copilot_auth import resolve_copilot_token
+                        _copilot_token, _copilot_source = resolve_copilot_token()
+                        if _copilot_token:
+                            logging.warning(f"[API_SERVER] Swarm: resolved Copilot token from {_copilot_source}")
+                    except Exception as inner_exc:
+                        logging.warning(f"[API_SERVER] Swarm: failed to resolve Copilot token: {inner_exc}")
+                runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
+                runtime_kwargs["api_key"] = _copilot_token
+                runtime_kwargs["provider"] = "copilot"
+        elif provider_prefix == "minimax":
+            runtime_kwargs["base_url"] = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+            runtime_kwargs["api_key"] = os.getenv("MINIMAX_API_KEY", "")
+            runtime_kwargs["provider"] = "minimax"
+        elif provider_prefix == "synthetic":
+            runtime_kwargs["base_url"] = os.getenv("SYNTHETIC_BASE_URL", "https://api.synthetic.new/openai/v1").rstrip("/")
+            runtime_kwargs["api_key"] = os.getenv("SYNTHETIC_API_KEY", "")
+            runtime_kwargs["provider"] = "synthetic"
+        elif provider_prefix == "google":
+            _google_key = (
+                os.getenv("GOOGLE_API_KEY", "").strip()
+                or os.getenv("GEMINI_API_KEY", "").strip()
+                or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY", "").strip()
+            )
+            if _google_key:
+                runtime_kwargs["base_url"] = os.getenv("GOOGLE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+                runtime_kwargs["api_key"] = _google_key
+                runtime_kwargs["provider"] = "google"
+            else:
+                # No Google API key — enforce strict guard when forcing free OpenRouter
+                if os.getenv("HERMES_SWARM_FORCE_FREE_OPENROUTER", "").strip().lower() in ("1", "true", "yes"):
+                    runtime_kwargs["base_url"] = ""
+                    runtime_kwargs["api_key"] = ""
+                    runtime_kwargs["provider"] = "blocked"
+                else:
+                    # Route to OpenRouter conservatively (requires :free if guard active)
+                    runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+                    runtime_kwargs["api_key"] = ""
+                    runtime_kwargs["provider"] = "openrouter"
+        elif provider_prefix == "nvidia":
+            _nvidia_key = (
+                os.getenv("NVIDIA_API_KEY", "").strip()
+                or os.getenv("NVCLOUD_API_KEY", "").strip()
+            )
+            if _nvidia_key:
+                runtime_kwargs["base_url"] = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+                runtime_kwargs["api_key"] = _nvidia_key
+                runtime_kwargs["provider"] = "nvidia"
+            else:
+                # No NVIDIA API key — enforce openrouter free gate if configured
+                if os.getenv("HERMES_SWARM_FORCE_FREE_OPENROUTER", "").strip().lower() in ("1","true","yes"):
+                    runtime_kwargs["base_url"] = ""
+                    runtime_kwargs["api_key"] = ""
+                    runtime_kwargs["provider"] = "blocked"
+                else:
+                    runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+                    runtime_kwargs["api_key"] = ""
+                    runtime_kwargs["provider"] = "openrouter"
+        elif provider_prefix == "zai":
+            runtime_kwargs["base_url"] = "https://api.z.ai/api/coding/paas/v4"
+            runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
+            runtime_kwargs["provider"] = "zai"
+        elif provider_prefix == "qwen":
+            runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+            runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
+            runtime_kwargs["provider"] = "alibaba"
+        elif provider_prefix in ("ollama-cloud", "ollama"):
+            runtime_kwargs["base_url"] = os.getenv("OLLAMA_BASE_URL", "https://ollama.com/v1")
+            runtime_kwargs["api_key"] = os.getenv("OLLAMA_API_KEY", "")
+            runtime_kwargs["provider"] = "ollama-cloud"
+        elif provider_prefix not in ("openrouter",):
+            # Unknown non-openrouter prefix — still route via OpenRouter as last resort
+            runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+            runtime_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
+            runtime_kwargs["provider"] = "openrouter"
+        # NOTE: provider_prefix == "openrouter" is handled below
+        else:
+            runtime_kwargs["provider"] = provider_prefix
+    else:
+        from hermes_cli.model_normalize import detect_vendor
+        detected_provider = detect_vendor(normalized_model)
+        if detected_provider:
+            runtime_kwargs["provider"] = detected_provider
+
+    if "/" in normalized_model:
+        normalized_model = normalized_model.split("/", 1)[1].strip()
+    return runtime_kwargs, normalized_model
+
+
+def _swarm_model_is_available(model: str) -> bool:
+    """Check if a model is available (has credentials AND is not in cooldown/sin-bin).
+
+    This function extends _swarm_model_has_credentials to also check the cooldown DB,
+    preventing the swarm from repeatedly selecting rate-limited providers.
+    """
+    raw = str(model or "").strip()
+    if not raw:
+        return False
+
+    # Block google/nvidia without keys early
+    if raw.startswith("google/") or raw.startswith("nvidia/"):
+        if not (os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY", "").strip() or os.getenv("NVIDIA_API_KEY", "").strip() or os.getenv("NVCLOUD_API_KEY", "").strip()):
+            logger.info("[api_server] blocking google/nvidia model %s due to missing provider keys", raw)
+            return False
+
+    if not _swarm_model_has_credentials(raw):
+        return False
+
+    # ── OpenRouter cost guard ──────────────────────────────────────────────
+    # When HERMES_SWARM_FORCE_FREE_OPENROUTER is enabled, reject any model
+    # routed through OpenRouter that is not explicitly marked with the ":free"
+    # suffix.  This prevents accidental spending on paid OpenRouter models
+    # (e.g. google/gemini-2.5-flash costs $0.15/M completion tokens).
+    runtime_kwargs, normalized_model_result = _runtime_kwargs_for_model_id(raw)
+    provider = str(runtime_kwargs.get("provider") or "").strip().lower()
+    if provider == "openrouter" and os.getenv("HERMES_SWARM_FORCE_FREE_OPENROUTER", "").strip().lower() in ("1", "true", "yes"):
+        if ":free" not in raw.lower():
+            logger.info(
+                "[api_server] model %s blocked — FORCE_FREE_OPENROUTER is enabled and model is not :free",
+                raw,
+            )
+            return False
+
+    runtime_kwargs_out, model_name = runtime_kwargs, normalized_model_result
+    provider = str(runtime_kwargs_out.get("provider") or "").strip().lower()
+    base_url = str(runtime_kwargs_out.get("base_url") or "").strip()
+    if not provider or not model_name:
+        return True
+
+    try:
+        from agent.model_cooldown_db import model_cooldown_remaining
+        remaining = model_cooldown_remaining(provider, model_name, base_url=base_url)
+        if remaining and remaining > 0:
+            logger.info(
+                "[api_server] model %s in cooldown (%.0fs remaining) — skipping",
+                raw, remaining,
+            )
+            return False
+    except Exception:
+        pass
+
+    if provider == "zai" and _zai_is_peak_hours():
+        logger.info(
+            "[api_server] model %s skipped during peak hours (14:00-18:00 UTC+8) — quota costs 3x",
+            raw,
+        )
+        return False
+
+    return True
+
+
+def _zai_is_peak_hours() -> bool:
+    """Check if current time is within ZAI peak hours (14:00-18:00 UTC+8).
+
+    During peak hours, GLM-5.1 and GLM-5-Turbo consume quota at 3x normal rate.
+    Off-peak usage is currently 1x through end of June (limited-time benefit).
+    """
+    import time
+    utc_plus_8_offset = 8 * 3600
+    utc_plus_8_seconds = time.time() + utc_plus_8_offset
+    utc_plus_8_hour = (utc_plus_8_seconds % 86400) // 3600
+    return 14 <= utc_plus_8_hour < 18
 
 
 def _is_opencode_user_agent(user_agent: str) -> bool:
@@ -1502,6 +1954,72 @@ class APIServerAdapter(BasePlatformAdapter):
                 model = _resolve_gateway_model()
 
             runtime_kwargs = _align_runtime_with_explicit_model(runtime_kwargs, model)
+            # If the model had an explicit provider prefix (eg. "anthropic/..." or "ollama/...")
+            # but the requested provider couldn't be resolved (missing creds), try to find a
+            # viable provider for the bare model name. This prevents mismatched provider+model
+            # calls (e.g., calling openai-codex with an anthropic/ model) which produce
+            # non-retryable 400 errors. We only do this when the explicit provider was requested.
+            try:
+                from hermes_cli.models import detect_provider_for_model
+                from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
+                explicit_provider = _explicit_provider_from_model(model)
+                if explicit_provider:
+                    current_provider = str(runtime_kwargs.get("provider") or "").strip().lower()
+                    # If runtime doesn't match explicit provider or lacks api_key, attempt resolution
+                    if current_provider != explicit_provider or not runtime_kwargs.get("api_key"):
+                        try:
+                            # Try to resolve the explicit provider (may raise if creds missing)
+                            resolved = resolve_runtime_provider(requested=explicit_provider)
+                            runtime_kwargs = {
+                                "api_key": resolved.get("api_key"),
+                                "base_url": resolved.get("base_url"),
+                                "provider": resolved.get("provider"),
+                                "api_mode": resolved.get("api_mode"),
+                                "command": resolved.get("command"),
+                                "args": list(resolved.get("args") or []),
+                                "credential_pool": resolved.get("credential_pool"),
+                            }
+                        except Exception:
+                            # Couldn't resolve explicit provider (likely missing credentials).
+                            # Try to detect an alternative provider for the bare model name.
+                            try:
+                                bare = model.split("/", 1)[1].strip() if "/" in model else model
+                                detected = detect_provider_for_model(bare, current_provider)
+                                if detected:
+                                    alt_provider = detected[0]
+                                    try:
+                                        alt_runtime = resolve_runtime_provider(requested=alt_provider)
+                                        runtime_kwargs = {
+                                            "api_key": alt_runtime.get("api_key"),
+                                            "base_url": alt_runtime.get("base_url"),
+                                            "provider": alt_runtime.get("provider"),
+                                            "api_mode": alt_runtime.get("api_mode"),
+                                            "command": alt_runtime.get("command"),
+                                            "args": list(alt_runtime.get("args") or []),
+                                            "credential_pool": alt_runtime.get("credential_pool"),
+                                        }
+                                        logging.warning(
+                                            "[API_SERVER] explicit provider %s unavailable; routed model %s to provider %s",
+                                            explicit_provider,
+                                            model,
+                                            alt_provider,
+                                        )
+                                    except Exception:
+                                        logging.warning(
+                                            "[API_SERVER] explicit provider %s unavailable and alternative provider resolution failed; proceeding with default runtime kwargs",
+                                            explicit_provider,
+                                        )
+                                else:
+                                    logging.warning(
+                                        "[API_SERVER] explicit provider %s unavailable and no alternative provider detected for model %s",
+                                        explicit_provider,
+                                        model,
+                                    )
+                            except Exception:
+                                logging.exception("[API_SERVER] error while attempting alternative provider detection for model %s", model)
+            except Exception:
+                # If the import or detection fails, just continue with existing runtime_kwargs
+                logging.debug("[API_SERVER] provider alignment/detection helper failed; continuing")
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -1652,56 +2170,71 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        now = int(time.time())
+        data = [
+            {
+                "id": self._model_name,
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": self._model_name,
+                "parent": None,
+            },
+            {
+                "id": "hermes-code",
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": "hermes-code",
+                "parent": None,
+                "description": "Routes all tools to client (OpenCode local). Use with tools from OpenCode.",
+            },
+            {
+                "id": "hermes-agentic-remote",
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": "hermes-agentic-remote",
+                "parent": None,
+            },
+            {
+                "id": "hermes-agentic-full",
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": "hermes-agentic-full",
+                "parent": None,
+            },
+            {
+                "id": "hermes-swarm",
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": "hermes-swarm",
+                "parent": None,
+            },
+            *[
+                {
+                    "id": alias,
+                    "object": "model",
+                    "created": now,
+                    "owned_by": "hermes",
+                    "permission": [],
+                    "root": alias,
+                    "parent": "hermes-swarm",
+                    "description": "Role alias managed by Hermes Gateway. Routed dynamically through hermes-swarm.",
+                }
+                for alias in ROLE_ALIAS_CONFIG
+            ],
+        ]
         return web.json_response({
             "object": "list",
-            "data": [
-                {
-                    "id": self._model_name,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": self._model_name,
-                    "parent": None,
-                },
-                {
-                    "id": "hermes-code",
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": "hermes-code",
-                    "parent": None,
-                    "description": "Routes all tools to client (OpenCode local). Use with tools from OpenCode.",
-                },
-                {
-                    "id": "hermes-agentic-remote",
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": "hermes-agentic-remote",
-                    "parent": None,
-                },
-                {
-                    "id": "hermes-agentic-full",
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": "hermes-agentic-full",
-                    "parent": None,
-                },
-                {
-                    "id": "hermes-swarm",
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": "hermes-swarm",
-                    "parent": None,
-                },
-            ],
+            "data": data,
         })
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
@@ -1865,6 +2398,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
+        role_cfg = _get_role_alias_config(model_name)
+        role_hint = dict(role_cfg.get("hint") or {}) if role_cfg else None
         _toolset_mode = "auto"
         _provider_mode = False
         if model_name == "hermes-agentic-full":
@@ -1887,7 +2422,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Hermes-swarm: select free/cheap model pool
         swarm_mode = False
         swarm_model_pool = None
-        if model_name == "hermes-swarm":
+        if model_name == "hermes-swarm" or (role_cfg and role_cfg.get("mode") == "swarm"):
             swarm_mode = True
             from agent.model_metadata import estimate_request_tokens_rough
             _approx_tokens = 0
@@ -1905,6 +2440,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message=user_message,
                 tools=tools,
                 estimated_tokens=_approx_tokens,
+                routing_hint=role_hint,
             )
             logger.info(
                 "[api_server] swarm pool: primary=%s, fallbacks=%d models, "
@@ -1935,7 +2471,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         agents_prefetch_text = ""
         if swarm_mode and _needs_agents_prefetch(user_message, system_prompt, tools, conversation_messages):
-            prefetch = _determine_agents_prefetch_action(conversation_messages)
+            prefetch = _determine_agents_prefetch_action(conversation_messages, tools)
             status = prefetch.get("status")
             if status in {"need_search", "need_read"}:
                 prefetch_call = prefetch.get("tool_call")
@@ -2964,6 +3500,8 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = stored_session_id or str(uuid.uuid4())
 
         model_name = body.get("model", self._model_name)
+        role_cfg = _get_role_alias_config(model_name)
+        role_hint = dict(role_cfg.get("hint") or {}) if role_cfg else None
         _toolset_mode = "auto"
         _provider_mode = False
         if model_name == "hermes-agentic-full":
@@ -2986,7 +3524,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Handle hermes-swarm mode - use _model_name from request body
         swarm_mode = False
         swarm_model_pool = None
-        if _model_name == "hermes-swarm":
+        if _model_name == "hermes-swarm" or (role_cfg and role_cfg.get("mode") == "swarm"):
             swarm_mode = True
             from agent.model_metadata import estimate_request_tokens_rough
             _approx_tokens = 0
@@ -3004,6 +3542,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message=user_message,
                 tools=tools,
                 estimated_tokens=_approx_tokens,
+                routing_hint=role_hint,
             )
 
         stream = bool(body.get("stream", False))
@@ -3705,83 +4244,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return await loop.run_in_executor(None, _run)
 
     def _runtime_kwargs_for_model(self, model: str) -> tuple[Dict[str, Any], str]:
-        runtime_kwargs: Dict[str, Any] = {}
-        provider_prefix = ""
-        normalized_model = str(model or "").strip()
-        if "/" in normalized_model:
-            provider_prefix = normalized_model.split("/", 1)[0].strip().lower()
-            if provider_prefix == "opencode-zen":
-                runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
-                runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
-                runtime_kwargs["provider"] = "opencode-zen"
-            elif provider_prefix == "opencode-go":
-                runtime_kwargs["base_url"] = os.getenv("OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1")
-                runtime_kwargs["api_key"] = os.getenv("OPENCODE_GO_API_KEY", "")
-                runtime_kwargs["provider"] = "opencode-go"
-            elif provider_prefix == "openai":
-                openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
-                openai_base = os.getenv("OPENAI_BASE_URL", "").strip()
-                codex_key = (
-                    os.getenv("OPENAI_CODEX_API_KEY", "").strip()
-                    or os.getenv("OPENAI_OAUTH_TOKEN", "").strip()
-                    or os.getenv("OPENAI_CODEX_TOKEN", "").strip()
-                    or os.getenv("CODEX_ACCESS_TOKEN", "").strip()
-                )
-                if openai_api_key:
-                    # Direct OpenAI API if an actual OpenAI API key is configured.
-                    runtime_kwargs["base_url"] = "https://api.openai.com/v1"
-                    if openai_base:
-                        runtime_kwargs["base_url"] = openai_base
-                    runtime_kwargs["provider"] = "openai"
-                elif openai_base:
-                    # Custom OpenAI-compatible gateway/proxy.
-                    runtime_kwargs["base_url"] = openai_base
-                    runtime_kwargs["provider"] = "openai"
-                else:
-                    # Default to the Codex endpoint for openai/<model> routing.
-                    runtime_kwargs["base_url"] = os.getenv("OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex")
-                    runtime_kwargs["provider"] = "openai-codex"
-                runtime_kwargs["api_key"] = openai_api_key or codex_key
-            elif provider_prefix == "github-copilot":
-                _copilot_token = os.getenv("GITHUB_COPILOT_API_KEY", "")
-                if not _copilot_token:
-                    try:
-                        from hermes_cli.copilot_auth import resolve_copilot_token
-                        _copilot_token, _copilot_source = resolve_copilot_token()
-                        if _copilot_token:
-                            logging.warning(f"[API_SERVER] Swarm: resolved Copilot token from {_copilot_source}")
-                    except Exception as exc:
-                        logging.warning(f"[API_SERVER] Swarm: failed to resolve Copilot token: {exc}")
-                runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
-                runtime_kwargs["api_key"] = _copilot_token
-                runtime_kwargs["provider"] = "copilot"
-            elif provider_prefix == "minimax":
-                runtime_kwargs["base_url"] = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
-                runtime_kwargs["api_key"] = os.getenv("MINIMAX_API_KEY", "")
-                runtime_kwargs["provider"] = "minimax"
-            elif provider_prefix == "zai":
-                runtime_kwargs["base_url"] = "https://api.z.ai/api/coding/paas/v4"
-                runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
-                runtime_kwargs["provider"] = "zai"
-            elif provider_prefix == "qwen":
-                runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
-                runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
-                runtime_kwargs["provider"] = "alibaba"
-            elif provider_prefix != "local":
-                runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-                runtime_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
-                runtime_kwargs["provider"] = "openrouter"
-            else:
-                runtime_kwargs["provider"] = provider_prefix
-        else:
-            from hermes_cli.model_normalize import detect_vendor
-            detected_provider = detect_vendor(normalized_model)
-            if detected_provider:
-                runtime_kwargs["provider"] = detected_provider
-
-        if provider_prefix in ("opencode-go", "opencode-zen") and "/" in normalized_model:
-            normalized_model = normalized_model.split("/", 1)[1].strip()
-        return runtime_kwargs, normalized_model
+        return _runtime_kwargs_for_model_id(model)
 
     def _run_swarm_scout_sync(
         self,
@@ -3798,16 +4261,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # (cheap/Copilot) is selected. When context is large, MiniMax-M2.7 (200K)
         # passes the context filter and is selected instead.
         estimated_tokens = swarm_model_pool.get("estimated_tokens", 0)
-        preferred_models = [
-            os.getenv("HERMES_SWARM_SCOUT_MODEL", "").strip(),
-            pool.get("primary", ""),
-            "github-copilot/gpt-5-mini",
-            "openai/gpt-5-mini",
-            "minimax/MiniMax-M2.7",
-        ]
+        preferred_models = [os.getenv("HERMES_SWARM_SCOUT_MODEL", "").strip()]
+        preferred_models.extend(pool.get("scout_fallbacks", []))
         scout_model = ""
         for candidate in preferred_models:
-            if candidate and _swarm_model_has_credentials(candidate):
+            if candidate and _swarm_model_is_available(candidate):
                 # Skip models that can't hold the estimated context (prevents 413 on scout itself)
                 if not _model_safe_for_tokens(candidate, estimated_tokens):
                     logger.info("[api_server] scout skipping %s (context %d > safe limit)", candidate, estimated_tokens)
@@ -3816,6 +4274,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 break
         if not scout_model:
             raise RuntimeError("No available scout model with credentials")
+
+        logger.warning(
+            "[API_SERVER] swarm scout selected model=%s primary=%s scout_fallbacks=%s estimated_tokens=%s",
+            scout_model,
+            pool.get("primary", ""),
+            pool.get("scout_fallbacks", []),
+            estimated_tokens,
+        )
 
         runtime_kwargs, scout_model_name = self._runtime_kwargs_for_model(scout_model)
         from run_agent import AIAgent
@@ -3888,7 +4354,7 @@ class APIServerAdapter(BasePlatformAdapter):
         verify_model = ""
         primary = str(pool.get("primary") or "").strip()
         for candidate in preferred_models:
-            if candidate and candidate != primary and _swarm_model_has_credentials(candidate):
+            if candidate and candidate != primary and _swarm_model_is_available(candidate):
                 verify_model = candidate
                 break
         if not verify_model:
@@ -3950,8 +4416,9 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message: str = "",
         tools: Optional[List[Dict[str, Any]]] = None,
         estimated_tokens: int = 0,
+        routing_hint: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        pool = _build_swarm_model_pool(estimated_tokens=estimated_tokens)
+        pool = _build_swarm_model_pool(estimated_tokens=estimated_tokens, routing_hint=routing_hint)
         heuristic_hint = _heuristic_swarm_routing_hint(
             system_prompt=system_prompt,
             conversation_history=conversation_history,
@@ -3959,7 +4426,10 @@ class APIServerAdapter(BasePlatformAdapter):
             tools=tools,
             estimated_tokens=estimated_tokens,
         )
-        pool["routing_hint"] = heuristic_hint
+        merged_hint = dict(heuristic_hint)
+        if routing_hint:
+            merged_hint.update(routing_hint)
+        pool["routing_hint"] = merged_hint
 
         should_scout = os.getenv("HERMES_SWARM_ENABLE_SCOUT", "true").strip().lower() not in {"0", "false", "no"}
         if should_scout and heuristic_hint.get("recommended_tier") in {"balanced", "premium"}:
@@ -3976,9 +4446,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                 )
                 if isinstance(scout_hint, dict):
-                    merged_hint = dict(heuristic_hint)
-                    merged_hint.update(scout_hint)
-                    pool["routing_hint"] = merged_hint
+                    scout_merged_hint = dict(pool.get("routing_hint") or {})
+                    scout_merged_hint.update(scout_hint)
+                    pool["routing_hint"] = scout_merged_hint
             except Exception as exc:
                 logger.warning("[api_server] swarm scout failed, falling back to heuristics: %s", exc)
         return pool
