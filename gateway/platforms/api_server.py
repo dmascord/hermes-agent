@@ -185,16 +185,14 @@ _SWARM_CHEAP_MODEL_HINTS = (
 
 # Order matters: best quality FIRST, fallbacks last
 # This is the priority order when primary model fails
-# sonnet provides best quality/cost ratio, opus is heavier so use as last resort
+# gpt-5.4 has 400K context (2x Sonnet) - best for large codebases
 _HERMES_CODE_PREMIUM_MODELS = (
-    # Sonnet family - best quality/cost ratio for coding
+    # GPT-5.4 family - 400K context, best for large codebases
+    "github-copilot/gpt-5.4",
+    "openai/gpt-5.4",
+    # Sonnet family - excellent quality/cost ratio for coding
     "github-copilot/claude-sonnet-4.6",
     "anthropic/claude-sonnet-4.6",
-    # GPT-5 family - good quality
-    "openai/gpt-5.5",
-    "openai/gpt-5.4",
-    "openai/gpt-5.3-codex",
-    "github-copilot/gpt-5.4",
     "github-copilot/gpt-5.3-codex",
     # Opus family - best but heavier/expensive, use as last resort
     "github-copilot/claude-opus-4.7",
