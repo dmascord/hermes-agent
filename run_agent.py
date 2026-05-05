@@ -11936,6 +11936,25 @@ class AIAgent:
                         except Exception:
                             pass
                     self._touch_activity(f"API call #{api_call_count} completed")
+                    # ── Slow-response penalty ──────────────────────────
+                    # If the API call took much longer than expected, mark the
+                    # current credential as slow so the pool can rotate to a
+                    # faster alternative for subsequent calls.
+                    if self._credential_pool is not None and api_duration > 0:
+                        try:
+                            next_cred = self._credential_pool.mark_slow_response(
+                                api_duration=api_duration,
+                            )
+                            if next_cred is not None and next_cred.id != (self._credential_pool.current().id if self._credential_pool.current() else None):
+                                _next_label = next_cred.label or next_cred.id[:8]
+                                self._vprint(
+                                    f"{self.log_prefix}🐢 Slow response ({api_duration:.1f}s) — "
+                                    f"rotating to credential {_next_label}"
+                                )
+                                self._swap_credential(next_cred)
+                        except Exception:
+                            logger.debug("Slow-response penalty check failed", exc_info=True)
+
                     break  # Success, exit retry loop
 
                 except InterruptedError:
