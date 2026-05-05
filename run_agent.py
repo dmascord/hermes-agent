@@ -943,6 +943,13 @@ class AIAgent:
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
     )
+    # ── Class-level context pressure dedup (survives across instances) ──
+    # The gateway creates a new AIAgent per message, so instance-level flags
+    # reset every time.  This dict tracks {session_id: (warn_level, timestamp)}
+    # to suppress duplicate warnings within a cooldown window.
+    _context_pressure_last_warned: dict = {}
+    _CONTEXT_PRESSURE_COOLDOWN = 300  # seconds between re-warning same session
+
 
     @property
     def base_url(self) -> str:
@@ -1655,6 +1662,22 @@ class AIAgent:
         if self.ephemeral_system_prompt and not self.quiet_mode:
             prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
             print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
+        # Track which tools are from the client (route execution back to client)
+        self.client_tool_names = set()
+        self.internal_tool_names = set()
+        if self.tools is not None:
+            for tool in self.tools:
+                tool_name = tool.get("function", {}).get("name", "")
+                _fc = tool.get("_from_client", False)
+                _is_client_mode = (enabled_toolsets == [] and self.tools is not None)
+                if _is_client_mode:
+                    _fc = True
+                    tool["_from_client"] = True
+                if _fc or _is_client_mode:
+                    self.client_tool_names.add(tool_name)
+                else:
+                    self.internal_tool_names.add(tool_name)
+
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
@@ -9489,6 +9512,57 @@ class AIAgent:
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
 
+    def _await_external_tool_result(self, tool_call, function_name: str, function_args: dict, index: int) -> tuple:
+        """Wait for a brokered external tool result via tool_call_hub."""
+        from gateway.platforms import tool_call_hub
+
+        session_id = self.session_id or ""
+        call_id = getattr(tool_call, "id", None)
+        if not isinstance(call_id, str) or not call_id.strip():
+            raw_args = getattr(getattr(tool_call, "function", None), "arguments", None)
+            if not isinstance(raw_args, str):
+                try:
+                    raw_args = json.dumps(function_args, separators=(",", ":"), sort_keys=True)
+                except Exception:
+                    raw_args = str(function_args or "")
+            call_id = self._deterministic_call_id(function_name, raw_args, index)
+            try:
+                tool_call.id = call_id
+            except Exception:
+                pass
+
+        logger.info("Waiting for external tool result session=%s call_id=%s tool=%s",
+                     session_id, call_id, function_name)
+        pending = tool_call_hub.register_call(session_id, call_id, function_name)
+        timeout = float(os.getenv("HERMES_EXTERNAL_TOOL_TIMEOUT", "300"))
+        waited = pending.event.wait(timeout=timeout)
+        if not waited:
+            logger.warning("External tool timeout session=%s call_id=%s tool=%s timeout=%ss",
+                           session_id, call_id, function_name, timeout)
+            return (f"[Timeout waiting for external tool '{function_name}' result "
+                    f"(call_id: {call_id})]", True, call_id)
+
+        posted = pending.result
+        if pending.status == "ok":
+            logger.info("External tool completed session=%s call_id=%s tool=%s",
+                        session_id, call_id, function_name)
+            if isinstance(posted, str):
+                return posted, False, call_id
+            try:
+                return json.dumps(posted, ensure_ascii=False), False, call_id
+            except Exception:
+                return str(posted), False, call_id
+
+        logger.warning("External tool returned error session=%s call_id=%s tool=%s",
+                       session_id, call_id, function_name)
+        if isinstance(posted, str):
+            return f"[Tool error] {posted}", True, call_id
+        try:
+            return f"[Tool error] {json.dumps(posted, ensure_ascii=False)}", True, call_id
+        except Exception:
+            return f"[Tool error] {str(posted)}", True, call_id
+
+
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
 
@@ -11862,25 +11936,6 @@ class AIAgent:
                         except Exception:
                             pass
                     self._touch_activity(f"API call #{api_call_count} completed")
-                    # ── Slow-response penalty ──────────────────────────
-                    # If the API call took much longer than expected, mark the
-                    # current credential as slow so the pool can rotate to a
-                    # faster alternative for subsequent calls.
-                    if self._credential_pool is not None and api_duration > 0:
-                        try:
-                            next_cred = self._credential_pool.mark_slow_response(
-                                api_duration=api_duration,
-                            )
-                            if next_cred is not None and next_cred.id != (self._credential_pool.current().id if self._credential_pool.current() else None):
-                                _next_label = next_cred.label or next_cred.id[:8]
-                                self._vprint(
-                                    f"{self.log_prefix}🐢 Slow response ({api_duration:.1f}s) — "
-                                    f"rotating to credential {_next_label}"
-                                )
-                                self._swap_credential(next_cred)
-                        except Exception:
-                            logger.debug("Slow-response penalty check failed", exc_info=True)
-
                     break  # Success, exit retry loop
 
                 except InterruptedError:
