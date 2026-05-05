@@ -259,67 +259,12 @@ _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
     "kimi-coding-cn",
 })
 
-# OpenRouter app attribution headers (base — always sent)
-_OR_HEADERS_BASE = {
+# OpenRouter app attribution headers
+_OR_HEADERS = {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
     "X-OpenRouter-Title": "Hermes Agent",
     "X-OpenRouter-Categories": "productivity,cli-agent",
 }
-
-# Truthy values for boolean env-var parsing.
-_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
-
-
-def build_or_headers(or_config: dict | None = None) -> dict:
-    """Build OpenRouter headers, optionally including response-cache headers.
-
-    Precedence for response cache: env var > config.yaml > default (enabled).
-
-    Environment variables:
-        ``HERMES_OPENROUTER_CACHE`` — truthy (``1``/``true``/``yes``/``on``)
-            enables caching; ``0``/``false``/``no``/``off`` disables.
-            Overrides ``openrouter.response_cache`` in config.yaml.
-        ``HERMES_OPENROUTER_CACHE_TTL`` — integer seconds (1-86400).
-            Overrides ``openrouter.response_cache_ttl`` in config.yaml.
-
-    *or_config* is the ``openrouter`` section from config.yaml.  When *None*,
-    falls back to reading config from disk via ``load_config()``.
-    """
-    headers = dict(_OR_HEADERS_BASE)
-
-    # Resolve config from disk if not provided.
-    if or_config is None:
-        try:
-            from hermes_cli.config import load_config
-            or_config = load_config().get("openrouter", {})
-        except Exception:
-            or_config = {}
-
-    # Determine cache enabled: env var overrides config.
-    env_cache = os.environ.get("HERMES_OPENROUTER_CACHE", "").strip().lower()
-    if env_cache:
-        cache_enabled = env_cache in _TRUTHY_ENV_VALUES
-    else:
-        cache_enabled = or_config.get("response_cache", False)
-
-    if not cache_enabled:
-        return headers
-
-    headers["X-OpenRouter-Cache"] = "true"
-
-    # Determine TTL: env var overrides config.
-    env_ttl = os.environ.get("HERMES_OPENROUTER_CACHE_TTL", "").strip()
-    if env_ttl:
-        if env_ttl.isdigit():
-            ttl = int(env_ttl)
-            if 1 <= ttl <= 86400:
-                headers["X-OpenRouter-Cache-TTL"] = str(ttl)
-    else:
-        ttl = or_config.get("response_cache_ttl", 300)
-        if isinstance(ttl, (int, float)) and 1 <= ttl <= 86400:
-            headers["X-OpenRouter-Cache-TTL"] = str(int(ttl))
-
-    return headers
 
 # Vercel AI Gateway app attribution headers. HTTP-Referer maps to
 # referrerUrl and X-Title maps to appName in the gateway's analytics.
@@ -1204,23 +1149,23 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 
-def _try_openrouter(explicit_api_key: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
-        or_key = explicit_api_key or _pool_runtime_api_key(entry)
+        or_key = _pool_runtime_api_key(entry)
         if not or_key:
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
         logger.debug("Auxiliary client: OpenRouter via pool")
         return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=build_or_headers()), _OPENROUTER_MODEL
+                       default_headers=_OR_HEADERS), _OPENROUTER_MODEL
 
-    or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
+    or_key = os.getenv("OPENROUTER_API_KEY")
     if not or_key:
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers()), _OPENROUTER_MODEL
+                   default_headers=_OR_HEADERS), _OPENROUTER_MODEL
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -1529,7 +1474,7 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
     return CodexAuxiliaryClient(real_client, model), model
 
 
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
@@ -1539,10 +1484,10 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
     if pool_present:
         if entry is None:
             return None, None
-        token = explicit_api_key or _pool_runtime_api_key(entry)
+        token = _pool_runtime_api_key(entry)
     else:
         entry = None
-        token = explicit_api_key or resolve_anthropic_token()
+        token = resolve_anthropic_token()
     if not token:
         return None, None
 
@@ -1667,6 +1612,47 @@ def _is_connection_error(exc: Exception) -> bool:
     )):
         return True
     return False
+
+
+def _is_model_unavailable_error(exc: Exception) -> bool:
+    """Detect provider/model mismatches that should trigger auto fallback.
+
+    Some auxiliary calls inherit the main runtime model during ``provider=auto``.
+    For hermes-code this can surface provider-specific rejections like
+    ``Model opencode-go/deepseek-v4-pro not supported`` or ``model not found``.
+    Those are not transport failures, but for auto routing they are still safe
+    to treat as recoverable by falling through to the normal auxiliary chain.
+    """
+    status = getattr(exc, "status_code", None)
+    err_lower = str(exc).lower()
+
+    if status in (400, 401, 404, 422, 503):
+        if any(marker in err_lower for marker in (
+            "model_not_found",
+            "model not found",
+            "no such model",
+            "does not exist",
+            "not supported",
+            "unsupported model",
+            "provider rejected model",
+            "no available channel",
+            "unknown model",
+            "invalid model",
+        )):
+            return True
+
+    return any(marker in err_lower for marker in (
+        "model_not_found",
+        "model not found",
+        "no such model",
+        "does not exist",
+        "not supported",
+        "unsupported model",
+        "provider rejected model",
+        "no available channel",
+        "unknown model",
+        "invalid model",
+    ))
 
 
 def _is_auth_error(exc: Exception) -> bool:
@@ -1966,7 +1952,7 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     }
     sync_base_url = str(sync_client.base_url)
     if base_url_host_matches(sync_base_url, "openrouter.ai"):
-        async_kwargs["default_headers"] = build_or_headers()
+        async_kwargs["default_headers"] = dict(_OR_HEADERS)
     elif base_url_host_matches(sync_base_url, "api.githubcopilot.com"):
         from hermes_cli.copilot_auth import copilot_request_headers
 
@@ -2108,9 +2094,9 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
-    # ── OpenRouter ───────────────────────────────────────────
+    # ── OpenRouter ───────────────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
+        client, default = _try_openrouter()
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
@@ -2336,7 +2322,7 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
-            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
+            client, default_model = _try_anthropic()
             if client is None:
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None
@@ -2648,11 +2634,8 @@ def resolve_vision_provider_client(
         return resolved_provider, sync_client, final_model
 
     if resolved_base_url:
-        provider_for_base_override = (
-            requested if requested and requested not in ("", "auto") else "custom"
-        )
         client, final_model = resolve_provider_client(
-            provider_for_base_override,
+            "custom",
             model=resolved_model,
             async_mode=async_mode,
             explicit_base_url=resolved_base_url,
@@ -2660,8 +2643,8 @@ def resolve_vision_provider_client(
             api_mode=resolved_api_mode,
         )
         if client is None:
-            return provider_for_base_override, None, None
-        return provider_for_base_override, client, final_model
+            return "custom", None, None
+        return "custom", client, final_model
 
     if requested == "auto":
         # Vision auto-detection order:
@@ -3103,6 +3086,14 @@ def _resolve_task_provider_model(
     to "custom" and the task uses that direct endpoint. api_mode is one of
     "chat_completions", "codex_responses", or None (auto-detect).
     """
+    def _clean_optional_str(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return cleaned or None
+        return str(value).strip() or None
+
     cfg_provider = None
     cfg_model = None
     cfg_base_url = None
@@ -3111,11 +3102,11 @@ def _resolve_task_provider_model(
 
     if task:
         task_config = _get_auxiliary_task_config(task)
-        cfg_provider = str(task_config.get("provider", "")).strip() or None
-        cfg_model = str(task_config.get("model", "")).strip() or None
-        cfg_base_url = str(task_config.get("base_url", "")).strip() or None
-        cfg_api_key = str(task_config.get("api_key", "")).strip() or None
-        cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
+        cfg_provider = _clean_optional_str(task_config.get("provider"))
+        cfg_model = _clean_optional_str(task_config.get("model"))
+        cfg_base_url = _clean_optional_str(task_config.get("base_url"))
+        cfg_api_key = _clean_optional_str(task_config.get("api_key"))
+        cfg_api_mode = _clean_optional_str(task_config.get("api_mode"))
 
     resolved_model = model or cfg_model
     resolved_api_mode = cfg_api_mode
@@ -3295,26 +3286,7 @@ def _build_call_kwargs(
             kwargs["max_tokens"] = max_tokens
 
     if tools:
-        # Defensive dedup: providers like Google Vertex, Azure, and Bedrock
-        # reject requests with duplicate tool names (HTTP 400).  The upstream
-        # injection paths (run_agent.py) already dedup, but this guard
-        # converts a hard API failure into a warning if an upstream regression
-        # reintroduces duplicates.  See: #18478
-        _seen: set = set()
-        _deduped: list = []
-        for _t in tools:
-            _tname = (_t.get("function") or {}).get("name", "")
-            if _tname and _tname in _seen:
-                logger.warning(
-                    "_build_call_kwargs: duplicate tool name '%s' removed "
-                    "(provider=%s model=%s)",
-                    _tname, provider, model,
-                )
-                continue
-            if _tname:
-                _seen.add(_tname)
-            _deduped.append(_t)
-        kwargs["tools"] = _deduped
+        kwargs["tools"] = tools
 
     # Provider-specific extra_body
     merged_extra = dict(extra_body or {})
@@ -3612,13 +3584,22 @@ def call_llm(
         # Codex/OAuth tokens that authenticate but whose endpoint is down,
         # and providers the user never configured that got picked up by
         # the auto-detection chain.
-        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
+        should_fallback = (
+            _is_payment_error(first_err)
+            or _is_connection_error(first_err)
+            or _is_model_unavailable_error(first_err)
+        )
         # Only try alternative providers when the user didn't explicitly
         # configure this task's provider.  Explicit provider = hard constraint;
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in ("auto", "", None)
         if should_fallback and is_auto:
-            reason = "payment error" if _is_payment_error(first_err) else "connection error"
+            if _is_payment_error(first_err):
+                reason = "payment error"
+            elif _is_connection_error(first_err):
+                reason = "connection error"
+            else:
+                reason = "model unavailable"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
             fb_client, fb_model, fb_label = _try_payment_fallback(

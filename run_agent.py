@@ -60,6 +60,67 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 
 
+def _schema_safe_external_tool_arguments(name: Any, args: Any) -> Dict[str, Any]:
+    """Repair client-executed tool arguments before returning them to OpenCode."""
+    if isinstance(args, dict):
+        parsed = dict(args)
+    elif isinstance(args, str) and args.strip():
+        try:
+            loaded = json.loads(args)
+            parsed = dict(loaded) if isinstance(loaded, dict) else {}
+        except Exception:
+            parsed = {}
+    else:
+        parsed = {}
+
+    tool_name = str(name or "").strip()
+    if tool_name == "terminal":
+        tool_name = "bash"
+    if tool_name == "bash":
+        cmd = parsed.get("command")
+        if not isinstance(cmd, str):
+            for key in ("cmd", "shell", "script", "bash", "input", "text"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    cmd = value
+                    break
+        if not isinstance(cmd, str):
+            cmd = ""
+        parsed["command"] = cmd
+        if not isinstance(parsed.get("description"), str):
+            parsed["description"] = f"Execute command: {cmd[:100]}"
+    elif tool_name in {"read", "edit", "write"}:
+        file_value = parsed.get("filePath")
+        if not isinstance(file_value, str) or not file_value.strip():
+            for key in ("file", "path", "filename", "target", "file_path", "filepath"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    file_value = value
+                    break
+        if isinstance(file_value, str):
+            parsed["filePath"] = file_value
+        if tool_name == "write" and "content" not in parsed:
+            for key in ("text", "contents", "data"):
+                value = parsed.get(key)
+                if isinstance(value, str):
+                    parsed["content"] = value
+                    break
+        if tool_name == "edit":
+            if "oldString" not in parsed:
+                for key in ("old", "old_string", "search", "find"):
+                    value = parsed.get(key)
+                    if isinstance(value, str):
+                        parsed["oldString"] = value
+                        break
+            if "newString" not in parsed:
+                for key in ("new", "new_string", "replace", "replacement"):
+                    value = parsed.get(key)
+                    if isinstance(value, str):
+                        parsed["newString"] = value
+                        break
+    return parsed
+
+
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
@@ -304,8 +365,7 @@ class IterationBudget:
 
     @property
     def used(self) -> int:
-        with self._lock:
-            return self._used
+        return self._used
 
     @property
     def remaining(self) -> int:
@@ -957,6 +1017,9 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+        external_tool_mode: str = "none",
     ):
         """
         Initialize the AI Agent.
@@ -1033,6 +1096,9 @@ class AIAgent:
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
         self._credential_pool = credential_pool
+        self._external_tool_mode = str(external_tool_mode or "none")
+        self._tools_from_request = bool(tools)
+        self._requested_tool_choice = tool_choice
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -1259,10 +1325,6 @@ class AIAgent:
         # after each API call.  Accessed by /usage slash command.
         self._rate_limit_state: Optional["RateLimitState"] = None
 
-        # OpenRouter response cache hit counter — incremented when
-        # X-OpenRouter-Cache-Status: HIT is seen in streaming response headers.
-        self._or_cache_hits: int = 0
-
         # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
         # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
         # (which creates a new AIAgent per message) won't duplicate handlers.
@@ -1426,8 +1488,11 @@ class AIAgent:
                     client_kwargs["args"] = self.acp_args
                 effective_base = base_url
                 if base_url_host_matches(effective_base, "openrouter.ai"):
-                    from agent.auxiliary_client import build_or_headers
-                    client_kwargs["default_headers"] = build_or_headers()
+                    client_kwargs["default_headers"] = {
+                        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+                        "X-OpenRouter-Title": "Hermes Agent",
+                        "X-OpenRouter-Categories": "productivity,cli-agent",
+                    }
                 elif base_url_host_matches(effective_base, "api.routermint.com"):
                     client_kwargs["default_headers"] = _routermint_headers()
                 elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
@@ -1475,49 +1540,17 @@ class AIAgent:
                                 _env_hint = _pcfg.api_key_env_vars[0]
                         except Exception:
                             pass
-                        # --- Init-time fallback (#17929) ---
-                        _fb_entries = []
-                        if isinstance(fallback_model, list):
-                            _fb_entries = [
-                                f for f in fallback_model
-                                if isinstance(f, dict) and f.get("provider") and f.get("model")
-                            ]
-                        elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
-                            _fb_entries = [fallback_model]
-                        _fb_resolved = False
-                        for _fb in _fb_entries:
-                            _fb_client, _fb_model = resolve_provider_client(
-                                _fb["provider"], model=_fb["model"], raw_codex=True,
-                                explicit_base_url=_fb.get("base_url"),
-                                explicit_api_key=_fb.get("api_key"),
-                            )
-                            if _fb_client is not None:
-                                self.provider = _fb["provider"]
-                                self.model = _fb_model or _fb["model"]
-                                self._fallback_activated = True
-                                client_kwargs = {
-                                    "api_key": _fb_client.api_key,
-                                    "base_url": str(_fb_client.base_url),
-                                }
-                                if _provider_timeout is not None:
-                                    client_kwargs["timeout"] = _provider_timeout
-                                if hasattr(_fb_client, "_default_headers") and _fb_client._default_headers:
-                                    client_kwargs["default_headers"] = dict(_fb_client._default_headers)
-                                _fb_resolved = True
-                                break
-                        if not _fb_resolved:
-                            raise RuntimeError(
-                                f"Provider '{_explicit}' is set in config.yaml but no API key "
-                                f"was found. Set the {_env_hint} environment "
-                                f"variable, or switch to a different provider with `hermes model`."
-                            )
-                    if not getattr(self, "_fallback_activated", False):
-                        # No provider configured — reject with a clear message.
                         raise RuntimeError(
-                            "No LLM provider configured. Run `hermes model` to "
-                            "select a provider, or run `hermes setup` for first-time "
-                            "configuration."
+                            f"Provider '{_explicit}' is set in config.yaml but no API key "
+                            f"was found. Set the {_env_hint} environment "
+                            f"variable, or switch to a different provider with `hermes model`."
                         )
+                    # No provider configured — reject with a clear message.
+                    raise RuntimeError(
+                        "No LLM provider configured. Run `hermes model` to "
+                        "select a provider, or run `hermes setup` for first-time "
+                        "configuration."
+                    )
             
             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
@@ -1570,7 +1603,7 @@ class AIAgent:
         else:
             self._fallback_chain = []
         self._fallback_index = 0
-        self._fallback_activated = getattr(self, "_fallback_activated", False)
+        self._fallback_activated = False
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
@@ -1582,11 +1615,14 @@ class AIAgent:
                       " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
         # Get available tools with filtering
-        self.tools = get_tool_definitions(
-            enabled_toolsets=enabled_toolsets,
-            disabled_toolsets=disabled_toolsets,
-            quiet_mode=self.quiet_mode,
-        )
+        if self._external_tool_mode in {"broker", "inband"} and isinstance(tools, list):
+            self.tools = list(tools)
+        else:
+            self.tools = get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=self.quiet_mode,
+            )
         
         # Show tool configuration and store valid tool names for validation
         self.valid_tool_names = set()
@@ -1666,12 +1702,30 @@ class AIAgent:
         self._session_db = session_db
         self._parent_session_id = parent_session_id
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
-        self._session_db_created = False  # DB row deferred to run_conversation()
-        self._session_init_model_config = {
-            "max_iterations": self.max_iterations,
-            "reasoning_config": reasoning_config,
-            "max_tokens": max_tokens,
-        }
+        if self._session_db:
+            try:
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model=self.model,
+                    model_config={
+                        "max_iterations": self.max_iterations,
+                        "reasoning_config": reasoning_config,
+                        "max_tokens": max_tokens,
+                    },
+                    user_id=None,
+                    parent_session_id=self._parent_session_id,
+                )
+            except Exception as e:
+                # Transient SQLite lock contention (e.g. CLI and gateway writing
+                # concurrently) must NOT permanently disable session_search for
+                # this agent.  Keep _session_db alive — subsequent message
+                # flushes and session_search calls will still work once the
+                # lock clears.  The session row may be missing from the index
+                # for this run, but that is recoverable (flushes upsert rows).
+                logger.warning(
+                    "Session DB create_session failed (session_search still available): %s", e
+                )
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -2185,28 +2239,6 @@ class AIAgent:
                 "anthropic_base_url": self._anthropic_base_url,
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
-
-    def _ensure_db_session(self) -> None:
-        """Create session DB row on first use. Disables _session_db on failure."""
-        if self._session_db_created or not self._session_db:
-            return
-        try:
-            self._session_db.create_session(
-                session_id=self.session_id,
-                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                model=self.model,
-                model_config=self._session_init_model_config,
-                system_prompt=self._cached_system_prompt,
-                user_id=None,
-                parent_session_id=self._parent_session_id,
-            )
-            self._session_db_created = True
-        except Exception as e:
-            # Transient failure (e.g. SQLite lock). Keep _session_db alive —
-            # _session_db_created stays False so next run_conversation() retries.
-            logger.warning(
-                "Session DB creation failed (will retry next turn): %s", e
-            )
 
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
@@ -2866,6 +2898,48 @@ class AIAgent:
         if est_tokens > 50_000:
             return max(stale_base, 450.0)
         return stale_base
+
+    def _record_model_latency_if_slow(
+        self,
+        *,
+        elapsed_seconds: float,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        reason: str = "slow_response",
+    ) -> None:
+        """Persist a short model cooldown when a provider is slow/hung.
+
+        The gateway's swarm selector consults ``agent.model_cooldown_db`` before
+        choosing providers.  Keep this best-effort and non-fatal: latency
+        tracking must never break a successful model response.
+        """
+        provider = str(getattr(self, "provider", "") or "").strip()
+        model_name = str(model or getattr(self, "model", "") or "").strip()
+        effective_base = str(base_url or getattr(self, "base_url", "") or "").strip()
+        if not provider or not model_name:
+            return
+        if effective_base and is_local_endpoint(effective_base):
+            return
+        try:
+            from agent.model_cooldown_db import record_model_latency
+
+            applied = record_model_latency(
+                provider,
+                model_name,
+                elapsed_seconds,
+                base_url=effective_base,
+                reason=reason,
+            )
+            if applied:
+                logger.info(
+                    "Slow model response recorded for cooldown: provider=%s model=%s elapsed=%.1fs reason=%s",
+                    provider,
+                    model_name,
+                    elapsed_seconds,
+                    reason,
+                )
+        except Exception as exc:
+            logger.debug("Failed to record model latency cooldown: %s", exc)
 
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
@@ -3612,7 +3686,7 @@ class AIAgent:
                     _parent_runtime = self._current_main_runtime()
                     review_agent = AIAgent(
                         model=self.model,
-                        max_iterations=16,
+                        max_iterations=8,
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
@@ -3630,14 +3704,6 @@ class AIAgent:
                     review_agent._user_profile_enabled = self._user_profile_enabled
                     review_agent._memory_nudge_interval = 0
                     review_agent._skill_nudge_interval = 0
-                    # Suppress all status/warning emits from the fork so the
-                    # user only sees the final successful-action summary.
-                    # Without this, mid-review "Iteration budget exhausted",
-                    # rate-limit retries, compression warnings, and other
-                    # lifecycle messages bubble up through _emit_status ->
-                    # _vprint and leak past the stdout redirect (they go via
-                    # _print_fn/status_callback, which bypass sys.stdout).
-                    review_agent.suppress_status_output = True
 
                     review_agent.run_conversation(
                         user_message=prompt,
@@ -3765,9 +3831,14 @@ class AIAgent:
             return
         self._apply_persist_user_message_override(messages)
         try:
-            # Retry row creation if the earlier attempt failed transiently.
-            if not self._session_db_created:
-                self._ensure_db_session()
+            # If create_session() failed at startup (e.g. transient lock), the
+            # session row may not exist yet.  ensure_session() uses INSERT OR
+            # IGNORE so it is a no-op when the row is already there.
+            self._session_db.ensure_session(
+                self.session_id,
+                source=self.platform or "cli",
+                model=self.model,
+            )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
             for msg in messages[flush_from:]:
@@ -4590,28 +4661,6 @@ class AIAgent:
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
 
-    def _check_openrouter_cache_status(self, http_response: Any) -> None:
-        """Read X-OpenRouter-Cache-Status from response headers and log it.
-
-        Increments ``_or_cache_hits`` on HIT so callers can report savings.
-        """
-        if http_response is None:
-            return
-        headers = getattr(http_response, "headers", None)
-        if not headers:
-            return
-        try:
-            status = headers.get("x-openrouter-cache-status")
-            if not status:
-                return
-            if status.upper() == "HIT":
-                self._or_cache_hits += 1
-                logger.info("OpenRouter response cache HIT (total: %d)", self._or_cache_hits)
-            else:
-                logger.debug("OpenRouter response cache %s", status.upper())
-        except Exception:
-            pass  # Never let header parsing break the agent loop
-
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
@@ -5065,23 +5114,6 @@ class AIAgent:
             return tc.get("call_id", "") or tc.get("id", "") or ""
         return getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
 
-    @staticmethod
-    def _get_tool_call_name_static(tc) -> str:
-        """Extract function name from a tool_call entry (dict or object).
-
-        Gemini's OpenAI-compatibility endpoint requires every `role: tool`
-        message to carry the matching function name. OpenAI/Anthropic/ollama
-        tolerate its absence, so the field is best-effort: callers fall back
-        to "" and the message still works elsewhere.
-        """
-        if isinstance(tc, dict):
-            fn = tc.get("function")
-            if isinstance(fn, dict):
-                return fn.get("name", "") or ""
-            return ""
-        fn = getattr(tc, "function", None)
-        return getattr(fn, "name", "") or ""
-
     _VALID_API_ROLES = frozenset({"system", "user", "assistant", "tool", "function", "developer"})
 
     @staticmethod
@@ -5144,7 +5176,6 @@ class AIAgent:
                         if cid in missing_results:
                             patched.append({
                                 "role": "tool",
-                                "name": AIAgent._get_tool_call_name_static(tc),
                                 "content": "[Result unavailable — see context summary above]",
                                 "tool_call_id": cid,
                             })
@@ -5843,17 +5874,6 @@ class AIAgent:
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
-        # Per-request OpenAI-wire clients (used by both the non-streaming
-        # chat-completions path and the streaming chat-completions path
-        # in `_interruptible_api_call`) should not run the SDK's built-in
-        # retry loop: the agent's outer loop owns retries with credential
-        # rotation, provider fallback, and backoff that the SDK can't
-        # see. Leaving SDK retries on (default 2) compounds with our outer
-        # retries and lets a single hung provider request stretch to ~3x
-        # the per-call timeout before our stale detector reports it.
-        # Shared/primary clients and Anthropic / Bedrock paths are
-        # unaffected (they don't go through here).
-        request_kwargs["max_retries"] = 0
         if (
             base_url_host_matches(str(request_kwargs.get("base_url", "")), "api.githubcopilot.com")
             and self._api_kwargs_have_image_parts(api_kwargs or {})
@@ -6218,10 +6238,10 @@ class AIAgent:
         return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
-        from agent.auxiliary_client import _AI_GATEWAY_HEADERS, build_or_headers
+        from agent.auxiliary_client import _AI_GATEWAY_HEADERS, _OR_HEADERS
 
         if base_url_host_matches(base_url, "openrouter.ai"):
-            self._client_kwargs["default_headers"] = build_or_headers()
+            self._client_kwargs["default_headers"] = dict(_OR_HEADERS)
         elif base_url_host_matches(base_url, "ai-gateway.vercel.sh"):
             self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "api.routermint.com"):
@@ -6493,6 +6513,11 @@ class AIAgent:
                     _elapsed, _stale_timeout,
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
+                self._record_model_latency_if_slow(
+                    elapsed_seconds=_elapsed,
+                    model=api_kwargs.get("model"),
+                    reason="stale_non_stream_response",
+                )
                 self._emit_status(
                     f"⚠️ No response from provider for {int(_elapsed)}s "
                     f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
@@ -6537,6 +6562,11 @@ class AIAgent:
                 raise InterruptedError("Agent interrupted during API call")
         if result["error"] is not None:
             raise result["error"]
+        self._record_model_latency_if_slow(
+            elapsed_seconds=time.time() - _call_start,
+            model=api_kwargs.get("model"),
+            reason="slow_non_stream_response",
+        )
         return result["response"]
 
     # ── Unified streaming API call ─────────────────────────────────────────
@@ -6840,9 +6870,6 @@ class AIAgent:
             # The OpenAI SDK Stream object exposes the underlying httpx
             # response via .response before any chunks are consumed.
             self._capture_rate_limits(getattr(stream, "response", None))
-
-            # Log OpenRouter response cache status when present.
-            self._check_openrouter_cache_status(getattr(stream, "response", None))
 
             content_parts: list = []
             tool_calls_acc: dict = {}
@@ -7385,6 +7412,7 @@ class AIAgent:
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
 
+        _stream_call_start = time.time()
         t = threading.Thread(target=_call, daemon=True)
         t.start()
         _last_heartbeat = time.time()
@@ -7419,6 +7447,11 @@ class AIAgent:
                     "model=%s context=~%s tokens. Killing connection.",
                     _stale_elapsed, _stream_stale_timeout,
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
+                self._record_model_latency_if_slow(
+                    elapsed_seconds=_stale_elapsed,
+                    model=api_kwargs.get("model"),
+                    reason="stale_stream_response",
                 )
                 self._emit_status(
                     f"⚠️ No response from provider for {int(_stale_elapsed)}s "
@@ -7522,6 +7555,11 @@ class AIAgent:
                     usage=None,
                 )
             raise result["error"]
+        self._record_model_latency_if_slow(
+            elapsed_seconds=time.time() - _stream_call_start,
+            model=api_kwargs.get("model"),
+            reason="slow_stream_response",
+        )
         return result["response"]
 
     # ── Provider fallback ──────────────────────────────────────────────────
@@ -8230,7 +8268,6 @@ class AIAgent:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
         Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).
         MiniMax keeps dots (e.g. MiniMax-M2.7).
-        Xiaomi MiMo keeps dots (e.g. mimo-v2.5, mimo-v2.5-pro).
         OpenCode Go/Zen keeps dots for non-Claude models (e.g. minimax-m2.5-free).
         ZAI/Zhipu keeps dots (e.g. glm-4.7, glm-5.1).
         AWS Bedrock uses dotted inference-profile IDs
@@ -8244,7 +8281,6 @@ class AIAgent:
             "alibaba", "minimax", "minimax-cn",
             "opencode-go", "opencode-zen",
             "zai", "bedrock",
-            "xiaomi",
         }:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
@@ -8254,7 +8290,6 @@ class AIAgent:
             or "minimax" in base
             or "opencode.ai/zen/" in base
             or "bigmodel.cn" in base
-            or "xiaomimimo.com" in base
             # AWS Bedrock runtime endpoints — defense-in-depth when
             # ``provider`` is unset but ``base_url`` still names Bedrock.
             or "bedrock-runtime." in base
@@ -8339,6 +8374,7 @@ class AIAgent:
                 model=self.model,
                 messages=anthropic_messages,
                 tools=self.tools,
+                tool_choice=self._requested_tool_choice,
                 max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
                 reasoning_config=self.reasoning_config,
                 is_oauth=self._is_anthropic_oauth,
@@ -8387,6 +8423,7 @@ class AIAgent:
                 session_id=getattr(self, "session_id", None),
                 max_tokens=self.max_tokens,
                 request_overrides=self.request_overrides,
+                tool_choice=self._requested_tool_choice,
                 is_github_responses=is_github_responses,
                 is_codex_backend=is_codex_backend,
                 is_xai_responses=is_xai_responses,
@@ -8499,6 +8536,7 @@ class AIAgent:
             lmstudio_reasoning_options=self._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
             anthropic_max_output=_ant_max,
             provider_name=self.provider,
+            tool_choice=self._requested_tool_choice,
         )
 
     def _supports_reasoning_extra_body(self) -> bool:
@@ -8799,7 +8837,10 @@ class AIAgent:
                     "type": tool_call.type,
                     "function": {
                         "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments
+                        "arguments": json.dumps(_schema_safe_external_tool_arguments(
+                            tool_call.function.name,
+                            tool_call.function.arguments,
+                        ), ensure_ascii=False) if getattr(self, "_external_tool_mode", "none") in {"broker", "inband"} else tool_call.function.arguments,
                     },
                 }
                 # Preserve extra_content (e.g. Gemini thought_signature) so it
@@ -9049,7 +9090,6 @@ class AIAgent:
                             insert_at,
                             {
                                 "role": "tool",
-                                "name": function_name if function_name != "?" else "",
                                 "tool_call_id": tool_call_id,
                                 "content": marker,
                             },
@@ -9155,15 +9195,12 @@ class AIAgent:
                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
                 # Update session_log_file to point to the new session's JSON file
                 self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
-                self._session_db_created = False
                 self._session_db.create_session(
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
-                    model_config=self._session_init_model_config,
                     parent_session_id=old_session_id,
                 )
-                self._session_db_created = True
                 # Auto-number the title for the continuation session
                 if old_title:
                     try:
@@ -9295,6 +9332,19 @@ class AIAgent:
         file reads/writes may do so only when their target paths do not overlap.
         """
         tool_calls = assistant_message.tool_calls
+
+        if getattr(self, "_external_tool_mode", "none") in {"broker", "inband"}:
+            for tool_call in tool_calls:
+                name = getattr(getattr(tool_call, "function", None), "name", "")
+                args = getattr(getattr(tool_call, "function", None), "arguments", "{}")
+                parsed = _schema_safe_external_tool_arguments(name, args)
+                if self.tool_start_callback:
+                    try:
+                        self.tool_start_callback(tool_call.id, name, parsed)
+                    except Exception as cb_err:
+                        logging.debug(f"Tool start callback error: {cb_err}")
+            self._touch_activity("external tool call pending")
+            return
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
@@ -9454,7 +9504,6 @@ class AIAgent:
             for tc in tool_calls:
                 messages.append({
                     "role": "tool",
-                    "name": tc.function.name,
                     "content": f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
                     "tool_call_id": tc.id,
                 })
@@ -9796,7 +9845,6 @@ class AIAgent:
 
             tool_msg = {
                 "role": "tool",
-                "name": name,
                 "content": function_result,
                 "tool_call_id": tc.id,
             }
@@ -9834,7 +9882,6 @@ class AIAgent:
                     skipped_name = skipped_tc.function.name
                     skip_msg = {
                         "role": "tool",
-                        "name": skipped_name,
                         "content": f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
                         "tool_call_id": skipped_tc.id,
                     }
@@ -10185,7 +10232,6 @@ class AIAgent:
 
             tool_msg = {
                 "role": "tool",
-                "name": function_name,
                 "content": function_result,
                 "tool_call_id": tool_call.id
             }
@@ -10212,7 +10258,6 @@ class AIAgent:
                     skipped_name = skipped_tc.function.name
                     skip_msg = {
                         "role": "tool",
-                        "name": skipped_name,
                         "content": f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
                         "tool_call_id": skipped_tc.id
                     }
@@ -10347,10 +10392,7 @@ class AIAgent:
                     provider_preferences["order"] = self.providers_order
                 if self.provider_sort:
                     provider_preferences["sort"] = self.provider_sort
-                if provider_preferences and (
-                    (self.provider or "").strip().lower() == "openrouter"
-                    or self._is_openrouter_url()
-                ):
+                if provider_preferences:
                     summary_extra_body["provider"] = provider_preferences
 
                 if summary_extra_body:
@@ -10461,21 +10503,10 @@ class AIAgent:
         # Installed once, transparent when streams are healthy, prevents crash on write.
         _install_safe_stdio()
 
-        self._ensure_db_session()
-
         # Tag all log records on this thread with the session ID so
         # ``hermes logs --session <id>`` can filter a single conversation.
         from hermes_logging import set_session_context
         set_session_context(self.session_id)
-
-        # Bind the skill write-origin ContextVar for this thread so tool
-        # handlers (e.g. skill_manage create) can tell whether they are
-        # running inside the background self-improvement review fork vs.
-        # a foreground user-directed turn. Set at the top of each call;
-        # the review fork runs on its own thread with a fresh context,
-        # so the foreground value here does not leak into it.
-        from tools.skill_provenance import set_current_write_origin
-        set_current_write_origin(getattr(self, "_memory_write_origin", "assistant_tool"))
 
         # If the previous turn activated fallback, restore the primary
         # runtime so this turn gets a fresh attempt with the preferred model.
@@ -10682,11 +10713,11 @@ class AIAgent:
                     self.model,
                     f"{self.context_compressor.context_length:,}",
                 )
-                self._emit_status(
-                    f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                    f">= {self.context_compressor.threshold_tokens:,} threshold. "
-                    "This may take a moment."
-                )
+                if not self.quiet_mode:
+                    self._safe_print(
+                        f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                        f">= {self.context_compressor.threshold_tokens:,} threshold"
+                    )
                 # May need multiple passes for very large sessions with small
                 # context windows (each pass summarises the middle N turns).
                 for _pass in range(3):
@@ -13135,7 +13166,6 @@ class AIAgent:
                                 content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
                             messages.append({
                                 "role": "tool",
-                                "name": tc.function.name,
                                 "tool_call_id": tc.id,
                                 "content": content,
                             })
@@ -13227,7 +13257,6 @@ class AIAgent:
                                     tool_result = "Skipped: other tool call in this response had invalid JSON."
                                 messages.append({
                                     "role": "tool",
-                                    "name": tc.function.name,
                                     "tool_call_id": tc.id,
                                     "content": tool_result,
                                 })
@@ -13315,6 +13344,17 @@ class AIAgent:
                             pass
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                    if getattr(self, "_external_tool_mode", "none") in {"broker", "inband"}:
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": None,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "tool_calls_pending": True,
+                            "finish_reason": "tool_calls",
+                        }
 
                     if self._tool_guardrail_halt_decision is not None:
                         decision = self._tool_guardrail_halt_decision
@@ -13476,22 +13516,9 @@ class AIAgent:
                             m.get("role") == "tool"
                             for m in messages[-5:]  # check recent messages
                         )
-                        # Detect Qwen3/Ollama-style in-content thinking blocks.
-                        # Ollama puts <think> in the content field (not in
-                        # reasoning_content), so _has_structured below would
-                        # miss it.  We check here so thinking-only responses
-                        # after tool calls route to prefill instead of nudge.
-                        _has_inline_thinking = bool(
-                            re.search(
-                                r'<think>|<thinking>|<reasoning>',
-                                final_response or "",
-                                re.IGNORECASE,
-                            )
-                        )
                         if (
                             _prior_was_tool
                             and not getattr(self, "_post_tool_empty_retried", False)
-                            and not _has_inline_thinking  # thinking model still working — let prefill handle
                         ):
                             self._post_tool_empty_retried = True
                             # Clear stale narration so it doesn't resurface
@@ -13531,13 +13558,10 @@ class AIAgent:
                         # continue — the model will see its own reasoning
                         # on the next turn and produce the text portion.
                         # Inspired by clawdbot's "incomplete-text" recovery.
-                        # Also covers Qwen3/Ollama in-content <think> blocks
-                        # (detected above as _has_inline_thinking).
                         _has_structured = bool(
                             getattr(assistant_message, "reasoning", None)
                             or getattr(assistant_message, "reasoning_content", None)
                             or getattr(assistant_message, "reasoning_details", None)
-                            or _has_inline_thinking
                         )
                         if _has_structured and self._thinking_prefill_retries < 2:
                             self._thinking_prefill_retries += 1
@@ -13744,7 +13768,6 @@ class AIAgent:
                             if tc["id"] not in answered_ids:
                                 err_msg = {
                                     "role": "tool",
-                                    "name": AIAgent._get_tool_call_name_static(tc),
                                     "tool_call_id": tc["id"],
                                     "content": f"Error executing tool: {error_msg}",
                                 }
