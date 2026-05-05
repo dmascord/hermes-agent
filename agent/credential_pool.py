@@ -49,6 +49,7 @@ def _load_config_safe() -> Optional[dict]:
 
 STATUS_OK = "ok"
 STATUS_EXHAUSTED = "exhausted"
+STATUS_SLOW_RESPONSE = "slow_response"
 
 AUTH_TYPE_OAUTH = "oauth"
 AUTH_TYPE_API_KEY = "api_key"
@@ -71,6 +72,15 @@ SUPPORTED_POOL_STRATEGIES = {
 # Provider-supplied reset_at timestamps override these defaults.
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+
+# Slow-response penalty defaults.
+# When an API call takes longer than SLOW_RESPONSE_THRESHOLD_SECONDS, the
+# credential is marked STATUS_SLOW_RESPONSE and skipped for
+# SLOW_RESPONSE_COOLDOWN_SECONDS.  After the cooldown elapses the credential
+# becomes available again (its status is cleared).  This avoids hammering a
+# sluggish upstream while still allowing it to recover organically.
+SLOW_RESPONSE_THRESHOLD_SECONDS = 30.0    # response time above this triggers penalty
+SLOW_RESPONSE_COOLDOWN_SECONDS = 600.0     # 10 minutes
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
@@ -110,6 +120,13 @@ class PooledCredential:
     agent_key: Optional[str] = None
     agent_key_expires_at: Optional[str] = None
     request_count: int = 0
+    # Slow-response penalty tracking.
+    # When api_duration > SLOW_RESPONSE_THRESHOLD_SECONDS the caller marks
+    # the entry with mark_slow_response().  The credential is then skipped by
+    # _available_entries() until the cooldown elapses.
+    slow_response_at: Optional[float] = None
+    slow_response_duration: Optional[float] = None
+    slow_response_count: int = 0
     extra: Dict[str, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -143,6 +160,9 @@ class PooledCredential:
             "last_error_reason",
             "last_error_message",
             "last_error_reset_at",
+            "slow_response_at",
+            "slow_response_duration",
+            "slow_response_count",
         }
         result: Dict[str, Any] = {}
         for field_def in fields(self):
@@ -823,7 +843,7 @@ class CredentialPool:
             return self._select_unlocked()
 
     def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
-        """Return entries not currently in exhaustion cooldown.
+        """Return entries not currently in exhaustion or slow-response cooldown.
 
         When *clear_expired* is True, entries whose cooldown has elapsed are
         reset to STATUS_OK and persisted.  When *refresh* is True, entries
@@ -878,6 +898,32 @@ class CredentialPool:
                         last_error_reason=None,
                         last_error_message=None,
                         last_error_reset_at=None,
+                    )
+                    self._replace_entry(entry, cleared)
+                    entry = cleared
+                    cleared_any = True
+            # ── Slow-response cooldown ──────────────────────────────
+            # A credential marked slow_response is skipped for
+            # SLOW_RESPONSE_COOLDOWN_SECONDS.  After the cooldown
+            # elapses (and clear_expired is True), its status is reset
+            # so it can be tried again.
+            if entry.last_status == STATUS_SLOW_RESPONSE:
+                cooldown_remaining = SLOW_RESPONSE_COOLDOWN_SECONDS
+                if entry.slow_response_at:
+                    cooldown_remaining = (entry.slow_response_at + SLOW_RESPONSE_COOLDOWN_SECONDS) - now
+                if cooldown_remaining > 0:
+                    logger.debug(
+                        "credential pool: skipping %s (slow_response cooldown %.0fs remaining)",
+                        entry.label or entry.id[:8], cooldown_remaining,
+                    )
+                    continue
+                if clear_expired:
+                    cleared = replace(
+                        entry,
+                        last_status=STATUS_OK,
+                        last_status_at=None,
+                        slow_response_at=None,
+                        slow_response_duration=None,
                     )
                     self._replace_entry(entry, cleared)
                     entry = cleared
@@ -955,6 +1001,89 @@ class CredentialPool:
                 logger.info("credential pool: rotated to %s", _next_label)
             return next_entry
 
+    # ── Slow-response penalty ──────────────────────────────────────────
+
+    def mark_slow_response(
+        self,
+        *,
+        api_duration: float,
+        threshold: float = SLOW_RESPONSE_THRESHOLD_SECONDS,
+        cooldown: float = SLOW_RESPONSE_COOLDOWN_SECONDS,
+    ) -> Optional[PooledCredential]:
+        """Mark the current credential as slow and rotate to the next available one.
+
+        When *api_duration* exceeds *threshold*, the current pool entry is tagged
+        with ``STATUS_SLOW_RESPONSE`` for *cooldown* seconds.  During that window
+        ``_available_entries()`` skips it, so subsequent ``select()`` calls pick a
+        different credential (or return None if all are penalised).
+
+        Returns the next available credential, or None if every credential is
+        in cooldown.
+        """
+        if api_duration <= threshold:
+            return self.current()
+
+        with self._lock:
+            entry = self.current() or self._select_unlocked()
+            if entry is None:
+                return None
+            _label = entry.label or entry.id[:8]
+            now = time.time()
+            updated = replace(
+                entry,
+                last_status=STATUS_SLOW_RESPONSE,
+                last_status_at=now,
+                slow_response_at=now,
+                slow_response_duration=api_duration,
+                slow_response_count=entry.slow_response_count + 1,
+                # Clear any previous exhaustion state so _available_entries
+                # only needs to check one cooldown path.
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            self._replace_entry(entry, updated)
+            self._persist()
+
+            logger.info(
+                "credential pool: marking %s slow_response (%.1fs > %.1fs threshold), "
+                "cooldown for %.0fs",
+                _label, api_duration, threshold, cooldown,
+            )
+            self._current_id = None
+            next_entry = self._select_unlocked()
+            if next_entry:
+                _next_label = next_entry.label or next_entry.id[:8]
+                logger.info("credential pool: rotated to %s after slow response", _next_label)
+            return next_entry
+
+    def clear_slow_response(self, credential_id: Optional[str] = None) -> None:
+        """Manually clear the slow-response penalty on a credential.
+
+        If *credential_id* is None, clears the slow-response penalty on *all*
+        entries (e.g. after the provider has recovered).
+        """
+        with self._lock:
+            changed = False
+            new_entries: List[PooledCredential] = []
+            for entry in self._entries:
+                if entry.last_status == STATUS_SLOW_RESPONSE:
+                    if credential_id is None or entry.id == credential_id:
+                        new_entries.append(replace(
+                            entry,
+                            last_status=STATUS_OK,
+                            last_status_at=None,
+                            slow_response_at=None,
+                            slow_response_duration=None,
+                        ))
+                        changed = True
+                        continue
+                new_entries.append(entry)
+            if changed:
+                self._entries = new_entries
+                self._persist()
+
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
 
@@ -1012,7 +1141,7 @@ class CredentialPool:
         count = 0
         new_entries = []
         for entry in self._entries:
-            if entry.last_status or entry.last_status_at or entry.last_error_code:
+            if entry.last_status or entry.last_status_at or entry.last_error_code or entry.slow_response_at:
                 new_entries.append(
                     replace(
                         entry,
@@ -1022,6 +1151,8 @@ class CredentialPool:
                         last_error_reason=None,
                         last_error_message=None,
                         last_error_reset_at=None,
+                        slow_response_at=None,
+                        slow_response_duration=None,
                     )
                 )
                 count += 1
