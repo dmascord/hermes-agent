@@ -183,53 +183,73 @@ _SWARM_CHEAP_MODEL_HINTS = (
     "xiaomi/mimo-v2-flash",
 )
 
+# Order matters: best quality FIRST, fallbacks last
+# This is the priority order when primary model fails
+# sonnet provides best quality/cost ratio, opus is heavier so use as last resort
 _HERMES_CODE_PREMIUM_MODELS = (
-    "openai/gpt-5.5",
-    "github-copilot/claude-opus-4.7",
-    "minimax/MiniMax-M2.7",
-    "opencode-go/deepseek-v4-pro",
-    "openai/gpt-5.4",
-    "github-copilot/gpt-5.4",
+    # Sonnet family - best quality/cost ratio for coding
     "github-copilot/claude-sonnet-4.6",
-    "minimax/MiniMax-M2.7-highspeed",
-    "xiaomi/mimo-v2.5-pro",
-    "opencode-go/kimi-k2.6",
+    "anthropic/claude-sonnet-4.6",
+    # GPT-5 family - good quality
+    "openai/gpt-5.5",
+    "openai/gpt-5.4",
     "openai/gpt-5.3-codex",
+    "github-copilot/gpt-5.4",
     "github-copilot/gpt-5.3-codex",
-    "xiaomi/mimo-v2-pro",
+    # Opus family - best but heavier/expensive, use as last resort
+    "github-copilot/claude-opus-4.7",
     "github-copilot/claude-opus-4.6",
-    "github-copilot/gemini-3.1-pro-preview",
+    "anthropic/claude-opus-4.7",
+    # GPT-5 family - good quality
+    "openai/gpt-5.5",
+    "openai/gpt-5.4",
+    "openai/gpt-5.3-codex",
+    "github-copilot/gpt-5.4",
+    "github-copilot/gpt-5.3-codex",
+    # xiaomi models - reasonable cost/quality
+    "xiaomi/mimo-v2.5-pro",
+    "xiaomi/mimo-v2-pro",
     "xiaomi/mimo-v2-omni",
+    # minimax
+    "minimax/MiniMax-M2.7-highspeed",
+    "minimax/MiniMax-M2.7",
+    # opencode-go models
+    "opencode-go/deepseek-v4-pro",
+    "opencode-go/kimi-k2.6",
     "opencode-go/minimax-m2.7",
-    "opencode-zen/big-pickle",
     "opencode-go/qwen3.6-plus",
     "opencode-go/glm-5.1",
+    # openai Codex - good for coding
+    # github-copilot enterprise
+    "github-copilot/gemini-3.1-pro-preview",
+    # opencode-zen
     "opencode-zen/big-pickle",
     "opencode-zen/gpt-5-nano",
     "opencode-zen/minimax-m2.5-free",
     "opencode-zen/hy3-preview-free",
+    # arliai
     "arliai/Mistral-Medium-3.5-128B",
     "arliai/Gemma-4-31B-Claude-4.6-Opus-Reasoning-Distilled",
     "arliai/Gemma-4-31B-it",
+    "arliai/GLM-4.7",
+    "arliai/GLM-4.6-Derestricted-v5",
+    # zai
     "zai/glm-4.7",
     "zai/glm-5.1",
-    "xiaomi/mimo-v2.5-pro",
-    "xiaomi/mimo-v2-pro",
-    "xiaomi/mimo-v2-omni",
-    "ollama/minimax-m2.7",
+    # ollama - if available (free)
     "ollama/deepseek-v4-pro",
     "ollama/deepseek-v3.2",
     "ollama/kimi-k2.6:cloud",
     "ollama/qwen3-coder:480b",
     "ollama/glm-5.1",
+    "ollama/minimax-m2.7",
+    # synthetic - last resort
     "synthetic/hf:MiniMaxAI/MiniMax-M2.5",
     "synthetic/hf:Qwen/Qwen3-Coder-480B-A35B-Instruct",
     "synthetic/hf:deepseek-ai/DeepSeek-V3.2",
     "synthetic/hf:moonshotai/Kimi-K2.5",
     "synthetic/hf:zai-org/GLM-5.1",
-    "arliai/GLM-4.7",
-    "arliai/GLM-4.6-Derestricted-v5",
-    "arliai/Mistral-Medium-3.5-128B",
+    # More arliai
     "arliai/Qwen3.5-27B-Anko",
     "arliai/Qwen3.5-27B-BlueStar-v3-Derestricted",
     "arliai/Qwen3.5-27B-Infracelestial",
@@ -1225,12 +1245,17 @@ def _hermes_code_model_is_selectable(model: str) -> bool:
                     pass
             if not entries:
                 return False
-            if model_name not in _copilot_catalog_ids():
-                logger.info(
-                    "[api_server] copilot hermes-code model %s not present in live catalog — skipping",
-                    model_name,
-                )
+            # Extract API key from the first available entry to fetch the catalog
+            first_entry = entries[0]
+            api_key = getattr(first_entry, "runtime_api_key", None) or getattr(first_entry, "access_token", None)
+            if isinstance(first_entry, dict):
+                api_key = first_entry.get("runtime_api_key") or first_entry.get("access_token")
+            catalog_ids = _copilot_catalog_ids(api_key=api_key)
+            if catalog_ids and model_name not in catalog_ids:
+                # Model not in catalog - skip it
                 return False
+            # If catalog is empty but we have credentials, optimistically allow the model
+            # (catalog fetch may fail due to permissions/network, but credentials exist)
             remaining = model_cooldown_remaining("copilot", model_name, base_url=public_base)
             return not (remaining and remaining > 0)
         except Exception:
@@ -1660,6 +1685,17 @@ def _swarm_model_has_credentials(model: str) -> bool:
         except Exception:
             return False
     if prefix == "opencode-go":
+        # Check credential pool for exhaustion status, not just env var
+        try:
+            from agent.credential_pool import load_pool
+            pool = load_pool("opencode-go")
+            if pool.has_available():
+                return True
+            # Pool has no available entries - model is exhausted
+            return False
+        except Exception:
+            pass
+        # Fall back to env var check
         return bool(os.getenv("OPENCODE_GO_API_KEY", "").strip())
     if prefix == "opencode-zen":
         return bool(os.getenv("OPENCODE_ZEN_API_KEY", "").strip())

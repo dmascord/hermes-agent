@@ -995,6 +995,27 @@ class CredentialPool:
             )
             self._mark_exhausted(entry, status_code, error_context)
             self._current_id = None
+
+            # Also mark in cooldown DB so _model_provider_is_available() sees the same state
+            if status_code in (429, 402):
+                try:
+                    from agent.model_cooldown_db import mark_model_cooldown
+                    reset_at = error_context.get("reset_at") if error_context else None
+                    if reset_at:
+                        cooldown_seconds = max(0, reset_at - time.time())
+                    else:
+                        cooldown_seconds = 3600  # Default 1 hour
+                    if cooldown_seconds > 0:
+                        mark_model_cooldown(
+                            provider=self.provider,
+                            model=entry.model or "",
+                            base_url=str(entry.base_url or ""),
+                            cooldown_seconds=cooldown_seconds,
+                            reason=f"exhausted_{status_code}",
+                        )
+                except Exception:
+                    pass  # Don't let cooldown DB errors affect credential rotation
+
             next_entry = self._select_unlocked()
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]
