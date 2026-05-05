@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import random
 import threading
 import time
@@ -14,7 +13,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
-from hermes_cli.config import get_env_value, load_env
+from hermes_cli.config import get_env_value
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -159,6 +158,8 @@ class PooledCredential:
 
     @property
     def runtime_api_key(self) -> str:
+        if self.provider == "openai-codex":
+            return str(self.agent_key or self.access_token or "")
         if self.provider == "nous":
             return str(self.agent_key or self.access_token or "")
         return str(self.access_token or "")
@@ -1147,6 +1148,49 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
     return changed
 
 
+def _dedupe_subscription_oauth_entries(provider: str, entries: List[PooledCredential]) -> bool:
+    """Collapse duplicate OAuth/subscription tokens that are re-seeded from aliases.
+
+    Copilot and Codex credentials are often exposed through multiple source
+    aliases (GITHUB_TOKEN/COPILOT_GITHUB_TOKEN/config pool, or auth-state plus
+    manual Codex pool entries).  Keeping all aliases makes the pool look larger
+    than it is and rotates through the same underlying quota.  Deduplicate by
+    secret value, preferring manual/verified entries.
+    """
+    if provider not in {"copilot", "openai-codex"}:
+        return False
+
+    def _rank(entry: PooledCredential) -> tuple[int, int]:
+        source = str(entry.source or "")
+        label = str(entry.label or "").lower()
+        manual_rank = 0 if _is_manual_source(source) else 1
+        verified_rank = 0 if "verified" in label or "oauth" in label else 1
+        return (manual_rank, verified_rank)
+
+    best_by_token: Dict[str, PooledCredential] = {}
+    token_order: List[str] = []
+    tokenless: List[PooledCredential] = []
+    for entry in entries:
+        token = str(entry.runtime_api_key or entry.access_token or "")
+        if not token:
+            tokenless.append(entry)
+            continue
+        current = best_by_token.get(token)
+        if current is None:
+            best_by_token[token] = entry
+            token_order.append(token)
+        elif _rank(entry) < _rank(current):
+            best_by_token[token] = entry
+
+    retained = [best_by_token[token] for token in token_order]
+    # Tokenless entries cannot service requests; drop them for these runtime
+    # pools instead of letting them count as available credentials.
+    if len(retained) == len(entries) and not tokenless:
+        return False
+    entries[:] = [replace(entry, priority=idx) for idx, entry in enumerate(retained)]
+    return True
+
+
 def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
@@ -1381,16 +1425,6 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
-
-    # Prefer ~/.hermes/.env over os.environ — the user's config file is the
-    # authoritative source for Hermes credentials. Stale env vars from parent
-    # processes (Codex CLI, test scripts, etc.) should not override deliberate
-    # changes to the .env file.
-    def _get_env_prefer_dotenv(key: str) -> str:
-        env_file = load_env()
-        val = env_file.get(key) or os.environ.get(key) or ""
-        return val.strip()
-
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
     # won't be re-seeded from the user's shell environment or ~/.hermes/.env.
@@ -1402,8 +1436,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         def _is_source_suppressed(_p, _s):  # type: ignore[misc]
             return False
     if provider == "openrouter":
-        # Prefer ~/.hermes/.env over os.environ
-        token = _get_env_prefer_dotenv("OPENROUTER_API_KEY")
+        # Check both os.environ and ~/.hermes/.env file
+        token = (get_env_value("OPENROUTER_API_KEY") or "").strip()
         if token:
             source = "env:OPENROUTER_API_KEY"
             if _is_source_suppressed(provider, source):
@@ -1429,7 +1463,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = _get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+        env_url = (get_env_value(pconfig.base_url_env_var) or "").strip().rstrip("/")
 
     env_vars = list(pconfig.api_key_env_vars)
     if provider == "anthropic":
@@ -1440,8 +1474,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         ]
 
     for env_var in env_vars:
-        # Prefer ~/.hermes/.env over os.environ
-        token = _get_env_prefer_dotenv(env_var)
+        # Check both os.environ and ~/.hermes/.env file
+        token = (get_env_value(env_var) or "").strip()
         if not token:
             continue
         source = f"env:{env_var}"
@@ -1575,6 +1609,7 @@ def load_pool(provider: str) -> CredentialPool:
         changed = singleton_changed or env_changed
         changed |= _prune_stale_seeded_entries(entries, singleton_sources | env_sources)
         changed |= _normalize_pool_priorities(provider, entries)
+        changed |= _dedupe_subscription_oauth_entries(provider, entries)
 
     if changed:
         write_credential_pool(
