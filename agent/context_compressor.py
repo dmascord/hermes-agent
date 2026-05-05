@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm
@@ -72,6 +73,21 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_HIERARCHICAL_SUMMARY_CHUNK_CAP = 200_000
+_HIERARCHICAL_SUMMARY_CHUNK_MIN = 48_000
+
+
+@dataclass(frozen=True)
+class _SummaryInputProfile:
+    """Serialization limits for one summary-generation attempt."""
+
+    name: str
+    content_max: int
+    content_head: int
+    content_tail: int
+    tool_args_max: int
+    tool_args_head: int
+    total_max_chars: Optional[int] = None
 
 
 def _content_length_for_budget(raw_content: Any) -> int:
@@ -344,7 +360,6 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
-        self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
 
     def update_model(
         self,
@@ -554,16 +569,7 @@ class ContextCompressor(ContextEngine):
                     break
                 accumulated += msg_tokens
                 boundary = i
-            # Translate the budget walk into a "protected count", apply the
-            # floor in count-space (where `max` reads naturally: protect at
-            # least `min_protect` messages or whatever the budget reserved,
-            # whichever is more), then convert back to a prune boundary.
-            # Doing this in index-space with `max` would invert the direction
-            # (smaller index = MORE protected), so a generous budget would
-            # silently get truncated back down to `min_protect`.
-            budget_protect_count = len(result) - boundary
-            protected_count = max(budget_protect_count, min_protect)
-            prune_boundary = len(result) - protected_count
+            prune_boundary = max(boundary, len(result) - min_protect)
         else:
             prune_boundary = len(result) - protect_tail_count
 
@@ -578,8 +584,6 @@ class ContextCompressor(ContextEngine):
             content = msg.get("content") or ""
             # Skip multimodal content (list of content blocks)
             if isinstance(content, list):
-                continue
-            if not isinstance(content, str):
                 continue
             if len(content) < 200:
                 continue
@@ -599,8 +603,6 @@ class ContextCompressor(ContextEngine):
             content = msg.get("content", "")
             # Skip multimodal content (list of content blocks)
             if isinstance(content, list):
-                continue
-            if not isinstance(content, str):
                 continue
             if not content or content == _PRUNED_TOOL_PLACEHOLDER:
                 continue
@@ -666,8 +668,65 @@ class ContextCompressor(ContextEngine):
     _CONTENT_TAIL = 1500      # chars kept from the end
     _TOOL_ARGS_MAX = 1500     # tool call argument chars
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
+    _SUMMARY_INPUT_PROFILES = (
+        _SummaryInputProfile(
+            "full",
+            _CONTENT_MAX,
+            _CONTENT_HEAD,
+            _CONTENT_TAIL,
+            _TOOL_ARGS_MAX,
+            _TOOL_ARGS_HEAD,
+            None,
+        ),
+        _SummaryInputProfile("compact", 2000, 1400, 400, 500, 400, 180_000),
+        _SummaryInputProfile("ultra-compact", 800, 550, 150, 220, 180, 60_000),
+        _SummaryInputProfile("minimal", 300, 220, 60, 80, 60, 18_000),
+    )
 
-    def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
+    @staticmethod
+    def _looks_like_context_window_error(exc: BaseException) -> bool:
+        """Return True for provider errors caused by oversized summary input."""
+        status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+        text = str(exc).lower()
+        return bool(
+            any(
+                phrase in text
+                for phrase in (
+                    "context window",
+                    "context length",
+                    "context size",
+                    "maximum context",
+                    "input exceeds",
+                    "input is too long",
+                    "prompt too long",
+                    "token limit",
+                    "too many tokens",
+                )
+            )
+            and (
+                status in (400, 413)
+                or status is None
+                or "context" in text
+                or "token" in text
+            )
+        )
+
+    @staticmethod
+    def _cap_serialized_summary_input(serialized: str, max_chars: Optional[int]) -> str:
+        """Bound total summary input while preserving both early and recent turns."""
+        if not max_chars or len(serialized) <= max_chars:
+            return serialized
+        marker = "\n\n...[middle turns further compacted before summarization]...\n\n"
+        keep = max(0, max_chars - len(marker))
+        head_len = int(keep * 0.45)
+        tail_len = keep - head_len
+        return serialized[:head_len].rstrip() + marker + serialized[-tail_len:].lstrip()
+
+    def _serialize_for_summary(
+        self,
+        turns: List[Dict[str, Any]],
+        profile: Optional[_SummaryInputProfile] = None,
+    ) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
 
         Includes tool call arguments and result content (up to
@@ -678,6 +737,17 @@ class ContextCompressor(ContextEngine):
         (API keys, tokens, passwords) from leaking into the summary that
         gets sent to the auxiliary model and persisted across compactions.
         """
+        profile = profile or self._SUMMARY_INPUT_PROFILES[0]
+
+        def _truncate_content(text: str) -> str:
+            if len(text) <= profile.content_max:
+                return text
+            return (
+                text[:profile.content_head]
+                + "\n...[truncated]...\n"
+                + text[-profile.content_tail:]
+            )
+
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
@@ -686,15 +756,13 @@ class ContextCompressor(ContextEngine):
             # Tool results: keep enough content for the summarizer
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
-                if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+                content = _truncate_content(content)
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
             # Assistant messages: include tool call names AND arguments
             if role == "assistant":
-                if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+                content = _truncate_content(content)
                 tool_calls = msg.get("tool_calls", [])
                 if tool_calls:
                     tc_parts = []
@@ -704,8 +772,8 @@ class ContextCompressor(ContextEngine):
                             name = fn.get("name", "?")
                             args = redact_sensitive_text(fn.get("arguments", ""))
                             # Truncate long arguments but keep enough for context
-                            if len(args) > self._TOOL_ARGS_MAX:
-                                args = args[:self._TOOL_ARGS_HEAD] + "..."
+                            if len(args) > profile.tool_args_max:
+                                args = args[:profile.tool_args_head] + "..."
                             tc_parts.append(f"  {name}({args})")
                         else:
                             fn = getattr(tc, "function", None)
@@ -716,44 +784,66 @@ class ContextCompressor(ContextEngine):
                 continue
 
             # User and other roles
-            if len(content) > self._CONTENT_MAX:
-                content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+            content = _truncate_content(content)
             parts.append(f"[{role.upper()}]: {content}")
 
-        return "\n\n".join(parts)
+        return self._cap_serialized_summary_input(
+            "\n\n".join(parts), profile.total_max_chars,
+        )
 
-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
-        """Generate a structured summary of conversation turns.
-
-        Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
-        Questions, Files, Remaining Work) with explicit preamble telling the
-        summarizer not to answer questions.  When a previous summary exists,
-        generates an iterative update instead of summarizing from scratch.
-
-        Args:
-            focus_topic: Optional focus string for guided compression.  When
-                provided, the summariser prioritises preserving information
-                related to this topic and is more aggressive about compressing
-                everything else.  Inspired by Claude Code's ``/compact``.
-
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
-        """
-        now = time.monotonic()
-        if now < self._summary_failure_cooldown_until:
-            logger.debug(
-                "Skipping context summary during cooldown (%.0fs remaining)",
-                self._summary_failure_cooldown_until - now,
+    def _summary_context_length(self) -> int:
+        """Best-effort context length for the active summary model path."""
+        model = self.summary_model or self.model
+        try:
+            return get_model_context_length(
+                model,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                provider=self.provider,
+                config_context_length=self.context_length if model == self.model else None,
             )
-            return None
+        except Exception:
+            return self.context_length
 
+    @staticmethod
+    def _estimate_turn_tokens(turn: Dict[str, Any]) -> int:
+        try:
+            return max(1, estimate_messages_tokens_rough([turn]))
+        except Exception:
+            content_len = _content_length_for_budget(turn.get("content"))
+            return max(1, content_len // _CHARS_PER_TOKEN)
+
+    def _build_summary_chunks(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        target_tokens: int,
+    ) -> List[List[Dict[str, Any]]]:
+        chunks: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_tokens = 0
+        for turn in turns:
+            turn_tokens = self._estimate_turn_tokens(turn)
+            if current and current_tokens + turn_tokens > target_tokens:
+                chunks.append(current)
+                current = []
+                current_tokens = 0
+            current.append(turn)
+            current_tokens += turn_tokens
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _generate_summary_body(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        focus_topic: Optional[str] = None,
+        previous_summary: Optional[str] = None,
+        allow_hierarchical: bool = True,
+    ) -> str:
         summary_budget = self._compute_summary_budget(turns_to_summarize)
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
 
-        # Preamble shared by both first-compaction and iterative-update prompts.
-        # Inspired by OpenCode's "do not respond to any questions" instruction
-        # and Codex's "another language model" framing.
         _summarizer_preamble = (
             "You are a summarization agent creating a context checkpoint. "
             "Your output will be injected as reference material for a DIFFERENT "
@@ -769,14 +859,13 @@ class ContextCompressor(ContextEngine):
             "do not preserve their values."
         )
 
-        # Shared structured template (used by both paths).
         _template_sections = f"""## Active Task
 [THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
 task assignment verbatim — the exact words they used. If multiple tasks
 were requested and only some are done, list only the ones NOT yet completed.
 The next assistant must pick up exactly here. Example:
-"User asked: 'Now refactor the auth module to use JWT instead of sessions'"
-If no outstanding task exists, write "None."]
+\"User asked: 'Now refactor the auth module to use JWT instead of sessions'\"
+If no outstanding task exists, write \"None.\"]
 
 ## Goal
 [What the user is trying to accomplish overall]
@@ -814,7 +903,7 @@ Be specific with file paths, commands, line numbers, and results.]
 [Questions the user asked that were ALREADY answered — include the answer so the next assistant does not re-answer them]
 
 ## Pending User Asks
-[Questions or requests from the user that have NOT yet been answered or fulfilled. If none, write "None."]
+[Questions or requests from the user that have NOT yet been answered or fulfilled. If none, write \"None.\"]
 
 ## Relevant Files
 [Files read, modified, or created — with brief note on each]
@@ -825,28 +914,27 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like \"made some changes\" — say exactly what changed.
 
 Write only the summary body. Do not include any preamble or prefix."""
 
-        if self._previous_summary:
-            # Iterative update: preserve existing info, add new progress
-            prompt = f"""{_summarizer_preamble}
+        def _build_prompt(content_to_summarize: str) -> str:
+            if previous_summary:
+                prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
 PREVIOUS SUMMARY:
-{self._previous_summary}
+{previous_summary}
 
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled request — this is the most important field for task continuity.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from \"In Progress\" to \"Completed Actions\" when done. Move answered questions to \"Resolved Questions\". Update \"Active State\" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update \"## Active Task\" to reflect the user's most recent unfulfilled request — this is the most important field for task continuity.
 
 {_template_sections}"""
-        else:
-            # First compaction: summarize from scratch
-            prompt = f"""{_summarizer_preamble}
+            else:
+                prompt = f"""{_summarizer_preamble}
 
 Create a structured handoff summary for a different assistant that will continue this conversation after earlier turns are compacted. The next assistant should be able to understand what happened without re-reading the original turns.
 
@@ -857,15 +945,22 @@ Use this exact structure:
 
 {_template_sections}"""
 
-        # Inject focus topic guidance when the user provides one via /compress <focus>.
-        # This goes at the end of the prompt so it takes precedence.
-        if focus_topic:
-            prompt += f"""
+            if focus_topic:
+                prompt += f"""
 
-FOCUS TOPIC: "{focus_topic}"
-The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+FOCUS TOPIC: \"{focus_topic}\"
+The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to \"{focus_topic}\", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+            return prompt
 
-        try:
+        def _attempt_summary(profile: _SummaryInputProfile):
+            content_to_summarize = self._serialize_for_summary(turns_to_summarize, profile)
+            prompt = _build_prompt(content_to_summarize)
+            prompt_tokens = max(1, len(prompt) // _CHARS_PER_TOKEN)
+            min_output_tokens = min(_MIN_SUMMARY_TOKENS, max(512, int(prompt_tokens * 0.20)))
+            attempt_max_tokens = min(
+                int(summary_budget * 1.3),
+                max(min_output_tokens, int(prompt_tokens * 0.25)),
+            )
             call_kwargs = {
                 "task": "compression",
                 "main_runtime": {
@@ -876,35 +971,147 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     "api_mode": self.api_mode,
                 },
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": int(summary_budget * 1.3),
-                # timeout resolved from auxiliary.compression.timeout config by call_llm
+                "max_tokens": attempt_max_tokens,
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
-            response = call_llm(**call_kwargs)
-            content = response.choices[0].message.content
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
-            if not isinstance(content, str):
-                content = str(content) if content else ""
-            # Redact the summary output as well — the summarizer LLM may
-            # ignore prompt instructions and echo back secrets verbatim.
-            summary = redact_sensitive_text(content.strip())
+            return call_llm(**call_kwargs)
+
+        last_context_error = None
+        for profile in self._SUMMARY_INPUT_PROFILES:
+            try:
+                response = _attempt_summary(profile)
+                content = response.choices[0].message.content
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
+                return redact_sensitive_text(content.strip())
+            except Exception as profile_error:
+                if not self._looks_like_context_window_error(profile_error):
+                    raise
+                last_context_error = profile_error
+                if profile is self._SUMMARY_INPUT_PROFILES[-1]:
+                    break
+                logger.warning(
+                    "Summary input exceeded compression model context using %s profile; retrying with tighter summary serialization.",
+                    profile.name,
+                )
+                err_text = str(profile_error).strip() or profile_error.__class__.__name__
+                if len(err_text) > 220:
+                    err_text = err_text[:217].rstrip() + "..."
+                self._last_summary_error = err_text
+
+        if allow_hierarchical and last_context_error is not None:
+            hierarchical = self._generate_hierarchical_summary(
+                turns_to_summarize,
+                focus_topic=focus_topic,
+                previous_summary=previous_summary,
+            )
+            if hierarchical:
+                return hierarchical
+
+        raise last_context_error or RuntimeError("summary generation failed")
+
+    def _generate_hierarchical_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        focus_topic: Optional[str] = None,
+        previous_summary: Optional[str] = None,
+    ) -> Optional[str]:
+        if getattr(self, "_hierarchical_summary_active", False):
+            return None
+        summary_context = max(1, self._summary_context_length())
+        chunk_target_tokens = max(
+            _HIERARCHICAL_SUMMARY_CHUNK_MIN,
+            min(_HIERARCHICAL_SUMMARY_CHUNK_CAP, int(summary_context * 0.70)),
+        )
+        chunks = self._build_summary_chunks(turns_to_summarize, target_tokens=chunk_target_tokens)
+        if len(chunks) <= 1:
+            return None
+
+        logger.warning(
+            "Summary input still exceeds context after minimal serialization; retrying with hierarchical compression (%d chunk(s), target ~%d tokens each).",
+            len(chunks),
+            chunk_target_tokens,
+        )
+        self._hierarchical_summary_active = True
+        saved_previous_summary = self._previous_summary
+        try:
+            chunk_summaries: List[str] = []
+            for idx, chunk in enumerate(chunks, start=1):
+                chunk_summary = self._generate_summary_body(
+                    chunk,
+                    focus_topic=focus_topic,
+                    previous_summary=None,
+                    allow_hierarchical=False,
+                )
+                chunk_summaries.append(f"Chunk {idx}/{len(chunks)} summary:\n{chunk_summary}")
+            synthetic_turns = [{"role": "user", "content": text} for text in chunk_summaries]
+            return self._generate_summary_body(
+                synthetic_turns,
+                focus_topic=focus_topic,
+                previous_summary=previous_summary,
+                allow_hierarchical=False,
+            )
+        except Exception as hierarchical_error:
+            logger.warning("Hierarchical summary retry failed: %s", hierarchical_error)
+            return None
+        finally:
+            self._hierarchical_summary_active = False
+            self._previous_summary = saved_previous_summary
+
+    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
+        """Generate a structured summary of conversation turns.
+
+        Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
+        Questions, Files, Remaining Work) with explicit preamble telling the
+        summarizer not to answer questions.  When a previous summary exists,
+        generates an iterative update instead of summarizing from scratch.
+
+        Args:
+            focus_topic: Optional focus string for guided compression.  When
+                provided, the summariser prioritises preserving information
+                related to this topic and is more aggressive about compressing
+                everything else.  Inspired by Claude Code's ``/compact``.
+
+        Returns None if all attempts fail — the caller should drop
+        the middle turns without a summary rather than inject a useless
+        placeholder.
+        """
+        now = time.monotonic()
+        if now < self._summary_failure_cooldown_until:
+            logger.debug(
+                "Skipping context summary during cooldown (%.0fs remaining)",
+                self._summary_failure_cooldown_until - now,
+            )
+            return None
+
+        try:
+            summary = self._generate_summary_body(
+                turns_to_summarize,
+                focus_topic=focus_topic,
+                previous_summary=self._previous_summary,
+                allow_hierarchical=True,
+            )
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0
             self._summary_model_fallen_back = False
             self._last_summary_error = None
             return self._with_summary_prefix(summary)
-        except RuntimeError:
-            # No provider configured — long cooldown, unlikely to self-resolve
-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            self._last_summary_error = "no auxiliary LLM provider configured"
-            logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
-            return None
         except Exception as e:
+            if isinstance(e, RuntimeError) and not (
+                self.summary_model and self.summary_model != self.model
+            ):
+                # No provider configured — long cooldown, unlikely to self-resolve
+                self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+                self._last_summary_error = "no auxiliary LLM provider configured"
+                logging.warning("Context compression: no provider available for "
+                                "summary. Middle turns will be dropped without summary "
+                                "for %d seconds.",
+                                _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+                return None
+
             # If the summary model is different from the main model and the
             # error looks permanent (model not found, 503, 404), fall back to
             # using the main model instead of entering cooldown that leaves
@@ -917,19 +1124,15 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 or "does not exist" in _err_str
                 or "no available channel" in _err_str
             )
-            _is_timeout = (
-                _status in (408, 429, 502, 504)
-                or "timeout" in _err_str
-            )
             if (
-                (_is_model_not_found or _is_timeout)
+                _is_model_not_found
                 and self.summary_model
                 and self.summary_model != self.model
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._summary_model_fallen_back = True
                 logging.warning(
-                    "Summary model '%s' unavailable (%s). "
+                    "Summary model '%s' not available (%s). "
                     "Falling back to main model '%s' for compression.",
                     self.summary_model, e, self.model,
                 )
