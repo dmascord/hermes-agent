@@ -604,7 +604,7 @@ class TestAuxiliaryPoolAwareness:
             client, model = _try_nous()
 
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == "google/gemini-2.5-flash:free"
         assert mock_openai.call_args.kwargs["api_key"] == "pooled-agent-key"
         assert mock_openai.call_args.kwargs["base_url"] == "https://inference.pool.example/v1"
 
@@ -632,14 +632,14 @@ class TestAuxiliaryPoolAwareness:
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value={"access_token": "***"}),
             patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-agent-key", fresh_base)),
-            patch("hermes_cli.models.get_nous_recommended_aux_model", return_value="google/gemini-3-flash-preview") as mock_rec,
+            patch("hermes_cli.models.get_nous_recommended_aux_model", return_value="google/gemini-2.5-flash:free") as mock_rec,
             patch("agent.auxiliary_client.OpenAI"),
         ):
             from agent.auxiliary_client import _try_nous
             client, model = _try_nous(vision=True)
 
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == "google/gemini-2.5-flash:free"
         assert mock_rec.call_args.kwargs["vision"] is True
 
     def test_try_nous_falls_back_when_recommendation_lookup_raises(self):
@@ -655,7 +655,7 @@ class TestAuxiliaryPoolAwareness:
             client, model = _try_nous()
 
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == "google/gemini-2.5-flash:free"
 
     def test_call_llm_retries_nous_after_401(self):
         class _Auth401(Exception):
@@ -877,9 +877,9 @@ class TestCallLlmPaymentFallback:
         primary_client.chat.completions.create.side_effect = server_err
 
         with patch("agent.auxiliary_client._get_cached_client",
-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
+                    return_value=(primary_client, "google/gemini-2.5-flash:free")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)):
+                    return_value=("auto", "google/gemini-2.5-flash:free", None, None, None)):
             with pytest.raises(Exception, match="Internal Server Error"):
                 call_llm(
                     task="compression",
@@ -1681,7 +1681,7 @@ class TestVisionAutoSkipsKimiCoding:
 
         def fake_strict(provider, model=None):
             if provider == "openrouter":
-                return fake_or_client, "google/gemini-3-flash-preview"
+                return fake_or_client, "google/gemini-2.5-flash:free"
             if provider == "nous":
                 return None, None
             raise AssertionError(
@@ -1696,7 +1696,7 @@ class TestVisionAutoSkipsKimiCoding:
         provider, client, model = resolve_vision_provider_client()
         assert provider == "openrouter"
         assert client is fake_or_client
-        assert model == "google/gemini-3-flash-preview"
+        assert model == "google/gemini-2.5-flash:free"
 
     def test_kimi_coding_cn_skipped_too(self, monkeypatch):
         """Same skip applies to the CN variant."""

@@ -46,7 +46,7 @@ class TestMoonshotModelDetection:
             None,
             "anthropic/claude-sonnet-4.6",
             "openai/gpt-5.4",
-            "google/gemini-3-flash-preview",
+            "google/gemini-2.5-flash:free",
             "deepseek-chat",
         ],
     )

@@ -28,6 +28,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _CORS_HEADERS,
+    _align_runtime_with_explicit_model,
     _derive_chat_session_id,
     check_api_server_requirements,
     cors_middleware,
@@ -47,6 +48,30 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+class TestExplicitModelRuntimeAlignment:
+    def test_enterprise_copilot_model_prefers_enterprise_runtime(self):
+        with patch(
+            "gateway.platforms.api_server._runtime_kwargs_for_model_id",
+            return_value=(
+                {
+                    "provider": "copilot",
+                    "base_url": "https://copilot-api.sita.ghe.com",
+                    "api_key": "gho_enterprise",
+                    "api_mode": "responses",
+                },
+                "gpt-5.4",
+            ),
+        ):
+            aligned = _align_runtime_with_explicit_model(
+                {"provider": "copilot", "base_url": "https://api.githubcopilot.com", "api_key": "gho_public"},
+                "github-copilot-enterprise/gpt-5.4",
+            )
+
+        assert aligned["provider"] == "copilot"
+        assert aligned["base_url"] == "https://copilot-api.sita.ghe.com"
+        assert aligned["api_key"] == "gho_enterprise"
 
 
 # ---------------------------------------------------------------------------
