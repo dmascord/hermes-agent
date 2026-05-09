@@ -215,9 +215,12 @@ def _fixed_temperature_for_model(
         return OMIT_TEMPERATURE
     return None
 
-# Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
+# Default auxiliary models for direct API-key providers (cheap/fast for side tasks).
+# Env overrides: HERMES_AUX_<PROVIDER>_MODEL (e.g. HERMES_AUX_GEMINI_MODEL).
+# Providers that were previously free but now charge should be updated here to
+# use the :free suffix or a subscription-backed model.
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
-    "gemini": "gemini-3-flash-preview",
+    "gemini": "google/gemini-2.5-flash:free",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "stepfun": "step-3.5-flash",
@@ -230,10 +233,20 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "ai-gateway": "google/gemini-3-flash",
     "opencode-zen": "gemini-3-flash",
     "opencode-go": "glm-5",
-    "kilocode": "google/gemini-3-flash-preview",
+    "kilocode": "google/gemini-2.5-flash:free",
     "ollama-cloud": "nemotron-3-nano:30b",
     "tencent-tokenhub": "hy3-preview",
 }
+
+
+def _env_override_for_provider(provider_key: str) -> Optional[str]:
+    """Return env-var override for a provider's auxiliary model, if set.
+
+    Checks ``HERMES_AUX_<PROVIDER>_MODEL`` (uppercased, hyphens→underscores).
+    """
+    env_name = f"HERMES_AUX_{provider_key.upper().replace('-', '_')}_MODEL"
+    val = os.getenv(env_name, "").strip()
+    return val or None
 
 # Vision-specific model overrides for direct providers.
 # When the user's main provider has a dedicated vision/multimodal model that
@@ -284,9 +297,12 @@ NOUS_EXTRA_BODY = {"tags": ["product=hermes-agent"]}
 # Set at resolve time — True if the auxiliary client points to Nous Portal
 auxiliary_is_nous: bool = False
 
-# Default auxiliary models per provider
-_OPENROUTER_MODEL = "google/gemini-3-flash-preview"
-_NOUS_MODEL = "google/gemini-3-flash-preview"
+# Default auxiliary models per provider.
+# Env overrides: HERMES_AUX_OPENROUTER_MODEL, HERMES_AUX_NOUS_MODEL.
+# Previously used google/gemini-3-flash-preview but it started charging,
+# so we default to the :free suffix variant via OpenRouter.
+_OPENROUTER_MODEL = os.getenv("HERMES_AUX_OPENROUTER_MODEL", "google/gemini-2.5-flash:free")
+_NOUS_MODEL = os.getenv("HERMES_AUX_NOUS_MODEL", "google/gemini-2.5-flash:free")
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
@@ -1107,10 +1123,10 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             extra = {}
             if base_url_host_matches(base_url, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
-            elif base_url_host_matches(base_url, "api.githubcopilot.com"):
+            elif __import__("hermes_cli.models", fromlist=["is_copilot_api_base_url"]).is_copilot_api_base_url(base_url):
                 from hermes_cli.models import copilot_default_headers
 
-                extra["default_headers"] = copilot_default_headers()
+                extra["default_headers"] = copilot_default_headers(base_url)
             _client = OpenAI(api_key=api_key, base_url=base_url, **extra)
             _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
             return _client, model
@@ -1134,10 +1150,10 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         extra = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
             extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
-        elif base_url_host_matches(base_url, "api.githubcopilot.com"):
+        elif __import__("hermes_cli.models", fromlist=["is_copilot_api_base_url"]).is_copilot_api_base_url(base_url):
             from hermes_cli.models import copilot_default_headers
 
-            extra["default_headers"] = copilot_default_headers()
+            extra["default_headers"] = copilot_default_headers(base_url)
         _client = OpenAI(api_key=api_key, base_url=base_url, **extra)
         _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
         return _client, model
@@ -1953,11 +1969,11 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     sync_base_url = str(sync_client.base_url)
     if base_url_host_matches(sync_base_url, "openrouter.ai"):
         async_kwargs["default_headers"] = dict(_OR_HEADERS)
-    elif base_url_host_matches(sync_base_url, "api.githubcopilot.com"):
+    elif __import__("hermes_cli.models", fromlist=["is_copilot_api_base_url"]).is_copilot_api_base_url(sync_base_url):
         from hermes_cli.copilot_auth import copilot_request_headers
 
         async_kwargs["default_headers"] = copilot_request_headers(
-            is_agent_turn=True, is_vision=is_vision
+            is_agent_turn=True, is_vision=is_vision, base_url=sync_base_url
         )
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
         async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
@@ -2026,6 +2042,48 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+
+    def _pick_copilot_pool_entry(model_name: Optional[str]) -> Optional[Any]:
+        """Return the most suitable Copilot credential-pool entry.
+
+        ``github-copilot-enterprise/...`` models should prefer enterprise-base
+        credentials, while ``github-copilot/...`` models should prefer the
+        public API base. If no exact base-class match exists, fall back to the
+        first credentialed entry.
+        """
+        try:
+            pool = load_pool("copilot")
+        except Exception:
+            return None
+        if not pool or not pool.has_credentials():
+            return None
+        entries = list(pool.entries() or [])
+        if not entries:
+            return None
+
+        raw_model = str(model_name or "").strip().lower()
+
+        def _entry_has_token(entry: Any) -> bool:
+            return bool(
+                str(getattr(entry, "runtime_api_key", "") or getattr(entry, "access_token", "") or "").strip()
+            )
+
+        def _entry_base(entry: Any) -> str:
+            return str(getattr(entry, "runtime_base_url", "") or getattr(entry, "base_url", "") or "").strip().rstrip("/")
+
+        candidates = [entry for entry in entries if _entry_has_token(entry)]
+        if not candidates:
+            return None
+
+        if raw_model.startswith("github-copilot-enterprise/"):
+            for entry in candidates:
+                if "copilot-api." in _entry_base(entry).lower():
+                    return entry
+        elif raw_model.startswith("github-copilot/"):
+            for entry in candidates:
+                if base_url_host_matches(_entry_base(entry), "api.githubcopilot.com"):
+                    return entry
+        return candidates[0]
 
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
         """Decide if a plain OpenAI client should be wrapped for Responses API.
@@ -2347,6 +2405,23 @@ def resolve_provider_client(
             return None, None
 
         raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
+        if provider == "copilot" and str(creds.get("source", "")).startswith("credential_pool:"):
+            pool_entry = _pick_copilot_pool_entry(model)
+            if pool_entry is not None:
+                pool_key = str(
+                    getattr(pool_entry, "runtime_api_key", "")
+                    or getattr(pool_entry, "access_token", "")
+                    or ""
+                ).strip()
+                pool_base = str(
+                    getattr(pool_entry, "runtime_base_url", "")
+                    or getattr(pool_entry, "base_url", "")
+                    or ""
+                ).strip().rstrip("/")
+                if pool_key:
+                    api_key = pool_key
+                if pool_base:
+                    raw_base_url = pool_base
         base_url = _to_openai_base_url(raw_base_url)
         # Honour an explicit base_url override from the caller — used when a
         # fallback_model entry (or custom_providers lookup) routes through a
