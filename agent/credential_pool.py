@@ -68,10 +68,11 @@ SUPPORTED_POOL_STRATEGIES = {
 }
 
 # Cooldown before retrying an exhausted credential.
-# 429 (rate-limited) and 402 (billing/quota) both cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
-EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
-EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+# Provider-supplied Retry-After / x-ratelimit-reset / reset_at values always
+# take precedence (stored in last_error_reset_at and returned by
+# _exhausted_until).  These constants are only the *fallback* when the provider
+# sends no timing hint.  Override via HERMES_RATE_LIMIT_COOLDOWN_SECONDS.
+_EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60     # 1 hour — kept as a safe fallback
 
 # Slow-response penalty defaults.
 # When an API call takes longer than SLOW_RESPONSE_THRESHOLD_SECONDS, the
@@ -209,11 +210,26 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
-def _exhausted_ttl(error_code: Optional[int]) -> int:
-    """Return cooldown seconds based on the HTTP status that caused exhaustion."""
-    if error_code == 429:
-        return EXHAUSTED_TTL_429_SECONDS
-    return EXHAUSTED_TTL_DEFAULT_SECONDS
+def _rate_limit_cooldown_seconds() -> float:
+    """Fallback cooldown for exhausted credentials when the provider sends no timing hint.
+
+    Override via ``HERMES_RATE_LIMIT_COOLDOWN_SECONDS``.  Defaults to 1 hour
+    because most provider quota windows reset on an hourly boundary.
+    """
+    raw = get_env_value("HERMES_RATE_LIMIT_COOLDOWN_SECONDS")
+    if raw and str(raw).strip():
+        try:
+            value = float(str(raw).strip())
+            if value >= 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return float(_EXHAUSTED_TTL_DEFAULT_SECONDS)
+
+
+def _exhausted_ttl(error_code: Optional[int]) -> float:
+    """Return fallback cooldown seconds when the provider supplies no reset hint."""
+    return _rate_limit_cooldown_seconds()
 
 
 def _parse_absolute_timestamp(value: Any) -> Optional[float]:
@@ -494,7 +510,7 @@ class CredentialPool:
         device_code-sourced entries; env/API-key-sourced entries have no
         auth.json shadow to sync from.
         """
-        if self.provider != "openai-codex" or entry.source != "device_code":
+        if self.provider != "openai-codex" or not str(entry.source or "").endswith("device_code"):
             return entry
         try:
             with _auth_store_lock():
@@ -1002,9 +1018,9 @@ class CredentialPool:
                     from agent.model_cooldown_db import mark_model_cooldown
                     reset_at = error_context.get("reset_at") if error_context else None
                     if reset_at:
-                        cooldown_seconds = max(0, reset_at - time.time())
+                        cooldown_seconds = max(0.0, float(reset_at) - time.time())
                     else:
-                        cooldown_seconds = 3600  # Default 1 hour
+                        cooldown_seconds = _rate_limit_cooldown_seconds()
                     if cooldown_seconds > 0:
                         mark_model_cooldown(
                             provider=self.provider,
