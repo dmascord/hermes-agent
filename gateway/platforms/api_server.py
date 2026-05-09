@@ -49,6 +49,20 @@ from gateway.platforms.base import (
 )
 logger = logging.getLogger(__name__)
 
+# Process-level cache for _runtime_kwargs_for_model_id, keyed by provider prefix
+# (e.g. "github-copilot").  Credential resolution for Copilot/OAuth-based
+# providers takes 1-3s per call; the cache eliminates redundant resolves
+# across the 4-6 calls made per request for different swarm-pool models that
+# share the same provider credentials.
+_RUNTIME_KWARGS_CACHE: Dict[str, Dict[str, Any]] = {}
+_RUNTIME_KWARGS_CACHE_AT: Dict[str, float] = {}
+_RUNTIME_KWARGS_CACHE_TTL = 86400.0  # 24 hours — tokens don't rotate mid-session
+
+# Process-level cache for _build_env_fallback_chain, keyed by env prefix.
+# The fallback chain is purely env-var-driven and never changes mid-process,
+# but calling resolve_runtime_provider for each of 20+ fallback models takes ~6.7s.
+_FALLBACK_CHAIN_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
 # Dynamic role aliases exposed by Hermes Gateway. These are virtual models
 # from the client's point of view, but they route through hermes-swarm using
 # role-specific routing hints instead of a fixed backend mapping.
@@ -187,6 +201,8 @@ _SWARM_CHEAP_MODEL_HINTS = (
 # This is the priority order when primary model fails
 # gpt-5.4 has 400K context (2x Sonnet) - best for large codebases
 _HERMES_CODE_PREMIUM_MODELS = (
+    # GHE Copilot GPT-5.4 via /responses + Copilot-Integration-Id
+    "github-copilot-enterprise/gpt-5.4",
     # GPT-5.4 family - 400K context, best for large codebases
     "github-copilot/gpt-5.4",
     "openai/gpt-5.4",
@@ -603,8 +619,32 @@ def _align_runtime_with_explicit_model(runtime_kwargs: Dict[str, Any], model: st
         return runtime_kwargs
 
     current_provider = str(runtime_kwargs.get("provider") or "").strip().lower()
-    if current_provider == explicit_provider and runtime_kwargs.get("api_key"):
+    raw_prefix = str(model or "").split("/", 1)[0].strip().lower() if "/" in str(model or "") else ""
+    if (
+        current_provider == explicit_provider
+        and runtime_kwargs.get("api_key")
+        and raw_prefix != "github-copilot-enterprise"
+    ):
         return runtime_kwargs
+
+    try:
+        explicit_runtime_kwargs, _normalized_model = _runtime_kwargs_for_model_id(model)
+    except Exception:
+        explicit_runtime_kwargs, _normalized_model = {}, str(model or "").strip()
+
+    explicit_runtime_provider = str(explicit_runtime_kwargs.get("provider") or "").strip().lower()
+    if explicit_runtime_provider == explicit_provider:
+        merged = dict(runtime_kwargs)
+        for key in ("api_key", "base_url", "provider", "api_mode", "credential_pool"):
+            value = explicit_runtime_kwargs.get(key)
+            if value is not None and value != "":
+                merged[key] = value
+        logger.info(
+            "[api_server] aligned runtime provider to %s for explicit model %s via model-id runtime resolution",
+            explicit_provider,
+            model,
+        )
+        return merged
 
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -950,6 +990,16 @@ def _fallback_provider_for_model(model_id: str) -> tuple[str, str]:
 
 
 def _build_env_fallback_chain(prefix: str) -> List[Dict[str, Any]]:
+    """Build fallback provider chain from HERMES_*_FALLBACK_{N} env vars.
+
+    Result is cached by prefix since env vars don't change at runtime.
+    Without caching, the ~6.7s spent in resolve_runtime_provider() per call
+    (20+ fallback models × ~0.3s each) would repeat on every request.
+    """
+    if prefix in _FALLBACK_CHAIN_CACHE:
+        logger.debug("[timing] _build_env_fallback_chain: CACHED for prefix=%s", prefix)
+        return _FALLBACK_CHAIN_CACHE[prefix]
+
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     chain: List[Dict[str, Any]] = []
@@ -964,9 +1014,6 @@ def _build_env_fallback_chain(prefix: str) -> List[Dict[str, Any]]:
             runtime = resolve_runtime_provider(requested=provider)
         except Exception:
             runtime = {}
-        # Use provider from runtime if available, otherwise fall back to requested_provider or raw provider.
-        # runtime["provider"] is the resolved canonical name (e.g., "copilot").
-        # runtime["requested_provider"] may be an alias (e.g., "github-copilot") which is not a valid provider key.
         resolved_provider = runtime.get("provider") or ""
         normalized_provider = str(resolved_provider or runtime.get("requested_provider") or provider).strip()
         chain.append({
@@ -975,6 +1022,8 @@ def _build_env_fallback_chain(prefix: str) -> List[Dict[str, Any]]:
             "base_url": str(runtime.get("base_url") or "").strip(),
             "api_key": str(runtime.get("api_key") or "").strip(),
         })
+    _FALLBACK_CHAIN_CACHE[prefix] = chain
+    logger.debug("[timing] _build_env_fallback_chain: built %d entries for prefix=%s", len(chain), prefix)
     return chain
 
 
@@ -1058,24 +1107,27 @@ def _build_hermes_code_model_pool() -> List[str]:
         fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
         if fb:
             candidates.append(fb)
+
+    # Configured models define the real preference order for hermes-code.
+    # The built-in premium list is a default/backfill list, not a hard allowlist.
+    # Append defaults only to fill gaps when config does not mention them.
     candidates.extend(_HERMES_CODE_PREMIUM_MODELS)
 
     seen: set[str] = set()
-    premium_only: List[str] = []
+    ordered: List[str] = []
     for model in candidates:
         model = str(model or "").strip()
         if not model or model in seen:
             continue
         seen.add(model)
-        if model in _HERMES_CODE_PREMIUM_MODELS and _is_subscription_model(model):
-            premium_only.append(model)
-        else:
+        if "\n" in model or "HERMES_CODE_" in model:
             logger.warning(
-                "[api_server] ignoring non-subscription/non-premium HERMES_CODE model candidate: %s (billing=%s)",
+                "[api_server] ignoring malformed HERMES_CODE model candidate: %s",
                 model,
-                _provider_billing_mode(_model_provider_prefix(model)),
             )
-    return premium_only
+            continue
+        ordered.append(model)
+    return ordered
 
 
 def _selectable_hermes_code_model_name(model: str) -> str:
@@ -1255,6 +1307,52 @@ def _hermes_code_model_is_selectable(model: str) -> bool:
             # If catalog is empty but we have credentials, optimistically allow the model
             # (catalog fetch may fail due to permissions/network, but credentials exist)
             remaining = model_cooldown_remaining("copilot", model_name, base_url=public_base)
+            return not (remaining and remaining > 0)
+        except Exception:
+            return False
+
+    if prefix == "github-copilot-enterprise":
+        try:
+            from agent.credential_pool import load_pool
+            from agent.model_cooldown_db import model_cooldown_remaining
+            from hermes_cli.models import _copilot_catalog_ids
+
+            pool = load_pool("copilot")
+            enterprise_base = os.getenv("GITHUB_COPILOT_ENTERPRISE_BASE_URL", "").rstrip("/")
+            if not enterprise_base:
+                for entry in pool.entries():
+                    candidate = str(getattr(entry, "base_url", "") or "").rstrip("/")
+                    if "copilot-api." in candidate.lower():
+                        enterprise_base = candidate
+                        break
+            if not enterprise_base:
+                return False
+            entries = [
+                entry for entry in pool.entries()
+                if str(getattr(entry, "base_url", "") or "").rstrip("/") == enterprise_base
+                and (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", ""))
+            ]
+            if not entries:
+                try:
+                    from hermes_cli.auth import read_credential_pool
+
+                    entries = [
+                        entry for entry in read_credential_pool("copilot")
+                        if str(entry.get("base_url") or "").rstrip("/") == enterprise_base
+                        and (entry.get("access_token") or entry.get("runtime_api_key"))
+                    ]
+                except Exception:
+                    pass
+            if not entries:
+                return False
+            first_entry = entries[0]
+            api_key = getattr(first_entry, "runtime_api_key", None) or getattr(first_entry, "access_token", None)
+            if isinstance(first_entry, dict):
+                api_key = first_entry.get("runtime_api_key") or first_entry.get("access_token")
+            catalog_ids = _copilot_catalog_ids(api_key=api_key, base_url=enterprise_base)
+            if catalog_ids and model_name not in catalog_ids:
+                return False
+            remaining = model_cooldown_remaining("copilot", model_name, base_url=enterprise_base)
             return not (remaining and remaining > 0)
         except Exception:
             return False
@@ -1678,8 +1776,15 @@ def _swarm_model_has_credentials(model: str) -> bool:
         try:
             from agent.credential_pool import load_pool
 
-            base_url = os.getenv("GITHUB_COPILOT_ENTERPRISE_BASE_URL", "https://copilot-api.sita.ghe.com").rstrip("/")
-            return any(str(getattr(entry, "base_url", "") or "").rstrip("/") == base_url for entry in load_pool("copilot").entries())
+            base_url = os.getenv("GITHUB_COPILOT_ENTERPRISE_BASE_URL", "").rstrip("/")
+            entries = load_pool("copilot").entries()
+            if not base_url:
+                for entry in entries:
+                    candidate = str(getattr(entry, "base_url", "") or "").rstrip("/")
+                    if "copilot-api." in candidate.lower():
+                        base_url = candidate
+                        break
+            return bool(base_url) and any(str(getattr(entry, "base_url", "") or "").rstrip("/") == base_url for entry in entries)
         except Exception:
             return False
     if prefix == "opencode-go":
@@ -1712,13 +1817,21 @@ def _swarm_model_has_credentials(model: str) -> bool:
             or os.getenv("ARCEEAI_API_KEY", "").strip()
         )
     if prefix == "google":
-        # Direct Google API key takes priority; otherwise we fall back to OpenRouter
+        # Direct Google API key takes priority; otherwise we fall back to OpenRouter.
+        # In containerized deployments keys may live in Hermes auth.json via pool
+        # seeding from ~/.hermes/.env rather than process env, so consult the pool too.
         if (
             os.getenv("GOOGLE_API_KEY", "").strip()
             or os.getenv("GEMINI_API_KEY", "").strip()
             or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY", "").strip()
         ):
             return True
+        try:
+            from agent.credential_pool import load_pool
+            if load_pool("gemini").has_available():
+                return True
+        except Exception:
+            pass
         # No direct key — will route via OpenRouter, so check for that key
         return bool(os.getenv("OPENROUTER_API_KEY", "").strip())
     if prefix == "nvidia":
@@ -1759,12 +1872,26 @@ def _swarm_model_has_credentials(model: str) -> bool:
 
 
 def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
+    _t_rk = time.time()
     runtime_kwargs: Dict[str, Any] = {}
     provider_prefix = ""
     normalized_model = str(model or "").strip()
 
     if "/" in normalized_model:
         provider_prefix = normalized_model.split("/", 1)[0].strip().lower()
+        # Process-level cache: same provider → same credentials
+        if provider_prefix in _RUNTIME_KWARGS_CACHE and provider_prefix not in (
+            "opencode-zen", "opencode-go", "openai",
+        ):
+            cached_at = _RUNTIME_KWARGS_CACHE_AT.get(provider_prefix, 0)
+            if time.time() - cached_at < _RUNTIME_KWARGS_CACHE_TTL:
+                cached = _RUNTIME_KWARGS_CACHE[provider_prefix]
+                result_model = normalized_model.split("/", 1)[1].strip()
+                logging.getLogger(__name__).info(
+                    "[timing] _runtime_kwargs_for_model_id: CACHED (%.3fs) for model=%s",
+                    time.time() - _t_rk, model,
+                )
+                return dict(cached), result_model
         if provider_prefix == "opencode-zen":
             runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
             runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
@@ -1865,20 +1992,33 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                 except Exception:
                     pass
         elif provider_prefix == "github-copilot-enterprise":
-            runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_ENTERPRISE_BASE_URL", "https://copilot-api.sita.ghe.com").rstrip("/")
+            runtime_kwargs["base_url"] = os.getenv("GITHUB_COPILOT_ENTERPRISE_BASE_URL", "").rstrip("/")
             runtime_kwargs["api_key"] = ""
             try:
                 from agent.credential_pool import load_pool
+                from hermes_cli.models import copilot_model_api_mode
 
-                for entry in load_pool("copilot").entries():
+                pool_entries = load_pool("copilot").entries()
+                if not runtime_kwargs["base_url"]:
+                    for entry in pool_entries:
+                        candidate = str(getattr(entry, "base_url", "") or "").rstrip("/")
+                        if "copilot-api." in candidate.lower():
+                            runtime_kwargs["base_url"] = candidate
+                            break
+                for entry in pool_entries:
                     base = str(getattr(entry, "base_url", "") or "").rstrip("/")
                     if base == runtime_kwargs["base_url"]:
                         runtime_kwargs["api_key"] = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "") or ""
                         break
+                runtime_kwargs["api_mode"] = copilot_model_api_mode(
+                    normalized_model,
+                    api_key=runtime_kwargs.get("api_key") or None,
+                    base_url=runtime_kwargs["base_url"] or None,
+                )
             except Exception as exc:
                 logging.warning(f"[API_SERVER] failed to resolve enterprise Copilot token: {exc}")
             runtime_kwargs["provider"] = "copilot"
-            runtime_kwargs["api_mode"] = "chat_completions"
+            runtime_kwargs.setdefault("api_mode", "chat_completions")
         elif provider_prefix == "minimax":
             runtime_kwargs["base_url"] = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
             runtime_kwargs["api_key"] = os.getenv("MINIMAX_API_KEY", "")
@@ -1910,6 +2050,20 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                 runtime_kwargs["api_key"] = _google_key
                 runtime_kwargs["provider"] = "google"
             else:
+                try:
+                    from agent.credential_pool import load_pool
+
+                    _gemini_pool = load_pool("gemini")
+                    _gemini_entry = _gemini_pool.peek()
+                    _gemini_key = getattr(_gemini_entry, "runtime_api_key", None) or getattr(_gemini_entry, "access_token", "") or ""
+                    if _gemini_key:
+                        runtime_kwargs["base_url"] = getattr(_gemini_entry, "runtime_base_url", None) or getattr(_gemini_entry, "base_url", "") or os.getenv("GOOGLE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+                        runtime_kwargs["api_key"] = _gemini_key
+                        runtime_kwargs["provider"] = "google"
+                        runtime_kwargs["credential_pool"] = _gemini_pool
+                except Exception:
+                    pass
+            if runtime_kwargs.get("provider") != "google":
                 # No Google API key — enforce strict guard when forcing free OpenRouter
                 if os.getenv("HERMES_SWARM_FORCE_FREE_OPENROUTER", "").strip().lower() in ("1", "true", "yes"):
                     runtime_kwargs["base_url"] = ""
@@ -1918,7 +2072,7 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                 else:
                     # Route to OpenRouter conservatively (requires :free if guard active)
                     runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-                    runtime_kwargs["api_key"] = ""
+                    runtime_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "").strip()
                     runtime_kwargs["provider"] = "openrouter"
         elif provider_prefix == "nvidia":
             _nvidia_key = (
@@ -1971,8 +2125,21 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
         if detected_provider:
             runtime_kwargs["provider"] = detected_provider
 
+    # Cache the resolved credentials keyed by provider prefix so subsequent
+    # calls for other models under the same provider (e.g. github-copilot/gpt-5.4
+    # after github-copilot/gpt-5-mini) skip the expensive resolution.
+    if provider_prefix and runtime_kwargs.get("api_key") and provider_prefix not in (
+        "opencode-zen", "opencode-go", "openai",
+    ):
+        _RUNTIME_KWARGS_CACHE[provider_prefix] = dict(runtime_kwargs)
+        _RUNTIME_KWARGS_CACHE_AT[provider_prefix] = time.time()
+
     if "/" in normalized_model:
         normalized_model = normalized_model.split("/", 1)[1].strip()
+    logging.getLogger(__name__).info(
+        "[timing] _runtime_kwargs_for_model_id: %.3fs for model=%s",
+        time.time() - _t_rk, model,
+    )
     return runtime_kwargs, normalized_model
 
 
@@ -1986,10 +2153,16 @@ def _swarm_model_is_available(model: str) -> bool:
     if not raw:
         return False
 
-    # Block google/nvidia without keys early
-    if raw.startswith("google/") or raw.startswith("nvidia/"):
-        if not (os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY", "").strip() or os.getenv("NVIDIA_API_KEY", "").strip() or os.getenv("NVCLOUD_API_KEY", "").strip()):
-            logger.info("[api_server] blocking google/nvidia model %s due to missing provider keys", raw)
+    # Block google/nvidia without keys early.  Consult pool-backed credentials too,
+    # because containerized deployments may seed these providers from ~/.hermes/.env
+    # into auth.json rather than exporting process-level env vars.
+    if raw.startswith("google/"):
+        if not _swarm_model_has_credentials(raw):
+            logger.info("[api_server] blocking google model %s due to missing provider keys", raw)
+            return False
+    if raw.startswith("nvidia/"):
+        if not (os.getenv("NVIDIA_API_KEY", "").strip() or os.getenv("NVCLOUD_API_KEY", "").strip()):
+            logger.info("[api_server] blocking nvidia model %s due to missing provider keys", raw)
             return False
 
     if not _swarm_model_has_credentials(raw):
@@ -2795,6 +2968,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 # If the import or detection fails, just continue with existing runtime_kwargs
                 logging.debug("[API_SERVER] provider alignment/detection helper failed; continuing")
 
+            if provider_mode:
+                _resolved_provider = str(runtime_kwargs.get("provider") or "").strip() or "unknown"
+                _resolved_base_url = str(runtime_kwargs.get("base_url") or "").strip() or "unknown"
+                logger.info(
+                    "[api_server] final hermes-code resolution: requested=%s resolved_provider=%s resolved_model=%s base_url=%s",
+                    code_model or model,
+                    _resolved_provider,
+                    model,
+                    _resolved_base_url,
+                )
+
+        _t_cfg = time.time()
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         skip_memory = False
@@ -2829,19 +3014,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 [t for t in enabled_toolsets if t in ("web", "skills")]
             )
         # "full", "auto" or anything else uses all configured toolsets
+        _t_cfg_done = time.time()
+        logger.info("[timing] _create_agent config+tools: %.3fs", _t_cfg_done - _t_cfg)
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         from gateway.run import GatewayRunner
+        _t_fb = time.time()
         fallback_model = GatewayRunner._load_fallback_model()
         if not fallback_model:
             if provider_mode:
                 fallback_model = _build_env_fallback_chain("HERMES_AGENT_FALLBACK")
             elif swarm_mode:
                 fallback_model = _build_env_fallback_chain("HERMES_SWARM_FALLBACK")
+        _t_fb_done = time.time()
+        logger.info("[timing] _create_agent fallback+env: %.3fs", _t_fb_done - _t_fb)
 
+        _t_aiagent = time.time()
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -2865,6 +3056,8 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_choice=tool_choice,
             external_tool_mode=external_tool_mode,
         )
+        _t_aiagent_done = time.time()
+        logger.info("[timing] _create_agent AIAgent.__init__: %.3fs", _t_aiagent_done - _t_aiagent)
         try:
             agent._provider_mode = provider_mode
             agent._tools_from_request = bool(tools)
@@ -3037,6 +3230,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        _t0 = time.time()
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -3389,6 +3583,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         created = int(time.time())
+        logger.info("[timing] _handle_chat_completions pre-stream parse+swarm: %.3fs", time.time() - _t0)
 
         if stream:
             import queue as _q
@@ -3586,7 +3781,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
         else:
             try:
+                _timing_compute = time.time()
                 result, usage = await _compute_completion()
+                logger.info("[timing] _compute_completion total: %.3fs (wall since request start: %.3fs)",
+                    time.time() - _timing_compute, time.time() - _t0)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -3594,6 +3792,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
+        logger.info("[timing] _handle_chat_completions agent returned, elapsed: %.3fs", time.time() - _t0)
         final_response = result.get("final_response", "")
         if result.get("tool_calls_pending"):
             last_assistant = None
@@ -5076,6 +5275,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
+            _t_create = time.time()
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
@@ -5093,13 +5293,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_choice=tool_choice,
                 external_tool_mode=external_tool_mode,
             )
+            _t_created = time.time()
+            logger.info("[timing] _create_agent: %.3fs", _t_created - _t_create)
             if agent_ref is not None:
                 agent_ref[0] = agent
+            _t_conv = time.time()
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 task_id="default",
             )
+            _t_done = time.time()
+            logger.info("[timing] run_conversation: %.3fs (agent_create: %.3fs, total _run: %.3fs)",
+                _t_done - _t_conv, _t_created - _t_create, _t_done - _t_create)
             if (
                 swarm_mode
                 and swarm_model_pool
@@ -5790,6 +5996,28 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._runner.setup()
             self._site = web.TCPSite(self._runner, self._host, self._port)
             await self._site.start()
+
+            # Eager warm-up: pre-resolve credentials for slow OAuth-based
+            # providers (Copilot) in a background thread so the process-level
+            # cache is populated before the first user request.  This saves
+            # ~11s on the first request by avoiding 4-6 redundant ~2-3s
+            # credential resolution calls.  Only one model per provider is
+            # needed — the cache is keyed on provider prefix, so resolving
+            # github-copilot/gpt-5-mini populates the cache for all
+            # github-copilot/* models in the swarm pool.
+            # Also pre-builds the fallback chain cache to avoid the ~6.7s
+            # fallback+env bottleneck on every request.
+            loop = asyncio.get_running_loop()
+            def _warmup():
+                try:
+                    _runtime_kwargs_for_model_id("github-copilot/gpt-5-mini")
+                except Exception:
+                    pass
+                try:
+                    _build_env_fallback_chain("HERMES_SWARM_FALLBACK")
+                except Exception:
+                    pass
+            loop.run_in_executor(None, _warmup)
 
             self._mark_connected()
             if not self._api_key:
