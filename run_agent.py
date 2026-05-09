@@ -1502,10 +1502,10 @@ class AIAgent:
                     }
                 elif base_url_host_matches(effective_base, "api.routermint.com"):
                     client_kwargs["default_headers"] = _routermint_headers()
-                elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
+                elif __import__("hermes_cli.models", fromlist=["is_copilot_api_base_url"]).is_copilot_api_base_url(effective_base):
                     from hermes_cli.models import copilot_default_headers
 
-                    client_kwargs["default_headers"] = copilot_default_headers()
+                    client_kwargs["default_headers"] = copilot_default_headers(effective_base)
                 elif base_url_host_matches(effective_base, "api.kimi.com"):
                     client_kwargs["default_headers"] = {
                         "User-Agent": "claude-code/0.1.0",
@@ -5887,7 +5887,7 @@ class AIAgent:
     def _copilot_headers_for_request(self, *, is_vision: bool) -> dict:
         from hermes_cli.copilot_auth import copilot_request_headers
 
-        return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
+        return copilot_request_headers(is_agent_turn=True, is_vision=is_vision, base_url=self.base_url)
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
@@ -5897,8 +5897,10 @@ class AIAgent:
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
+        from hermes_cli.models import is_copilot_api_base_url
+
         if (
-            base_url_host_matches(str(request_kwargs.get("base_url", "")), "api.githubcopilot.com")
+            is_copilot_api_base_url(str(request_kwargs.get("base_url", "")))
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
@@ -6269,10 +6271,10 @@ class AIAgent:
             self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
-        elif base_url_host_matches(base_url, "api.githubcopilot.com"):
+        elif __import__("hermes_cli.models", fromlist=["is_copilot_api_base_url"]).is_copilot_api_base_url(base_url):
             from hermes_cli.models import copilot_default_headers
 
-            self._client_kwargs["default_headers"] = copilot_default_headers()
+            self._client_kwargs["default_headers"] = copilot_default_headers(base_url)
         elif base_url_host_matches(base_url, "api.kimi.com"):
             self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
@@ -8428,6 +8430,7 @@ class AIAgent:
             is_github_responses = (
                 base_url_host_matches(self.base_url, "models.github.ai")
                 or base_url_host_matches(self.base_url, "api.githubcopilot.com")
+                or "copilot-api." in str(self.base_url or "").lower()
             )
             is_codex_backend = (
                 self.provider == "openai-codex"
@@ -8462,6 +8465,7 @@ class AIAgent:
         _is_gh = (
             base_url_host_matches(self._base_url_lower, "models.github.ai")
             or base_url_host_matches(self._base_url_lower, "api.githubcopilot.com")
+            or "copilot-api." in self._base_url_lower
         )
         _is_nous = "nousresearch" in self._base_url_lower
         _is_nvidia = "integrate.api.nvidia.com" in self._base_url_lower
@@ -8576,6 +8580,7 @@ class AIAgent:
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")
             or base_url_host_matches(self._base_url_lower, "api.githubcopilot.com")
+            or "copilot-api." in self._base_url_lower
         ):
             try:
                 from hermes_cli.models import github_model_reasoning_efforts
@@ -12469,24 +12474,54 @@ class AIAgent:
                     # When a fallback model is configured, switch immediately instead
                     # of burning through retries with exponential backoff -- the
                     # primary provider won't recover within the retry window.
+                    #
+                    # Exception: if a multi-credential pool has another credential
+                    # to rotate to (e.g. multiple openai-codex OAuth tokens), let
+                    # the pool rotation path handle recovery -- don't record a
+                    # cooldown for the model or skip retries, as those would
+                    # short-circuit the pool before it gets a chance to rotate.
                     is_rate_limited = classified.reason in (
                         FailoverReason.rate_limit,
                         FailoverReason.billing,
                     )
-                    if is_rate_limited and self._fallback_index < len(self._fallback_chain):
-                        # Don't eagerly fallback if credential pool rotation may
-                        # still recover.  See _pool_may_recover_from_rate_limit
-                        # for the single-credential-pool exception.  Fixes #11314.
-                        pool_may_recover = _pool_may_recover_from_rate_limit(
-                            self._credential_pool
-                        )
-                        if not pool_may_recover:
-                            self._emit_status("⚠️ Rate limited — switching to fallback provider...")
-                            if self._try_activate_fallback(reason=classified.reason):
-                                retry_count = 0
-                                compression_attempts = 0
-                                primary_recovery_attempted = False
-                                continue
+                    pool_may_recover = _pool_may_recover_from_rate_limit(
+                        self._credential_pool
+                    ) if is_rate_limited else False
+
+                    if is_rate_limited and not pool_may_recover:
+                        # Record the rate limit in the cooldown DB immediately so
+                        # all sessions (cron, gateway, auxiliary) know not to pile
+                        # on.  error_context was already populated by
+                        # _extract_api_error_context() which reads Retry-After,
+                        # x-ratelimit-reset, body reset_at, and message regexes —
+                        # all in one place.  Use its reset_at (absolute epoch) to
+                        # compute cooldown_seconds; fall back to the env-configured
+                        # default (HERMES_SLOW_MODEL_COOLDOWN_SECONDS) when absent.
+                        try:
+                            from agent.model_cooldown_db import mark_model_cooldown
+                            _rl_reset_at = error_context.get("reset_at") if error_context else None
+                            _rl_cooldown = (
+                                max(0.0, float(_rl_reset_at) - time.time())
+                                if _rl_reset_at is not None
+                                else None  # None → mark_model_cooldown uses env default
+                            )
+                            mark_model_cooldown(
+                                provider=_provider,
+                                model=_model,
+                                base_url=_base,
+                                reason="rate_limited",
+                                cooldown_seconds=_rl_cooldown,
+                            )
+                        except Exception:
+                            pass
+
+                    if is_rate_limited and not pool_may_recover and self._fallback_index < len(self._fallback_chain):
+                        self._emit_status("⚠️ Rate limited — switching to fallback provider...")
+                        if self._try_activate_fallback(reason=classified.reason):
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
 
                     # ── Nous Portal: record rate limit & skip retries ─────
                     # When Nous returns a 429 that is a genuine account-
@@ -12947,22 +12982,19 @@ class AIAgent:
                             "error": _final_summary,
                         }
 
-                    # For rate limits, respect the Retry-After header if present
-                    _retry_after = None
-                    if is_rate_limited:
-                        _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                        if _resp_headers and hasattr(_resp_headers, "get"):
-                            _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                            if _ra_raw:
-                                try:
-                                    _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
-                                except (TypeError, ValueError):
-                                    pass
-                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
-                    if is_rate_limited:
-                        self._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
-                    else:
-                        self._emit_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
+                    # For rate limits with no pool recovery, skip the retry wait
+                    # and exhaust the retry budget immediately -- the model/provider
+                    # is already recorded in the cooldown DB above, so retrying it
+                    # here would just burn time.  When a pool can recover (multi-
+                    # credential rotation), leave retries intact so the pool gets
+                    # its rotation attempt.
+                    if is_rate_limited and not pool_may_recover:
+                        retry_count = max_retries
+                        self._emit_status(f"⚠️ Rate limited — skipping retries, trying next fallback...")
+                        continue
+
+                    wait_time = jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    self._emit_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                     logger.warning(
                         "Retrying API call in %ss (attempt %s/%s) %s error=%s",
                         wait_time,
