@@ -98,7 +98,13 @@ class CompressionConfig:
     protect_last_n_turns: int = 4
     
     # Summarization (OpenRouter)
-    summarization_model: str = "google/gemini-3-flash-preview"
+    # Env override: HERMES_AUX_SUMMARIZATION_MODEL
+    summarization_model: str = field(
+        default_factory=lambda: os.getenv(
+            "HERMES_AUX_SUMMARIZATION_MODEL",
+            "google/gemini-2.5-flash:free",
+        )
+    )
     base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = "OPENROUTER_API_KEY"
     temperature: float = 0.3
