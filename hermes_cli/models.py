@@ -24,6 +24,7 @@ _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
+COPILOT_ENTERPRISE_BASE_URL = os.getenv("GITHUB_COPILOT_ENTERPRISE_BASE_URL", "").rstrip("/")
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
@@ -457,17 +458,38 @@ _PROVIDER_MODELS["ai-gateway"] = [mid for mid, _ in VERCEL_AI_GATEWAY_MODELS]
 # The Nous Portal models endpoint is the source of truth for which models
 # are currently offered (free or paid). We trust whatever it returns and
 # surface it to users as-is — no local allowlist filtering.
+#
+# Some models are historically/operationally treated as free even when the
+# current pricing payload is temporarily missing. Keep those expectations here,
+# but always let live non-zero pricing override the local expectation.
+EXPECTED_FREE_MODELS: set[str] = {
+    "google/gemini-2.5-flash:free",
+}
+
+
+def _pricing_entry_is_free(pricing_entry: dict[str, str]) -> bool:
+    """Return True when a pricing entry has zero-cost prompt AND completion fields."""
+    try:
+        return (
+            float(pricing_entry.get("prompt", "1")) == 0
+            and float(pricing_entry.get("completion", "1")) == 0
+        )
+    except (TypeError, ValueError):
+        return False
+
 
 
 def _is_model_free(model_id: str, pricing: dict[str, dict[str, str]]) -> bool:
-    """Return True if *model_id* has zero-cost prompt AND completion pricing."""
+    """Return True for models that are currently free for Nous free-tier users.
+
+    Live zero-cost pricing is authoritative. For models we historically expect
+    to be free, missing pricing falls back to that expectation, but any non-zero
+    pricing immediately demotes the model out of the free tier.
+    """
     p = pricing.get(model_id)
-    if not p:
-        return False
-    try:
-        return float(p.get("prompt", "1")) == 0 and float(p.get("completion", "1")) == 0
-    except (TypeError, ValueError):
-        return False
+    if p:
+        return _pricing_entry_is_free(p)
+    return model_id in EXPECTED_FREE_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -2111,7 +2133,7 @@ def _payload_items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def copilot_default_headers() -> dict[str, str]:
+def copilot_default_headers(base_url: Optional[str] = None) -> dict[str, str]:
     """Standard headers for Copilot API requests.
 
     Includes Openai-Intent and x-initiator headers that opencode and the
@@ -2119,7 +2141,7 @@ def copilot_default_headers() -> dict[str, str]:
     """
     try:
         from hermes_cli.copilot_auth import copilot_request_headers
-        return copilot_request_headers(is_agent_turn=True)
+        return copilot_request_headers(is_agent_turn=True, base_url=base_url)
     except ImportError:
         return {
             "Editor-Version": COPILOT_EDITOR_VERSION,
@@ -2159,19 +2181,21 @@ def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
 
 
 def fetch_github_model_catalog(
-    api_key: Optional[str] = None, timeout: float = 5.0
+    api_key: Optional[str] = None,
+    timeout: float = 5.0,
+    base_url: Optional[str] = None,
 ) -> Optional[list[dict[str, Any]]]:
     """Fetch the live GitHub Copilot model catalog for this account."""
     attempts: list[dict[str, str]] = []
     if api_key:
         attempts.append({
-            **copilot_default_headers(),
+            **copilot_default_headers(base_url=base_url),
             "Authorization": f"Bearer {api_key}",
         })
-    attempts.append(copilot_default_headers())
+    attempts.append(copilot_default_headers(base_url=base_url))
 
     for headers in attempts:
-        req = urllib.request.Request(COPILOT_MODELS_URL, headers=headers)
+        req = urllib.request.Request(_copilot_models_url(base_url), headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
@@ -2244,6 +2268,22 @@ def _is_github_models_base_url(base_url: Optional[str]) -> bool:
         normalized.startswith(COPILOT_BASE_URL)
         or normalized.startswith("https://models.github.ai/inference")
     )
+
+
+def is_copilot_api_base_url(base_url: Optional[str]) -> bool:
+    normalized = (base_url or "").strip().rstrip("/").lower()
+    enterprise_base = (COPILOT_ENTERPRISE_BASE_URL or "").strip().rstrip("/").lower()
+    return (
+        normalized.startswith(COPILOT_BASE_URL)
+        or normalized.startswith("https://models.github.ai/inference")
+        or (bool(enterprise_base) and normalized.startswith(enterprise_base))
+        or "copilot-api." in normalized
+    )
+
+
+def _copilot_models_url(base_url: Optional[str] = None) -> str:
+    root = (base_url or COPILOT_BASE_URL).strip().rstrip("/")
+    return f"{root}/models"
 
 
 def _lmstudio_server_root(base_url: Optional[str]) -> Optional[str]:
@@ -2517,9 +2557,10 @@ _COPILOT_MODEL_ALIASES = {
 def _copilot_catalog_ids(
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> set[str]:
     if catalog is None and api_key:
-        catalog = fetch_github_model_catalog(api_key=api_key)
+        catalog = fetch_github_model_catalog(api_key=api_key, base_url=base_url)
     if not catalog:
         return set()
     return {
@@ -2534,12 +2575,13 @@ def normalize_copilot_model_id(
     *,
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> str:
     raw = str(model_id or "").strip()
     if not raw:
         return ""
 
-    catalog_ids = _copilot_catalog_ids(catalog=catalog, api_key=api_key)
+    catalog_ids = _copilot_catalog_ids(catalog=catalog, api_key=api_key, base_url=base_url)
     alias = _COPILOT_MODEL_ALIASES.get(raw)
     if alias:
         return alias
@@ -2602,6 +2644,7 @@ def copilot_model_api_mode(
     *,
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> str:
     """Determine the API mode for a Copilot model.
 
@@ -2612,9 +2655,9 @@ def copilot_model_api_mode(
     # Fetch the catalog once so normalize + endpoint check share it
     # (avoids two redundant network calls for non-GPT-5 models).
     if catalog is None and api_key:
-        catalog = fetch_github_model_catalog(api_key=api_key)
+        catalog = fetch_github_model_catalog(api_key=api_key, base_url=base_url)
 
-    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
+    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key, base_url=base_url)
     if not normalized:
         return "chat_completions"
 
