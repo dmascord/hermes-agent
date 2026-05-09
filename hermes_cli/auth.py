@@ -28,6 +28,7 @@ import hashlib
 import subprocess
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 from contextlib import contextmanager
@@ -398,6 +399,22 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("OLLAMA_API_KEY",),
         base_url_env_var="OLLAMA_BASE_URL",
     ),
+    "synthetic": ProviderConfig(
+        id="synthetic",
+        name="Synthetic",
+        auth_type="api_key",
+        inference_base_url="https://api.synthetic.new/openai/v1",
+        api_key_env_vars=("SYNTHETIC_API_KEY",),
+        base_url_env_var="SYNTHETIC_BASE_URL",
+    ),
+    "arliai": ProviderConfig(
+        id="arliai",
+        name="ArliAI",
+        auth_type="api_key",
+        inference_base_url="https://api.arliai.com/v1",
+        api_key_env_vars=("ARLIAI_API_KEY", "ARLI_API_KEY", "ARCEEAI_API_KEY"),
+        base_url_env_var="ARLIAI_BASE_URL",
+    ),
     "bedrock": ProviderConfig(
         id="bedrock",
         name="AWS Bedrock",
@@ -505,7 +522,10 @@ def _resolve_api_key_provider_secret(
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
-        # Use the dedicated copilot auth module for proper token validation
+        # Copilot uses OAuth bearer tokens. Prefer the dedicated resolver
+        # (env/gh integration) but fall back to the persisted credential pool
+        # so gateway/docker runtimes can use restored auth.json tokens without
+        # requiring COPILOT_GITHUB_TOKEN in the environment.
         try:
             from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
             token, source = resolve_copilot_token()
@@ -513,6 +533,19 @@ def _resolve_api_key_provider_secret(
                 return get_copilot_api_token(token), source
         except ValueError as exc:
             logger.warning("Copilot token validation failed: %s", exc)
+        except Exception:
+            pass
+        try:
+            from agent.credential_pool import load_pool
+
+            pool = load_pool("copilot")
+            if pool and pool.has_credentials():
+                entry = pool.peek()
+                if entry:
+                    key = getattr(entry, "runtime_api_key", "") or getattr(entry, "access_token", "")
+                    key = str(key).strip()
+                    if has_usable_secret(key):
+                        return key, "credential_pool:copilot"
         except Exception:
             pass
         return "", ""
@@ -850,9 +883,83 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
+def _merge_preserved_auth_sections(current: Dict[str, Any], existing: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(current)
+    current_pool = merged.get("credential_pool")
+    existing_pool = existing.get("credential_pool")
+    if isinstance(current_pool, dict) and isinstance(existing_pool, dict):
+        preserved_pool = dict(current_pool)
+        for provider_id, entries in existing_pool.items():
+            if provider_id in preserved_pool or not isinstance(entries, list):
+                continue
+            if any(
+                isinstance(entry, dict)
+                and str(entry.get("source") or "").strip().lower().startswith("manual:")
+                for entry in entries
+            ):
+                preserved_pool[provider_id] = entries
+        merged["credential_pool"] = preserved_pool
+    current_providers = merged.get("providers")
+    existing_providers = existing.get("providers")
+    if isinstance(current_providers, dict) and isinstance(existing_providers, dict):
+        preserved_providers = dict(current_providers)
+        preserved_pool = merged.get("credential_pool") if isinstance(merged.get("credential_pool"), dict) else {}
+        for provider_id, state in existing_providers.items():
+            if provider_id in preserved_providers:
+                continue
+            pool_entries = preserved_pool.get(provider_id)
+            if isinstance(pool_entries, list) and any(
+                isinstance(entry, dict)
+                and str(entry.get("source") or "").strip().lower().startswith("manual:")
+                for entry in pool_entries
+            ):
+                preserved_providers[provider_id] = state
+        merged["providers"] = preserved_providers
+    return merged
+
+
+def _trace_auth_store_write(existing: Dict[str, Any], new_store: Dict[str, Any]) -> None:
+    try:
+        interesting = ("copilot", "openai-codex")
+        before_pool = existing.get("credential_pool") if isinstance(existing.get("credential_pool"), dict) else {}
+        after_pool = new_store.get("credential_pool") if isinstance(new_store.get("credential_pool"), dict) else {}
+        before_providers = existing.get("providers") if isinstance(existing.get("providers"), dict) else {}
+        after_providers = new_store.get("providers") if isinstance(new_store.get("providers"), dict) else {}
+        summary = []
+        for provider_id in interesting:
+            before_pool_n = len(before_pool.get(provider_id) or []) if isinstance(before_pool.get(provider_id), list) else 0
+            after_pool_n = len(after_pool.get(provider_id) or []) if isinstance(after_pool.get(provider_id), list) else 0
+            before_provider = provider_id in before_providers
+            after_provider = provider_id in after_providers
+            summary.append(
+                f"{provider_id}: pool {before_pool_n}->{after_pool_n}, provider {int(before_provider)}->{int(after_provider)}"
+            )
+        trace_path = _auth_file_path().with_name("auth-save-trace.log")
+        with trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[{datetime.now(timezone.utc).isoformat()} pid={os.getpid()}]\n")
+            handle.write("; ".join(summary) + "\n")
+            handle.write("".join(traceback.format_stack(limit=18)))
+            handle.write("\n")
+    except Exception:
+        pass
+
+
+def _save_auth_store(auth_store: Dict[str, Any], *, preserve_missing_manual: bool = True) -> Path:
     auth_file = _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
+    existing: Dict[str, Any] = {}
+    if preserve_missing_manual and auth_file.exists():
+        try:
+            existing = _load_auth_store(auth_file)
+            auth_store = _merge_preserved_auth_sections(auth_store, existing)
+        except Exception:
+            pass
+    elif auth_file.exists():
+        try:
+            existing = _load_auth_store(auth_file)
+        except Exception:
+            existing = {}
+    _trace_auth_store_write(existing, auth_store)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
@@ -1097,7 +1204,7 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
 
         if not cleared:
             return False
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, preserve_missing_manual=False)
     return True
 
 
@@ -2194,6 +2301,26 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
         auth_store = _load_auth_store()
     state = _load_provider_state(auth_store, "openai-codex")
     if not state:
+        pool = auth_store.get("credential_pool") if isinstance(auth_store.get("credential_pool"), dict) else {}
+        pool_entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+        if isinstance(pool_entries, list):
+            fallback_entry = next(
+                (
+                    entry for entry in pool_entries
+                    if isinstance(entry, dict)
+                    and str(entry.get("access_token") or "").strip()
+                    and str(entry.get("refresh_token") or "").strip()
+                ),
+                None,
+            )
+            if fallback_entry:
+                return {
+                    "tokens": {
+                        "access_token": str(fallback_entry.get("access_token") or "").strip(),
+                        "refresh_token": str(fallback_entry.get("refresh_token") or "").strip(),
+                    },
+                    "last_refresh": fallback_entry.get("last_refresh"),
+                }
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
             provider="openai-codex",

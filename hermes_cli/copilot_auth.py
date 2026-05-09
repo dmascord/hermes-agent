@@ -374,15 +374,21 @@ def copilot_request_headers(
     *,
     is_agent_turn: bool = True,
     is_vision: bool = False,
+    base_url: str | None = None,
 ) -> dict[str, str]:
     """Build the standard headers for Copilot API requests.
 
     Replicates the header set used by opencode and the Copilot CLI.
     """
+    normalized_base = str(base_url or "").strip().rstrip("/").lower()
+    default_integration_id = "vscode-chat"
+    if "copilot-api." in normalized_base or normalized_base.startswith("https://api.sita.ghe.com"):
+        default_integration_id = "copilot-developer-cli"
+
     headers: dict[str, str] = {
         "Editor-Version": "vscode/1.104.1",
         "User-Agent": "HermesAgent/1.0",
-        "Copilot-Integration-Id": "vscode-chat",
+        "Copilot-Integration-Id": os.getenv("GITHUB_COPILOT_INTEGRATION_ID", default_integration_id),
         "Openai-Intent": "conversation-edits",
         "x-initiator": "agent" if is_agent_turn else "user",
     }
