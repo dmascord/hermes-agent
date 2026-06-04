@@ -6022,10 +6022,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                     mark_model_cooldown(
                                         provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
                                         model=provider_model,
-                                        cooldown_seconds=300.0,
+                                        cooldown_seconds=3600.0,
                                         reason="hermes_code_stream_401",
                                     )
-                                    logger.warning("[hermes-code] stream %s cooled down for 300s after 401", provider_model)
+                                    logger.warning("[hermes-code] stream %s cooled down for 3600s after 401 — token invalid, won't retry soon", provider_model)
                                 except Exception:
                                     pass
                             logger.warning("[hermes-code] passthrough stream copilot %s failed: %s", provider_model, exc)
@@ -6481,10 +6481,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                     mark_model_cooldown(
                                         provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
                                         model=provider_model,
-                                        cooldown_seconds=300.0,
+                                        cooldown_seconds=3600.0,
                                         reason="hermes_code_stream_401",
                                     )
-                                    logger.warning("[hermes-code] stream %s cooled down for 300s after 401", provider_model)
+                                    logger.warning("[hermes-code] stream %s cooled down for 3600s after 401 — token invalid, won't retry soon", provider_model)
                                 except Exception:
                                     pass
                             # For pool-backed credentials (openai-codex), rotate to the next
