@@ -1412,6 +1412,8 @@ def resolve_runtime_provider(
                                             _json.dump(_bk_data, _f, indent=2)
                         except Exception:
                             pass  # Non-critical
+                    except Exception:
+                        pass  # Non-critical
             except Exception:
                 pass  # Fall through with existing pool_api_key; pool will mark entry exhausted on error
 
