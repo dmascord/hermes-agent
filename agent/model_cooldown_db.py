@@ -1,9 +1,21 @@
-"""Persistent model cooldown hooks for gateway routing.
+"""Persistent model cooldown hooks for gateway routing (SQLite backend).
 
 The gateway asks :func:`model_cooldown_remaining` before selecting a swarm
 model.  Slow or stale provider calls can use :func:`record_model_latency` and
 :func:`mark_model_cooldown` to temporarily "sin-bin" a provider/model/base URL
 combination so future routing skips it for a short period.
+
+Storage
+-------
+Backed by a SQLite database at ``<HERMES_HOME>/model_cooldowns.db`` (WAL mode)
+with two tables:
+
+* **cooldowns** — provider/model/base_url/credential scoped cooldown entries.
+* **circuit_breakers** — rolling failure counters per (provider, model, base_url).
+
+On first use the module automatically migrates any existing data from the
+legacy ``model_cooldowns.json`` file, then renames it to
+``model_cooldowns.json.migrated``.
 """
 
 from __future__ import annotations
@@ -12,18 +24,18 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
-from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3  # bumped from 2 for SQLite migration
 _MAX_RECORDS = 512
 _DEFAULT_SLOW_THRESHOLD_SECONDS = 75.0
 _DEFAULT_COOLDOWN_SECONDS = 600.0
@@ -31,10 +43,186 @@ _DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 3
 _DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 300.0
 _DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS = 300.0
 
+# ---------------------------------------------------------------------------
+# Connection management
+# ---------------------------------------------------------------------------
+
+_connection: sqlite3.Connection | None = None
+_connection_lock = threading.Lock()
+
 
 def _db_path() -> Path:
+    return get_hermes_home() / "model_cooldowns.db"
+
+
+def _legacy_json_path() -> Path:
     return get_hermes_home() / "model_cooldowns.json"
 
+
+def _get_conn() -> sqlite3.Connection:
+    """Return the singleton WAL-mode SQLite connection (creating it on first call)."""
+    global _connection
+    if _connection is not None:
+        return _connection
+    with _connection_lock:
+        if _connection is not None:
+            return _connection
+        path = _db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")       # balance safety/speed
+        conn.execute("PRAGMA busy_timeout=5000")         # wait up to 5s on lock
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")   # reclaim space
+        conn.row_factory = sqlite3.Row
+        _init_schema(conn)
+        _migrate_from_json(conn)
+        _connection = conn
+        return conn
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS cooldowns (
+            key             TEXT PRIMARY KEY,
+            provider        TEXT NOT NULL,
+            model           TEXT NOT NULL,
+            base_url        TEXT NOT NULL DEFAULT '',
+            credential_id   TEXT,
+            cooldown_until  REAL NOT NULL,
+            reason          TEXT NOT NULL DEFAULT 'slow_response',
+            latency_seconds REAL,
+            updated_at      REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cooldowns_provider_model
+            ON cooldowns(provider, model, base_url);
+
+        CREATE TABLE IF NOT EXISTS circuit_breakers (
+            key                 TEXT PRIMARY KEY,
+            provider            TEXT NOT NULL,
+            model               TEXT NOT NULL,
+            base_url            TEXT NOT NULL DEFAULT '',
+            failures            TEXT NOT NULL DEFAULT '[]',
+            last_failure_reason TEXT,
+            updated_at          REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cb_provider_model
+            ON circuit_breakers(provider, model, base_url);
+    """)
+    conn.commit()
+
+
+def _migrate_from_json(conn: sqlite3.Connection) -> None:
+    """One-time migration from legacy ``model_cooldowns.json`` to SQLite."""
+    json_path = _legacy_json_path()
+    if not json_path.exists():
+        return
+
+    # Check the metadata table to see if migration already happened.
+    already = conn.execute(
+        "SELECT 1 FROM cooldowns LIMIT 1"
+    ).fetchone()
+    if already:
+        # Rows exist — assume migration was done (or DB was seeded manually).
+        # Still rename the JSON file so we don't re-read it next startup.
+        try:
+            json_path.rename(json_path.with_suffix(".json.migrated"))
+        except OSError:
+            pass
+        return
+
+    try:
+        raw = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("[cooldown] legacy JSON migration: cannot read %s: %s", json_path, exc)
+        return
+
+    records = raw.get("records") if isinstance(raw, dict) else None
+    if not isinstance(records, dict) or not records:
+        # Empty or missing — just rename and move on.
+        try:
+            json_path.rename(json_path.with_suffix(".json.migrated"))
+        except OSError:
+            pass
+        return
+
+    # Separate normal cooldowns from circuit-breaker entries.
+    cd_rows: list[tuple[str, str, str, str, str | None, float, str, float | None, float]] = []
+    cb_rows: list[tuple[str, str, str, str, str, str, float]] = []
+    now = time.time()
+    migrated_cd = 0
+    migrated_cb = 0
+
+    for rec_key, rec in records.items():
+        if not isinstance(rec, dict):
+            continue
+        if rec_key.startswith("cb::"):
+            # Circuit breaker entry
+            failures = rec.get("failures", [])
+            if isinstance(failures, list):
+                failures = [ts for ts in failures if isinstance(ts, (int, float))]
+            cb_rows.append((
+                rec_key,
+                str(rec.get("provider", "")),
+                str(rec.get("model", "")),
+                str(rec.get("base_url", "")),
+                json.dumps(failures),
+                str(rec.get("last_failure_reason", "")),
+                float(rec.get("updated_at", now)),
+            ))
+            migrated_cb += 1
+        else:
+            # Cooldown entry
+            cooldown_until = float(rec.get("cooldown_until") or 0)
+            if cooldown_until <= now:
+                continue  # skip already-expired
+            cd_rows.append((
+                rec_key,
+                str(rec.get("provider", "")),
+                str(rec.get("model", "")),
+                str(rec.get("base_url", "")),
+                rec.get("credential_id"),           # None is fine for TEXT? use None
+                cooldown_until,
+                str(rec.get("reason", "slow_response")),
+                rec.get("latency_seconds"),         # may be None
+                float(rec.get("updated_at", now)),
+            ))
+            migrated_cd += 1
+
+    if cd_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO cooldowns "
+            "(key, provider, model, base_url, credential_id, cooldown_until, "
+            " reason, latency_seconds, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            cd_rows,
+        )
+    if cb_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO circuit_breakers "
+            "(key, provider, model, base_url, failures, last_failure_reason, updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            cb_rows,
+        )
+    conn.commit()
+
+    # Rename legacy file to prevent re-migration.
+    try:
+        json_path.rename(json_path.with_suffix(".json.migrated"))
+    except OSError:
+        pass
+
+    if migrated_cd or migrated_cb:
+        logger.info(
+            "[cooldown] migrated %d cooldowns + %d circuit breakers from %s to SQLite",
+            migrated_cd, migrated_cb, json_path.name,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -87,72 +275,25 @@ def _key(provider: str, model: str, base_url: str = "", credential_id: str = "")
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def _empty_db() -> dict[str, Any]:
-    return {"version": _SCHEMA_VERSION, "records": {}}
+def _gc_cooldowns(conn: sqlite3.Connection, now: float) -> None:
+    """Remove expired cooldowns and the oldest records when over _MAX_RECORDS."""
+    conn.execute("DELETE FROM cooldowns WHERE cooldown_until <= ?", (now,))
+    # Keep only the _MAX_RECORDS most-recently-updated cooldowns.
+    excess = conn.execute(
+        "SELECT COUNT(*) FROM cooldowns"
+    ).fetchone()[0] - _MAX_RECORDS
+    if excess > 0:
+        conn.execute(
+            "DELETE FROM cooldowns WHERE key IN ("
+            "  SELECT key FROM cooldowns ORDER BY updated_at ASC LIMIT ?"
+            ")",
+            (excess,),
+        )
 
 
-def _repair_path_permissions(path: Path) -> bool:
-    """Best-effort repair for cooldown files created by another container user."""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            path.parent.chmod(0o700)
-        except OSError:
-            pass
-        if path.exists():
-            try:
-                path.chmod(0o600)
-            except OSError:
-                return False
-        return True
-    except OSError:
-        return False
-
-
-def _load_db_unlocked() -> dict[str, Any]:
-    path = _db_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return _empty_db()
-    except PermissionError as exc:
-        if _repair_path_permissions(path):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as retry_exc:
-                logger.warning("Failed to read model cooldown DB %s after permission repair: %s", path, retry_exc)
-                return _empty_db()
-        else:
-            logger.warning("Failed to read model cooldown DB %s: %s", path, exc)
-            return _empty_db()
-    except Exception as exc:
-        logger.warning("Failed to read model cooldown DB %s: %s", path, exc)
-        return _empty_db()
-    if not isinstance(data, dict):
-        return _empty_db()
-    records = data.get("records")
-    if not isinstance(records, dict):
-        data["records"] = {}
-    data["version"] = _SCHEMA_VERSION
-    return data
-
-
-def _save_db_unlocked(data: dict[str, Any]) -> None:
-    records = data.setdefault("records", {})
-    if isinstance(records, dict) and len(records) > _MAX_RECORDS:
-        ordered = sorted(
-            records.items(),
-            key=lambda item: float((item[1] or {}).get("updated_at") or 0),
-            reverse=True,
-        )[:_MAX_RECORDS]
-        data["records"] = dict(ordered)
-    path = _db_path()
-    atomic_json_write(path, data, indent=2, sort_keys=True)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-
+# ---------------------------------------------------------------------------
+# Public API — cooldowns
+# ---------------------------------------------------------------------------
 
 def mark_model_cooldown(
     provider: str,
@@ -180,20 +321,29 @@ def mark_model_cooldown(
         return 0.0
     now = time.time()
     rec_key = _key(provider_n, model_n, base_url, credential_id)
+
     with _LOCK:
-        data = _load_db_unlocked()
-        records = data.setdefault("records", {})
-        records[rec_key] = {
-            "provider": provider_n,
-            "model": model_n,
-            "base_url": _normalize(base_url),
-            "credential_id": _normalize(credential_id) or None,
-            "cooldown_until": now + cooldown,
-            "reason": str(reason or "slow_response"),
-            "latency_seconds": float(latency_seconds) if latency_seconds is not None else None,
-            "updated_at": now,
-        }
-        _save_db_unlocked(data)
+        conn = _get_conn()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO cooldowns
+                   (key, provider, model, base_url, credential_id,
+                    cooldown_until, reason, latency_seconds, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    rec_key, provider_n, model_n, _normalize(base_url),
+                    _normalize(credential_id) or None,
+                    now + cooldown,
+                    str(reason or "slow_response"),
+                    float(latency_seconds) if latency_seconds is not None else None,
+                    now,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     logger.info(
         "Model cooldown set provider=%s model=%s base_url=%s credential_id=%s reason=%s latency=%s cooldown=%.0fs",
         provider_n,
@@ -253,24 +403,21 @@ def model_cooldown_remaining(provider: str, model: str, *, base_url: str = "", c
         return 0.0
     now = time.time()
     rec_key = _key(provider_n, model_n, base_url, credential_id)
-    changed = False
+
     with _LOCK:
-        data = _load_db_unlocked()
-        records = data.setdefault("records", {})
-        rec = records.get(rec_key)
-        if not isinstance(rec, dict):
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT cooldown_until FROM cooldowns WHERE key = ?",
+            (rec_key,),
+        ).fetchone()
+        if row is None:
             return 0.0
-        until = float(rec.get("cooldown_until") or 0)
-        remaining = until - now
+        remaining = row["cooldown_until"] - now
         if remaining <= 0:
-            records.pop(rec_key, None)
-            changed = True
-        if changed:
-            try:
-                _save_db_unlocked(data)
-            except Exception:
-                pass
-        return max(0.0, remaining)
+            conn.execute("DELETE FROM cooldowns WHERE key = ?", (rec_key,))
+            conn.commit()
+            return 0.0
+        return remaining
 
 
 def model_cooldown_remaining_for_pool(
@@ -296,59 +443,63 @@ def model_cooldown_remaining_for_pool(
     if not provider_n or not model_n:
         return 0.0
     now = time.time()
+
     with _LOCK:
-        data = _load_db_unlocked()
-        records = data.setdefault("records", {})
+        conn = _get_conn()
+        # ── Pool-level (global) cooldown ──────────────────────────────
+        pool_row = conn.execute(
+            "SELECT cooldown_until FROM cooldowns"
+            " WHERE provider = ? AND model = ? AND base_url = ?"
+            "   AND (credential_id IS NULL OR credential_id = '')",
+            (provider_n, model_n, _normalize(base_url)),
+        ).fetchone()
+        pool_remaining = 0.0
+        if pool_row is not None:
+            pool_remaining = max(0.0, pool_row["cooldown_until"] - now)
 
-        # ── Compute the key prefix for this provider+model+base_url ──
-        # Walk all records and group by credential_id.
-        prefix_raw = "\x1f".join((provider_n, _normalize(model), _normalize(base_url)))
-        prefix = hashlib.sha256(prefix_raw.encode("utf-8")).hexdigest()[:24]
-
-        # Collect cooldowns: pool-level + per-credential
-        pool_remaining: float = 0.0
+        # ── Per-credential cooldowns ──────────────────────────────────
+        rows = conn.execute(
+            "SELECT credential_id, cooldown_until FROM cooldowns"
+            " WHERE provider = ? AND model = ? AND base_url = ?"
+            "   AND credential_id IS NOT NULL AND credential_id != ''",
+            (provider_n, model_n, _normalize(base_url)),
+        ).fetchall()
         cred_remaining: dict[str, float] = {}
         creds_seen: set[str] = set()
-
-        for rec_key, rec in list(records.items()):
-            if not rec_key.startswith(prefix):
+        seen_stale = False
+        for row in rows:
+            cred_id = _normalize(row["credential_id"] or "")
+            if not cred_id:
                 continue
-            if not isinstance(rec, dict):
-                continue
-            rec_cred = _normalize(rec.get("credential_id") or "")
-            until = float(rec.get("cooldown_until") or 0)
-            remaining = max(0.0, until - now)
-
+            remaining = max(0.0, row["cooldown_until"] - now)
             if remaining <= 0:
-                # Clean up expired entries
-                records.pop(rec_key, None)
+                seen_stale = True
                 continue
+            cred_remaining[cred_id] = remaining
+            creds_seen.add(cred_id)
 
-            if not rec_cred:
-                # Pool-level cooldown — applies to all credentials
-                pool_remaining = remaining if not pool_remaining else min(pool_remaining, remaining)
-            else:
-                cred_remaining[rec_cred] = remaining
-                creds_seen.add(rec_cred)
+        # GC stale entries if any were found.
+        if seen_stale:
+            conn.execute(
+                "DELETE FROM cooldowns WHERE provider = ? AND model = ? AND base_url = ?"
+                "  AND credential_id IS NOT NULL AND credential_id != ''"
+                "  AND cooldown_until <= ?",
+                (provider_n, model_n, _normalize(base_url), now),
+            )
+            conn.commit()
 
-        # Clean up if we modified records
-        try:
-            _save_db_unlocked(data)
-        except Exception:
-            pass
-
-    # If a pool-level cooldown exists, the entire pool is blocked regardless
+    # If a pool-level cooldown exists, the entire pool is blocked regardless.
     if pool_remaining > 0:
         return pool_remaining
 
-    # If we know all credential IDs, check if any are missing from cooldown
+    # If we know all credential IDs, check if any are missing from cooldown.
     if credential_ids:
         cred_ids_set = set(_normalize(c or "") for c in credential_ids if c)
         not_in_cooldown = cred_ids_set - creds_seen
         if not_in_cooldown:
-            return 0.0  # At least one credential has no cooldown
+            return 0.0  # At least one credential has no cooldown.
 
-        # All known credentials are in cooldown — return shortest remaining
+        # All known credentials are in cooldown — return shortest remaining.
         if cred_remaining:
             return min(cred_remaining.values())
         return 0.0
@@ -364,8 +515,15 @@ def model_cooldown_remaining_for_pool(
 def clear_model_cooldowns() -> None:
     """Clear all cooldowns. Intended for tests/admin repair."""
     with _LOCK:
-        _save_db_unlocked(_empty_db())
+        conn = _get_conn()
+        conn.execute("DELETE FROM cooldowns")
+        conn.execute("DELETE FROM circuit_breakers")
+        conn.commit()
 
+
+# ---------------------------------------------------------------------------
+# Public API — circuit breakers
+# ---------------------------------------------------------------------------
 
 _CIRCUIT_BREAKER_KEY_PREFIX = "cb::"
 
@@ -390,41 +548,70 @@ def mark_provider_failure(
     threshold = circuit_breaker_threshold()
     cooldown_seconds = circuit_breaker_cooldown_seconds()
     cutoff = now - circuit_breaker_window_seconds()
+    cooldown_applied = False
 
     with _LOCK:
-        data = _load_db_unlocked()
-        records = data.setdefault("records", {})
-        rec = records.get(cbk)
-        if not isinstance(rec, dict):
-            rec = {"failures": [], "updated_at": now}
-            records[cbk] = rec
-        failures = rec.get("failures", [])
-        if not isinstance(failures, list):
-            failures = []
-        failures = [ts for ts in failures if isinstance(ts, (int, float)) and ts > cutoff]
-        failures.append(now)
-        rec["failures"] = failures
-        rec["updated_at"] = now
-        rec["last_failure_reason"] = str(reason or "request_failed")
+        conn = _get_conn()
+        try:
+            # Load existing failures.
+            row = conn.execute(
+                "SELECT failures FROM circuit_breakers WHERE key = ?", (cbk,)
+            ).fetchone()
+            failures: list[float] = []
+            if row is not None:
+                try:
+                    failures = json.loads(row["failures"])
+                except (json.JSONDecodeError, TypeError):
+                    failures = []
+                if not isinstance(failures, list):
+                    failures = []
 
-        count = len(failures)
-        cooldown_applied = False
-        if count >= threshold and cooldown_seconds > 0:
-            cooldown_key = _key(provider_n, model_n, base_url, credential_id="")
-            records[cooldown_key] = {
-                "provider": provider_n,
-                "model": model_n,
-                "base_url": _normalize(base_url),
-                "credential_id": None,
-                "cooldown_until": now + cooldown_seconds,
-                "reason": f"circuit_breaker:{reason}:{count}_failures",
-                "latency_seconds": None,
-                "updated_at": now,
-            }
-            rec["failures"] = []
-            cooldown_applied = True
+            # Prune outside window and append.
+            failures = [ts for ts in failures if isinstance(ts, (int, float)) and ts > cutoff]
+            failures.append(now)
+            count = len(failures)
 
-        _save_db_unlocked(data)
+            # UPSERT circuit breaker row.
+            conn.execute(
+                """INSERT OR REPLACE INTO circuit_breakers
+                   (key, provider, model, base_url, failures, last_failure_reason, updated_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    cbk, provider_n, model_n, _normalize(base_url),
+                    json.dumps(failures),
+                    str(reason or "request_failed"),
+                    now,
+                ),
+            )
+
+            # Circuit breaker trip.
+            if count >= threshold and cooldown_seconds > 0:
+                cooldown_key = _key(provider_n, model_n, base_url, credential_id="")
+                conn.execute(
+                    """INSERT OR REPLACE INTO cooldowns
+                       (key, provider, model, base_url, credential_id,
+                        cooldown_until, reason, latency_seconds, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        cooldown_key, provider_n, model_n, _normalize(base_url),
+                        None,
+                        now + cooldown_seconds,
+                        f"circuit_breaker:{reason}:{count}_failures",
+                        None,
+                        now,
+                    ),
+                )
+                # Reset failures after trip.
+                conn.execute(
+                    "UPDATE circuit_breakers SET failures = '[]', updated_at = ? WHERE key = ?",
+                    (now, cbk),
+                )
+                cooldown_applied = True
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     if cooldown_applied:
         logger.warning(
@@ -448,15 +635,22 @@ def mark_provider_success(
     cbk = _cb_key(provider_n, model_n, base_url)
 
     with _LOCK:
-        data = _load_db_unlocked()
-        records = data.setdefault("records", {})
-        rec = records.get(cbk)
-        if isinstance(rec, dict):
-            failures = rec.get("failures", [])
-            if isinstance(failures, list) and failures:
-                rec["failures"] = []
-                rec["updated_at"] = now
-                _save_db_unlocked(data)
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT failures FROM circuit_breakers WHERE key = ?", (cbk,)
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            failures = json.loads(row["failures"])
+        except (json.JSONDecodeError, TypeError):
+            failures = []
+        if isinstance(failures, list) and failures:
+            conn.execute(
+                "UPDATE circuit_breakers SET failures = '[]', updated_at = ? WHERE key = ?",
+                (now, cbk),
+            )
+            conn.commit()
 
 
 def provider_failure_count(
@@ -474,11 +668,16 @@ def provider_failure_count(
     cbk = _cb_key(provider_n, model_n, base_url)
 
     with _LOCK:
-        data = _load_db_unlocked()
-        rec = data.setdefault("records", {}).get(cbk)
-        if not isinstance(rec, dict):
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT failures FROM circuit_breakers WHERE key = ?", (cbk,)
+        ).fetchone()
+        if row is None:
             return 0
-        failures = rec.get("failures", [])
+        try:
+            failures = json.loads(row["failures"])
+        except (json.JSONDecodeError, TypeError):
+            return 0
         if not isinstance(failures, list):
             return 0
         return len([ts for ts in failures if isinstance(ts, (int, float)) and ts > cutoff])
