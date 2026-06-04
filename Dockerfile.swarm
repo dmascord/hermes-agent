@@ -69,7 +69,8 @@ RUN apk add --no-cache --virtual .build-deps \
 COPY --chown=hermes:hermes . .
 
 # Install the project itself (editable .pth pointer only; deps already present)
-RUN uv sync --no-cache
+# aiohttp is required by gateway API server but dropped from fresh uv resolution
+RUN uv sync --no-cache && pip install --no-cache-dir aiohttp==3.13.3
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Layer 3 — Node.js dependencies (root package.json only)
