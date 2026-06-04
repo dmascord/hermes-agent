@@ -10,6 +10,8 @@
 .gitmodules
 node_modules
 **/.venv
+venv
+**/venv
 .env
 *.md
 
@@ -22,6 +24,9 @@ docs/
 
 # Exclude CI/CD
 .github/
+
+# Exclude Electron desktop app (not used by gateway)
+apps/
 
 # Exclude built artifacts that are regenerated
 ui-tui/dist/

@@ -15,7 +15,7 @@
 # BuildKit automatically uses Dockerfile.swarm.dockerignore (same-name suffix
 # convention) so tests/, website/, and docs/ are excluded from the context.
 #
-# Expected size: ~1.0–1.3 GB (vs 5.4 GB Debian image).
+# Expected size: ~600–800 MB (vs 5.4 GB Debian image, or 3 GB before cleanup).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 FROM tianon/gosu:1.19 AS gosu_source
@@ -56,7 +56,9 @@ WORKDIR /opt/hermes
 # ═══════════════════════════════════════════════════════════════════════════════
 COPY --chown=hermes:hermes pyproject.toml uv.lock* ./
 
-# Build deps are kept for npm native compilation (node-pty, etc.)
+# Build deps are needed for npm native addon compilation (agent-browser, etc.).
+# They will be removed after npm install in the next layer — native addons are
+# already compiled and linked by then.
 RUN rm -f /var/cache/apk/* && apk update && \
     apk add --no-cache --virtual .build-deps \
     gcc g++ musl-dev linux-headers libffi-dev openssl-dev cargo && \
@@ -85,7 +87,11 @@ RUN uv sync --no-cache && uv pip install --no-cache aiohttp==3.13.3 anthropic==0
 # agent-browser and @askjo/camofox-browser from node_modules/.bin/ .
 RUN npm install --prefer-offline --no-audit --no-fund && \
     npm cache clean --force && \
-    rm -rf /root/.cache/camoufox /tmp/camoufox-*
+    rm -rf /root/.cache/camoufox /tmp/camoufox-* && \
+    # Remove build-deps: native addons are already compiled; toolchain is ~400 MB
+    apk del .build-deps && \
+    # Clean up electron downloads and node-gyp artifacts
+    rm -rf /root/.cache/electron /root/.cache/node-gyp /root/.npm /root/.cache/Cypress
 
 # NOTE: No chmod -R layer here.  The Debian image wastes 1.17 GB because it does:
 #     RUN chmod -R a+rX /opt/hermes
