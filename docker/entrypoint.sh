@@ -50,75 +50,10 @@ if [ "$(id -u)" = "0" ]; then
         chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
     fi
 
-    # Restore codex credential pool entries from backup if they're missing from auth.json.
-    # After a container restart the hermes runtime's write_credential_pool()
-    # rewrites auth.json with only env-var providers, losing manual:device_code
-    # entries that were imported (e.g. via import-next-codex-account.sh or the
-    # add-hermes-codex-pool-fixed.sh helper).
-    #
-    # The backup file ($HERMES_HOME/auth.json.codex-backup) is created by a
-    # post-import step after a successful codex token import.  On every
-    # subsequent restart this block merges backed-up credential pool entries
-    # into the current auth.json, keying on label so that freshly-imported
-    # tokens are preserved (not replaced by stale backup entries).
-    #
-    # NOTE: the backup lives in the bind-mounted volume ($HERMES_HOME, i.e.
-    # /home/tusker/.hermes on tusker deployment), NOT the ephemeral Docker
-    # volume /opt/data.  It persists across container rebuilds.
-    _CODEX_BACKUP="$HERMES_HOME/auth.json.codex-backup"
-    if [ -f "$_CODEX_BACKUP" ]; then
-        python3 - << PYEOF
-import json, os, sys
-
-backup_path = os.path.join(os.environ["HERMES_HOME"], "auth.json.codex-backup")
-auth_path = os.path.join(os.environ["HERMES_HOME"], "auth.json")
-
-with open(backup_path) as f:
-    backup = json.load(f)
-with open(auth_path) as f:
-    current = json.load(f)
-
-backup_codex = backup.get("credential_pool", {}).get("openai-codex", [])
-if not backup_codex:
-    print("Backup has no codex entries to restore")
-    sys.exit(0)
-
-# Merge backup entries into the codex pool, keeping any existing entries
-# that aren't in the backup (e.g. freshly imported codex-4/5/6 from
-# import-next-codex-account.sh).  This is NOT a full replace — otherwise
-# every container restart would wipe newly imported credentials.
-current_pool = current.setdefault("credential_pool", {})
-current_pool.setdefault("openai-codex", [])
-existing_labels = {e.get("label") for e in current_pool["openai-codex"] if isinstance(e, dict)}
-added = 0
-for entry in backup_codex:
-    entry_label = str(entry.get("label") or "unknown")
-    if entry_label in existing_labels:
-        continue  # already present (possibly with fresh tokens from import)
-    # Give each entry a unique source keyed on its label so that
-    # _seed_from_singletons() -> _upsert_entry() dedup (which keys on
-    # source) doesn't collapse multiple manual:device_code entries.
-    entry["source"] = f"manual:device_code:{entry_label}"
-    current_pool["openai-codex"].append(entry)
-    added += 1
-
-# Also fix the source on any existing entries that still use the old
-# generic "manual:device_code" (since _upsert_entry dedup keys on source).
-for entry in current_pool["openai-codex"]:
-    if isinstance(entry, dict) and entry.get("source") == "manual:device_code":
-        lbl = str(entry.get("label") or "unknown")
-        entry["source"] = f"manual:device_code:{lbl}"
-        added += 1  # count as a "fix" for logging
-
-with open(auth_path, "w") as f:
-    json.dump(current, f, indent=2)
-print(f"Restored {added} codex credential entries from backup")
-PYEOF
-        # auth.json is now root-owned (written by Python above as root).
-        # chown it to hermes so the drop-privilege step doesn't break the
-        # hermes runtime's ability to read/write it.
-        chown hermes:hermes "$HERMES_HOME/auth.json" 2>/dev/null || true
-    fi
+    # auth.json is now root-owned (written by Python above as root).
+    # chown it to hermes so the drop-privilege step doesn't break the
+    # hermes runtime's ability to read/write it.
+    chown hermes:hermes "$HERMES_HOME/auth.json" 2>/dev/null || true
 
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"

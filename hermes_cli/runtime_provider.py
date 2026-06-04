@@ -1389,29 +1389,6 @@ def resolve_runtime_provider(
                             if _e is entry:
                                 pool._entries[_i] = _replace(entry, **updated_dict)
                                 break
-                        # Keep the backup file in sync so pod restarts see the
-                        # latest refresh token, not the stale one from auth time.
-                        # Only write manual:device_code entries — env-var entries
-                        # are sourced from Vault and don't need file backup.
-                        try:
-                            import json as _json
-                            from hermes_cli.auth import _auth_store_lock, _load_auth_store
-                            _hermes_home = os.environ.get("HERMES_HOME", "")
-                            if _hermes_home:
-                                _backup_path = os.path.join(_hermes_home, "auth.json.codex-backup")
-                                with _auth_store_lock():
-                                    _as = _load_auth_store()
-                                    _bk_entries = [
-                                        e for e in _as.get("credential_pool", {}).get("openai-codex", [])
-                                        if isinstance(e, dict)
-                                        and str(e.get("source") or "").startswith("manual:device_code")
-                                    ]
-                                    if _bk_entries:
-                                        _bk_data = {"credential_pool": {"openai-codex": _bk_entries}}
-                                        with open(_backup_path, "w") as _f:
-                                            _json.dump(_bk_data, _f, indent=2)
-                        except Exception:
-                            pass  # Non-critical
                     except Exception:
                         pass  # Non-critical
             except Exception:
