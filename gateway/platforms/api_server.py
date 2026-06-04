@@ -6017,8 +6017,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
 
                         # Restore original tool_call_ids for arliai responses.
-                        if _mapper_ns is not None and tool_calls_out:
-                            tool_calls_out = _mapper_ns.unsanitize_tool_calls(tool_calls_out)
+                        if _mapper is not None and tool_calls_out:
+                            tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
 
                         # If any provider returned no tool calls (or empty bash commands)
                         # despite having tools, skip to next without penalising.
