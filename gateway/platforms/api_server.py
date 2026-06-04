@@ -663,7 +663,6 @@ _SWARM_BALANCED_MODEL_HINTS = (
     "opencode-go/minimax-m2.7",
     "ollama/glm-5.1",
     "ollama-mac/qwopus3.6-35b-a3b:latest",  # local M4 Max, 58 tok/s, free
-    "opencode-zen/gpt-5-nano",
     # Xiaomi balanced models: good all-rounders and multimodal omni
     "xiaomi/mimo-v2-omni",
     "xiaomi/mimo-v2.5",
@@ -674,7 +673,6 @@ _SWARM_CHEAP_MODEL_HINTS = (
     "github-copilot-enterprise/gpt-4o-mini",
     "opencode-go/qwen3.5-plus",
     "opencode-go/deepseek-v4-flash",
-    "opencode-zen/gpt-5-nano",
     "opencode-zen/minimax-m2.5-free",
     "opencode-zen/hy3-preview-free",
     "ollama/qwen3-coder-next",
@@ -708,7 +706,6 @@ _HERMES_CODE_PREMIUM_MODELS = (
     "opencode-go/glm-5.1",
     # opencode-zen
     "opencode-zen/big-pickle",
-    "opencode-zen/gpt-5-nano",
     "opencode-zen/minimax-m2.5-free",
     "opencode-zen/hy3-preview-free",
     # arliai
@@ -1948,7 +1945,6 @@ def _build_swarm_model_pool(*, estimated_tokens: int = 0, routing_hint: Optional
             "minimax/MiniMax-M2.7",
             "opencode-go/qwen3.6-plus",
             "ollama/glm-5.1",
-            "opencode-zen/gpt-5-nano",
             "xiaomi/mimo-v2.5-pro",
             primary,
         ]
@@ -5486,6 +5482,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 if prov == "xiaomi":
                     return True
                 if "xiaomimimo.com" in url:
+                    return True
+
+                # OpenCode Zen/Go aggregator proxies. These forward to multiple
+                # backends including DeepSeek (which requires reasoning_content
+                # echo). Since the proxy handles the routing server-side we
+                # cannot inspect the effective downstream provider from the
+                # client — preserve reasoning_content for all models behind
+                # these aggregators so DeepSeek-tunneled models don't 400.
+                if prov in ("opencode-zen", "opencode-go"):
                     return True
 
                 return False
