@@ -57,7 +57,8 @@ WORKDIR /opt/hermes
 COPY --chown=hermes:hermes pyproject.toml uv.lock* ./
 
 # Build deps are kept for npm native compilation (node-pty, etc.)
-RUN apk add --no-cache --virtual .build-deps \
+RUN rm -f /var/cache/apk/* && apk update && \
+    apk add --no-cache --virtual .build-deps \
     gcc g++ musl-dev linux-headers libffi-dev openssl-dev cargo && \
     mkdir -p hermes_cli && touch hermes_cli/__init__.py && \
     uv venv && \
