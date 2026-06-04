@@ -6187,20 +6187,26 @@ class APIServerAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass
                         elif _is_auth_error:
-                            try:
-                                from agent.model_cooldown_db import mark_model_cooldown
-                                mark_model_cooldown(
-                                    provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
-                                    model=provider_model,
-                                    cooldown_seconds=300.0,
-                                    reason="hermes_code_stream_401",
-                                )
-                                logger.warning("[hermes-code] stream %s cooled down for 300s after 401", provider_model)
-                            except Exception:
-                                pass
+                            # For pool-backed credentials (openai-codex), skip the model-level
+                            # cooldown — the credential pool's mark_exhausted_and_rotate() below
+                            # handles per-credential exhaustion and rotation.  A model-level
+                            # cooldown would block ALL accounts for this model for 300s even
+                            # when other credentials in the pool are perfectly valid.
+                            _cpool = runtime_kwargs.get("credential_pool") if isinstance(runtime_kwargs, dict) else None
+                            if _cpool is None:
+                                try:
+                                    from agent.model_cooldown_db import mark_model_cooldown
+                                    mark_model_cooldown(
+                                        provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
+                                        model=provider_model,
+                                        cooldown_seconds=300.0,
+                                        reason="hermes_code_stream_401",
+                                    )
+                                    logger.warning("[hermes-code] stream %s cooled down for 300s after 401", provider_model)
+                                except Exception:
+                                    pass
                             # For pool-backed credentials (openai-codex), rotate to the next
                             # entry so subsequent requests don't reuse the invalidated token.
-                            _cpool = runtime_kwargs.get("credential_pool") if isinstance(runtime_kwargs, dict) else None
                             if _cpool is not None:
                                 try:
                                     _cpool.mark_exhausted_and_rotate(
