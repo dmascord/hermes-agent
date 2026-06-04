@@ -5563,13 +5563,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                    # Skip DeepSeek thinking-mode models (via opencode-zen/go) when the
-                    # session has assistant messages with no reasoning_content. DeepSeek's
-                    # API requires reasoning_content on all prior assistant turns when
-                    # thinking mode is enabled; mixed-provider sessions won't have it.
+                    # Skip models that require reasoning_content echo when the session
+                    # has assistant messages but none have reasoning_content (e.g. mixed-
+                    # provider sessions where prior turns were served by non-thinking models).
                     if "/" in provider_model:
                         _pp_prov, _pp_model = provider_model.split("/", 1)
-                        if "deepseek" in _pp_model.lower() and _pp_prov in ("opencode-zen", "opencode-go"):
+                        if _requires_reasoning_echo(_pp_model, provider=_pp_prov):
                             _has_assistant = any(
                                 isinstance(m, dict) and m.get("role") == "assistant"
                                 for m in passthrough_messages
@@ -5580,7 +5579,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                             if _has_assistant and not _has_any_rc:
                                 logger.debug(
-                                    "[hermes-code] skipping %s: %d assistant msgs with no reasoning_content (DeepSeek thinking mode requires it)",
+                                    "[hermes-code] skipping %s: %d assistant msgs with no reasoning_content (model requires echo)",
                                     provider_model,
                                     sum(1 for m in passthrough_messages if isinstance(m, dict) and m.get("role") == "assistant"),
                                 )
@@ -6239,6 +6238,27 @@ class APIServerAdapter(BasePlatformAdapter):
                             continue
                     except Exception:
                         pass
+
+                # Skip models that require reasoning_content echo when the session
+                # has assistant messages but none have reasoning_content.
+                if "/" in provider_model:
+                    _ns_prov, _ns_model = provider_model.split("/", 1)
+                    if _requires_reasoning_echo(_ns_model, provider=_ns_prov):
+                        _ns_has_assistant = any(
+                            isinstance(m, dict) and m.get("role") == "assistant"
+                            for m in passthrough_messages
+                        )
+                        _ns_has_any_rc = any(
+                            isinstance(m, dict) and m.get("role") == "assistant" and m.get("reasoning_content")
+                            for m in passthrough_messages
+                        )
+                        if _ns_has_assistant and not _ns_has_any_rc:
+                            logger.debug(
+                                "[hermes-code] ns-skip %s: %d assistant msgs with no reasoning_content (model requires echo)",
+                                provider_model,
+                                sum(1 for m in passthrough_messages if isinstance(m, dict) and m.get("role") == "assistant"),
+                            )
+                            continue
 
                     # Fire pre_api_request hook for observability plugins (e.g. Langfuse).
                     _pt_call_count[0] += 1
