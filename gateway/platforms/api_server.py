@@ -5557,6 +5557,54 @@ class APIServerAdapter(BasePlatformAdapter):
 
             logger.debug("[hermes-code] passthrough chain: first=%s models=%d", _passthrough_models[0] if _passthrough_models else "EMPTY", len(_passthrough_models))
 
+            # ── Compression fallback ──────────────────────────────────────────────
+            # If ALL models in the passthrough chain have context windows too small
+            # for the estimated token count, compact the message history to fit the
+            # largest available model before attempting any provider call. This
+            # prevents every model in the chain from being skipped (which would
+            # produce a 503 error with no usable fallback).
+            if _approx_tokens > 0 and len(_passthrough_models) > 0:
+                _all_too_small = True
+                _largest_ctx = 0
+                _largest_model = ""
+                for _pm in _passthrough_models:
+                    _ctx = _model_context_length(_pm)
+                    if _ctx <= 0:
+                        # Unknown context — assume it can handle the request
+                        _all_too_small = False
+                        break
+                    if _ctx > _largest_ctx:
+                        _largest_ctx = _ctx
+                        _largest_model = _pm
+                    if _model_can_handle_context(_pm, _approx_tokens):
+                        _all_too_small = False
+                        break
+                if _all_too_small and _largest_model:
+                    logger.warning(
+                        "[hermes-code] ALL %d passthrough models too small for ~%d tokens. "
+                        "Compacting conversation to fit %s (limit=%s) before fallback chain.",
+                        len(_passthrough_models), _approx_tokens,
+                        _largest_model, f"{_largest_ctx:,}",
+                    )
+                    passthrough_messages = _compact_message_history(
+                        passthrough_messages,
+                        session_id=session_id or "unknown",
+                        system_prompt="",
+                        target_model=_largest_model,
+                    )
+                    # Recompute approximated tokens after compaction so downstream
+                    # context-length checks use the new (smaller) estimate.
+                    try:
+                        from agent.model_metadata import estimate_request_tokens_rough
+                        _approx_tokens = estimate_request_tokens_rough(
+                            passthrough_messages,
+                            system_prompt=system_prompt or "",
+                            tools=tools,
+                        )
+                    except Exception:
+                        _approx_tokens = 0
+            # ── End compression fallback ──────────────────────────────────────────
+
             passthrough_error = None
             _pt_call_count = [0]  # mutable counter: incremented per provider attempt
 
@@ -5593,25 +5641,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                         continue
 
-                    # Skip models that require reasoning_content echo when the session
-                    # has assistant messages but none have reasoning_content (e.g. mixed-
-                    # provider sessions where prior turns were served by non-thinking models).
+                    # Skip models that require reasoning_content echo ONLY when the
+                    # conversation has a MIXED history (some assistant messages have
+                    # reasoning_content, some don't). When ALL lack reasoning_content
+                    # (e.g. prior turns served by non-thinking models) there is nothing
+                    # to echo — the request is perfectly valid as-is.
                     if "/" in provider_model:
                         _pp_prov, _pp_model = provider_model.split("/", 1)
                         if _requires_reasoning_echo(_pp_model, provider=_pp_prov):
-                            _has_assistant = any(
-                                isinstance(m, dict) and m.get("role") == "assistant"
-                                for m in passthrough_messages
-                            )
-                            _has_any_rc = any(
-                                isinstance(m, dict) and m.get("role") == "assistant" and m.get("reasoning_content")
-                                for m in passthrough_messages
-                            )
-                            if _has_assistant and not _has_any_rc:
-                                logger.debug(
-                                    "[hermes-code] skipping %s: %d assistant msgs with no reasoning_content (model requires echo)",
-                                    provider_model,
-                                    sum(1 for m in passthrough_messages if isinstance(m, dict) and m.get("role") == "assistant"),
+                            _asst_msgs = [
+                                m for m in passthrough_messages
+                                if isinstance(m, dict) and m.get("role") == "assistant"
+                            ]
+                            _asst_count = len(_asst_msgs)
+                            _rc_count = sum(1 for m in _asst_msgs if m.get("reasoning_content"))
+                            # Only skip when there's a MIX: some have rc, some don't.
+                            # If ALL have rc or NONE have rc, the request is consistent.
+                            if _asst_count > 0 and 0 < _rc_count < _asst_count:
+                                logger.warning(
+                                    "[hermes-code] skipping %s: %d/%d assistant msgs have reasoning_content (mixed history, cannot satisfy echo requirement)",
+                                    provider_model, _rc_count, _asst_count,
                                 )
                                 continue
 
@@ -5948,6 +5997,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         if not api_key:
                             continue
                         _s_loop = asyncio.get_running_loop()
+                        # Initialize tool_call_id mapper (always needed — referenced after dispatch)
+                        _mapper = None
+                        _raw_tool_calls = None
                         if _needs_audio and prov == "google":
                             def _gemini_audio_call():
                                 from agent.gemini_native_adapter import GeminiNativeClient
@@ -5983,8 +6035,6 @@ class APIServerAdapter(BasePlatformAdapter):
                             # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
                             # mapper so the client sees the original IDs while upstream
                             # receives sanitized ones.
-                            _mapper = None
-                            _raw_tool_calls = None
                             if base_url and "arliai" in (base_url or "").lower():
                                 try:
                                     from agent._tool_id_sanitizer import ToolCallIdMapper
@@ -6424,24 +6474,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     continue
 
-                # Skip models that require reasoning_content echo when the session
-                # has assistant messages but none have reasoning_content.
+                # Skip models that require reasoning_content echo ONLY when the
+                # conversation has a MIXED history (some assistant messages have
+                # reasoning_content, some don't).
                 if "/" in provider_model:
                     _ns_prov, _ns_model = provider_model.split("/", 1)
                     if _requires_reasoning_echo(_ns_model, provider=_ns_prov):
-                        _ns_has_assistant = any(
-                            isinstance(m, dict) and m.get("role") == "assistant"
-                            for m in passthrough_messages
-                        )
-                        _ns_has_any_rc = any(
-                            isinstance(m, dict) and m.get("role") == "assistant" and m.get("reasoning_content")
-                            for m in passthrough_messages
-                        )
-                        if _ns_has_assistant and not _ns_has_any_rc:
-                            logger.debug(
-                                "[hermes-code] ns-skip %s: %d assistant msgs with no reasoning_content (model requires echo)",
-                                provider_model,
-                                sum(1 for m in passthrough_messages if isinstance(m, dict) and m.get("role") == "assistant"),
+                        _ns_asst_msgs = [
+                            m for m in passthrough_messages
+                            if isinstance(m, dict) and m.get("role") == "assistant"
+                        ]
+                        _ns_asst_count = len(_ns_asst_msgs)
+                        _ns_rc_count = sum(1 for m in _ns_asst_msgs if m.get("reasoning_content"))
+                        if _ns_asst_count > 0 and 0 < _ns_rc_count < _ns_asst_count:
+                            logger.warning(
+                                "[hermes-code] ns-skip %s: %d/%d assistant msgs have reasoning_content (mixed history, cannot satisfy echo requirement)",
+                                provider_model, _ns_rc_count, _ns_asst_count,
                             )
                             continue
 
