@@ -5668,13 +5668,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 "arguments": json.dumps(block.input)
                                             }
                                         })
+                            tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
 
-tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
-
-                        # Restore original (client-side) tool_call_ids from sanitized
-                        # upstream IDs so the client receives consistent identifiers.
-                        if _mapper is not None and tool_calls_out:
-                            tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
+                            # Restore original (client-side) tool_call_ids from sanitized
+                            # upstream IDs so the client receives consistent identifiers.
+                            if _mapper is not None and tool_calls_out:
+                                tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
                             completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
                             created = int(time.time())
                             finish_reason = "tool_calls" if tool_calls_out else "stop"
@@ -6015,11 +6014,11 @@ tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
                                 _func_name = str(getattr(_func, "name", getattr(tc, "name", "")))
                                 _func_args = str(getattr(_func, "arguments", getattr(tc, "arguments", "{}")))
                                 tool_calls_out.append({"id": str(getattr(tc, "id", "")), "type": "function", "function": {"name": _func_name, "arguments": _func_args}})
-tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                        tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
 
-                    # Restore original tool_call_ids for arliai responses.
-                    if _mapper_ns is not None and tool_calls_out:
-                        tool_calls_out = _mapper_ns.unsanitize_tool_calls(tool_calls_out)
+                        # Restore original tool_call_ids for arliai responses.
+                        if _mapper_ns is not None and tool_calls_out:
+                            tool_calls_out = _mapper_ns.unsanitize_tool_calls(tool_calls_out)
 
                         # If any provider returned no tool calls (or empty bash commands)
                         # despite having tools, skip to next without penalising.
