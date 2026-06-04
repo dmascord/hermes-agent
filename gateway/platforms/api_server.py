@@ -5579,8 +5579,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 for m in passthrough_messages
                             )
                             if _has_assistant and not _has_any_rc:
-                                logger.warning(
-                                    "[hermes-code] skipping %s: %d assistant msgs with no reasoning_content, DeepSeek thinking mode will reject",
+                                logger.debug(
+                                    "[hermes-code] skipping %s: %d assistant msgs with no reasoning_content (DeepSeek thinking mode requires it)",
                                     provider_model,
                                     sum(1 for m in passthrough_messages if isinstance(m, dict) and m.get("role") == "assistant"),
                                 )
