@@ -5504,7 +5504,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 return False
 
+            def _strip_from_client_tools(tools: Any) -> Any:
+                """Remove _from_client marker added during request parsing.
+                
+                This marker is added for internal tracking but MUST NOT be sent to
+                external providers (e.g. google/gemini-2.5-flash rejects unknown fields).
+                """
+                if not isinstance(tools, list):
+                    return tools
+                result = []
+                for tool in tools:
+                    if isinstance(tool, dict):
+                        cleaned = {k: v for k, v in tool.items() if k != "_from_client"}
+                        result.append(cleaned)
+                    else:
+                        result.append(tool)
+                return result
+
             passthrough_tools = tools if tools else None
+            # _from_client is added during request parsing (line 5113) for internal tracking.
+            # External providers reject unknown fields — strip before sending to any API.
+            if passthrough_tools:
+                passthrough_tools = _strip_from_client_tools(passthrough_tools)
             # ── Tool-loop audit ───────────────────────────────────────────────
             # Observe-only: detects repeated identical tool calls and logs them.
             # Does NOT inject or mutate passthrough_messages.
