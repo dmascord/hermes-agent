@@ -63,9 +63,14 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     try:
         retry_after = exc.response.headers.get("Retry-After") or exc.response.headers.get("retry-after")  # type: ignore[union-attr]
         if retry_after:
-            # Cap at 5 min — upstream sometimes sends 86400 s (24 h) which
-            # would effectively kill the provider for the whole day.
-            return min(300.0, max(60.0, float(retry_after)))
+            # Honor the actual value from the upstream provider — 24 h resets
+            # would be honoured the same as a 60 s rate-limit window.
+            # An optional HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN env var can cap
+            # this at runtime if a hard upper bound is ever needed.
+            import os as _os
+            _max = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
+            _val = max(60.0, float(retry_after))
+            return _val if _max <= 0 else min(_val, _max)
     except Exception:
         pass
 
@@ -435,8 +440,12 @@ class _RerankRouter:
         retry_after = headers.get("retry-after") or headers.get("Retry-After") or ""
         if retry_after:
             try:
-                # Cap at 5 min — upstream sometimes sends 86400 s (24 h).
-                return min(300.0, max(1.0, float(retry_after)))
+                # Honor the actual value — no hard cap. Use
+                # HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN env var to cap if needed.
+                import os as _os
+                _max = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
+                _val = max(1.0, float(retry_after))
+                return _val if _max <= 0 else min(_val, _max)
             except ValueError:
                 pass
         return 60.0
@@ -5660,7 +5669,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                             }
                                         })
 
-                            tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+
+                        # Restore original (client-side) tool_call_ids from sanitized
+                        # upstream IDs so the client receives consistent identifiers.
+                        if _mapper is not None and tool_calls_out:
+                            tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
                             completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
                             created = int(time.time())
                             finish_reason = "tool_calls" if tool_calls_out else "stop"
@@ -5851,6 +5865,22 @@ class APIServerAdapter(BasePlatformAdapter):
                             _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                             _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
                             _msgs_to_send = _strip_unsupported_content_for_openai(_msgs_to_send)
+
+                            # ── arliai tool_call_id sanitization ────────────────────
+                            # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
+                            # mapper so the client sees the original IDs while upstream
+                            # receives sanitized ones.
+                            _mapper = None
+                            _raw_tool_calls = None
+                            if base_url and "arliai" in (base_url or "").lower():
+                                try:
+                                    from agent._tool_id_sanitizer import ToolCallIdMapper
+                                    _mapper = ToolCallIdMapper(max_length=9)
+                                    _msgs_to_send = _mapper.sanitize_messages(_msgs_to_send)
+                                    logger.debug("[hermes-code] arliai: sanitized tool_call_ids in %d messages", len(_msgs_to_send))
+                                except Exception as _map_exc:
+                                    logger.warning("[hermes-code] arliai: failed to init tool_id mapper: %s", _map_exc)
+
                             logger.debug(
                                 "[hermes-code] streaming call_llm: model=%s provider=%s has_rc=%s echo=%s msgs=%d",
                                 resolved_model, prov, _passthrough_has_reasoning, _echo_rc, len(_msgs_to_send),
@@ -5887,12 +5917,18 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "[hermes-code] DEEPHEX REQUEST provider=%s model=%s size=%d bytes",
                                             prov, resolved_model, len(_req_bytes),
                                         )
-                                        # Log first 500 bytes of request as hex
-                                        _hex_preview = _req_bytes[:500].hex(" ", 1)
-                                        logger.debug("[hermes-code] DEEPHEX REQUEST HEX:\n%s", _hex_preview)
+                                        # Log first 2000 chars of request body as text
+                                        _text_preview = _json_body[:2000]
+                                        logger.warning("[hermes-code] DEEPHEX REQUEST BODY START:\n%s", _text_preview)
+                                        # Log summary of each message
+                                        _msg_summary = [
+                                            (m.get("role","?"), len(str(m.get("content",""))), bool(m.get("reasoning_content")), bool(m.get("tool_calls")))
+                                            for m in _msgs_to_send
+                                        ]
+                                        logger.warning("[hermes-code] DEEPHEX MSG SUMMARY: %s", _msg_summary)
                                         # Log count of reasoning_content entries in request
                                         _rc_count = sum(1 for m in _msgs_to_send if m.get("reasoning_content"))
-                                        logger.debug("[hermes-code] DEEPHEX: %d messages with reasoning_content in request", _rc_count)
+                                        logger.warning("[hermes-code] DEEPHEX: %d messages with reasoning_content in request", _rc_count)
                                         # Make direct httpx call
                                         async with httpx.AsyncClient(timeout=300.0) as _client:
                                             _headers = {
@@ -5914,7 +5950,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             logger.debug("[hermes-code] DEEPHEX RESPONSE HEX:\n%s", _hex_resp)
                                             if _resp.status_code != 200:
                                                 _resp_text = _resp_body.decode("utf-8", errors="replace")
-                                                logger.debug("[hermes-code] DEEPHEX ERROR BODY: %s", _resp_text[:500])
+                                                logger.warning("[hermes-code] DEEPHEX ERROR BODY: %s", _resp_text[:2000])
                                                 raise Exception(f"DeepSeek direct call failed: {_resp.status_code}")
                                             # Parse and wrap response like call_llm would
                                             import types
@@ -5979,7 +6015,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _func_name = str(getattr(_func, "name", getattr(tc, "name", "")))
                                 _func_args = str(getattr(_func, "arguments", getattr(tc, "arguments", "{}")))
                                 tool_calls_out.append({"id": str(getattr(tc, "id", "")), "type": "function", "function": {"name": _func_name, "arguments": _func_args}})
-                        tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+
+                    # Restore original tool_call_ids for arliai responses.
+                    if _mapper_ns is not None and tool_calls_out:
+                        tool_calls_out = _mapper_ns.unsanitize_tool_calls(tool_calls_out)
 
                         # If any provider returned no tool calls (or empty bash commands)
                         # despite having tools, skip to next without penalising.
@@ -6496,6 +6536,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                         _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
                         _msgs_to_send = _strip_unsupported_content_for_openai(_msgs_to_send)
+
+                        # ── arliai tool_call_id sanitization ────────────────────
+                        _mapper_ns = None
+                        if base_url and "arliai" in (base_url or "").lower():
+                            try:
+                                from agent._tool_id_sanitizer import ToolCallIdMapper
+                                _mapper_ns = ToolCallIdMapper(max_length=9)
+                                _msgs_to_send = _mapper_ns.sanitize_messages(_msgs_to_send)
+                                logger.debug("[hermes-code] arliai ns: sanitized tool_call_ids",)
+                            except Exception as _map_exc:
+                                logger.warning("[hermes-code] arliai ns: failed to init mapper: %s", _map_exc)
+
                         logger.debug(
                             "[hermes-code] non-streaming call_llm: model=%s provider=%s has_rc=%s echo=%s msgs=%d",
                             resolved_model, prov, _passthrough_has_reasoning, _echo_rc, len(_msgs_to_send),

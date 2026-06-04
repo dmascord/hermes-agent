@@ -1387,20 +1387,10 @@ def normalize_model_name(model: str, preserve_dots: bool = False) -> str:
 def _sanitize_tool_id(tool_id: str) -> str:
     """Sanitize a tool call ID for the Anthropic API.
 
-    Anthropic requires IDs matching [a-zA-Z0-9_-]. Replace invalid
-    characters with underscores and ensure non-empty.
-
-    Some providers (e.g. arliai) additionally enforce a max length of 9
-    characters — truncate with a short hash when necessary.
+    Delegates to the shared utility in ``agent._tool_id_sanitizer``.
     """
-    import hashlib, re
-    if not tool_id:
-        return "tool_0"
-    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_id)
-    if len(sanitized) > 9:
-        # Deterministic 9-char hash to avoid collisions after truncation
-        sanitized = hashlib.md5(tool_id.encode()).hexdigest()[:9]
-    return sanitized or "tool_0"
+    from agent._tool_id_sanitizer import sanitize_tool_call_id
+    return sanitize_tool_call_id(tool_id, max_length=9)
 
 
 def _normalize_tool_input_schema(schema: Any) -> Dict[str, Any]:
