@@ -5457,6 +5457,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     out.append(m)
                 return out
 
+            def _synthesize_reasoning_for_tool_calls(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                """Ensure every assistant message with tool_calls also has a reasoning_content
+                field, defaulting to empty string if absent.
+
+                DeepSeek (and proxies that forward to DeepSeek like opencode-zen/opencode-go)
+                reject requests where an assistant message has tool_calls but is missing
+                reasoning_content — the API requires the field to be present (even if empty)
+                on every assistant turn in thinking mode. This synthesises an empty
+                ``reasoning_content`` for any assistant turn that has tool_calls but no
+                ``reasoning_content`` field, so the provider doesn't 400.
+                """
+                out = []
+                for m in msgs:
+                    if (
+                        isinstance(m, dict)
+                        and m.get("role") == "assistant"
+                        and m.get("tool_calls")
+                        and "reasoning_content" not in m
+                    ):
+                        m = {**m, "reasoning_content": ""}
+                    out.append(m)
+                return out
+
             def _requires_reasoning_echo(model_id: str, provider: str = "", base_url: str = "") -> bool:
                 """Return True for models that require reasoning_content echoed back.
 
@@ -6051,6 +6074,15 @@ class APIServerAdapter(BasePlatformAdapter):
                             _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                             _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
                             _msgs_to_send = _strip_unsupported_content_for_openai(_msgs_to_send)
+                            # For providers that require reasoning_content echo (DeepSeek via
+                            # opencode-zen/opencode-go), ensure every assistant turn that
+                            # has tool_calls also has a reasoning_content field — even an
+                            # empty one. The provider rejects the request if the field is
+                            # missing on any assistant turn that emitted tool_calls in
+                            # thinking mode. This must run AFTER _strip_reasoning so the
+                            # synthesised field isn't removed by stripping.
+                            if _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url):
+                                _msgs_to_send = _synthesize_reasoning_for_tool_calls(_msgs_to_send)
 
                             # ── arliai tool_call_id sanitization ────────────────────
                             # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
@@ -6206,7 +6238,13 @@ class APIServerAdapter(BasePlatformAdapter):
                             tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
 
                         # If any provider returned no tool calls (or empty bash commands)
-                        # despite having tools, skip to next without penalising.
+                        # despite having tools, skip to next. Apply a short cooldown so
+                        # a model that repeatedly returns text-only (when tools are
+                        # expected) doesn't keep burning through the entire fallback
+                        # chain on every request. The cooldown is short enough that
+                        # the model will be retried after ~2 min — long enough to
+                        # skip past it on the current request and avoid the worst
+                        # case where 30+ models each return text-only in sequence.
                         if passthrough_tools and (not tool_calls_out or _has_empty_bash_tool_call(tool_calls_out)):
                             if not tool_calls_out:
                                 logger.warning(
@@ -6214,6 +6252,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "raising _CodexPassthroughSkip to try next provider",
                                     provider_model,
                                 )
+                                # Short cooldown for text-only — model isn't broken
+                                # (it returned valid text), but for THIS request we
+                                # needed a tool call. Skip it for ~2 min.
+                                try:
+                                    from agent.model_cooldown_db import mark_model_cooldown
+                                    mark_model_cooldown(
+                                        provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
+                                        model=provider_model,
+                                        cooldown_seconds=120.0,
+                                        reason="text_only_with_tools",
+                                    )
+                                except Exception:
+                                    pass
                                 raise _CodexPassthroughSkip()
                             else:
                                 logger.warning(
@@ -6222,13 +6273,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                     provider_model,
                                 )
                                 # Put the model on cooldown so it's not tried again
-                                # for the next 10 minutes, avoiding repeated empty bash round trips.
+                                # for the next 2 minutes, avoiding repeated empty bash
+                                # round trips. Short enough to retry after a few requests,
+                                # long enough to skip past it on the current one.
                                 try:
                                     from agent.model_cooldown_db import mark_model_cooldown
                                     mark_model_cooldown(
                                         provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
                                         model=provider_model,
-                                        cooldown_seconds=600.0,
+                                        cooldown_seconds=120.0,
                                         reason="empty_bash",
                                     )
                                 except Exception:
@@ -6809,6 +6862,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                         _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
                         _msgs_to_send = _strip_unsupported_content_for_openai(_msgs_to_send)
+                        # For providers that require reasoning_content echo (DeepSeek via
+                        # opencode-zen/opencode-go), ensure every assistant turn that
+                        # has tool_calls also has a reasoning_content field — even an
+                        # empty one. The provider rejects the request if the field is
+                        # missing on any assistant turn that emitted tool_calls in
+                        # thinking mode. This must run AFTER _strip_reasoning so the
+                        # synthesised field isn't removed by stripping.
+                        if _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url):
+                            _msgs_to_send = _synthesize_reasoning_for_tool_calls(_msgs_to_send)
 
                         # ── arliai tool_call_id sanitization ────────────────────
                         _mapper_ns = None
@@ -6874,7 +6936,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
 
                     # If any provider returned no tool calls (or empty bash commands)
-                    # despite having tools, skip to next without penalising.
+                    # despite having tools, skip to next. Apply a short cooldown so
+                    # a model that repeatedly returns text-only (when tools are
+                    # expected) doesn't keep burning through the entire fallback
+                    # chain on every request. The cooldown is short enough that
+                    # the model will be retried after ~2 min — long enough to
+                    # skip past it on the current request and avoid the worst
+                    # case where 30+ models each return text-only in sequence.
                     if passthrough_tools and (not tool_calls_out or _has_empty_bash_tool_call(tool_calls_out)):
                         if not tool_calls_out:
                             logger.warning(
@@ -6882,6 +6950,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "raising _CodexPassthroughSkip to try next provider",
                                 provider_model,
                             )
+                            # Short cooldown for text-only — model isn't broken
+                            # (it returned valid text), but for THIS request we
+                            # needed a tool call. Skip it for ~2 min.
+                            try:
+                                from agent.model_cooldown_db import mark_model_cooldown
+                                mark_model_cooldown(
+                                    provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
+                                    model=provider_model,
+                                    cooldown_seconds=120.0,
+                                    reason="text_only_with_tools",
+                                )
+                            except Exception:
+                                pass
                             raise _CodexPassthroughSkip()
                         else:
                             logger.warning(
@@ -6890,13 +6971,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                 provider_model,
                             )
                             # Put the model on cooldown so it's not tried again
-                            # for the next 5 minutes, avoiding repeated empty bash round trips.
+                            # for the next 2 minutes, avoiding repeated empty bash
+                            # round trips. Short enough to retry after a few requests,
+                            # long enough to skip past it on the current one.
                             try:
                                 from agent.model_cooldown_db import mark_model_cooldown
                                 mark_model_cooldown(
                                     provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
                                     model=provider_model,
-                                    cooldown_seconds=600.0,
+                                    cooldown_seconds=120.0,
                                     reason="empty_bash",
                                 )
                             except Exception:
