@@ -3091,7 +3091,7 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                     resolved = resolve_runtime_provider(requested="openai-codex")
                     _codex_api_key = resolved.get("api_key", "")
                     _codex_base_url = resolved.get("base_url", "")
-                    logger.warning("[hermes-code] resolve_runtime_provider: api_key=%s base_url=%s", 
+                    logger.debug("[hermes-code] resolve_runtime_provider: api_key=%s base_url=%s", 
                         "SET" if _codex_api_key else "EMPTY", _codex_base_url)
                     if _codex_api_key:
                         runtime_kwargs["base_url"] = _codex_base_url or os.getenv("OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex")
@@ -5435,7 +5435,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 for m in passthrough_messages
                 if isinstance(m, dict) and m.get("reasoning_content")
             ]
-            logger.warning(
+            logger.debug(
                 "[hermes-code] reasoning check: has_rc=%s rc_msgs=%s history_len=%d",
                 _passthrough_has_reasoning, _has_rc_msgs, len(history),
             )
@@ -5501,7 +5501,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 for m in passthrough_messages
                 if isinstance(m, dict)
             )
-            logger.warning(
+            logger.debug(
                 "[hermes-code] passthrough → provider: %d msgs last_roles=[...%s] "
                 "stream=%s tools=%d",
                 len(passthrough_messages),
@@ -5538,7 +5538,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if fb and fb not in _passthrough_models:
                     _passthrough_models.append(fb)
 
-            logger.warning("[hermes-code] passthrough chain: first=%s models=%d", _passthrough_models[0] if _passthrough_models else "EMPTY", len(_passthrough_models))
+            logger.debug("[hermes-code] passthrough chain: first=%s models=%d", _passthrough_models[0] if _passthrough_models else "EMPTY", len(_passthrough_models))
 
             passthrough_error = None
             _pt_call_count = [0]  # mutable counter: incremented per provider attempt
@@ -5844,7 +5844,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                             _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
                             _msgs_to_send = _strip_unsupported_content_for_openai(_msgs_to_send)
-                            logger.warning(
+                            logger.debug(
                                 "[hermes-code] streaming call_llm: model=%s provider=%s has_rc=%s echo=%s msgs=%d",
                                 resolved_model, prov, _passthrough_has_reasoning, _echo_rc, len(_msgs_to_send),
                             )
@@ -6044,7 +6044,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                         # Stream reasoning_content deltas first (for DeepSeek thinking mode etc.)
                         if reasoning_content_out:
-                            logger.warning(
+                            logger.debug(
                                 "[hermes-code] streaming reasoning_content to client: model=%s rc_len=%d",
                                 provider_model, len(reasoning_content_out),
                             )
@@ -6267,7 +6267,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             logger.debug("hermes-code passthrough: %s has no API key, skipping", provider_model)
                             continue
 
-                        logger.warning(
+                        logger.debug(
                             "[hermes-code] passthrough (copilot): model=%s tools=%s",
                             resolved_model, bool(tools),
                         )
@@ -6421,7 +6421,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     base_url = runtime_kwargs.get("base_url", "") or None
                     api_mode = runtime_kwargs.get("api_mode", "")
 
-                    logger.warning(
+                    logger.debug(
                         "[hermes-code] passthrough: trying provider=%s model=%s base_url=%s messages=%d",
                         prov, resolved_model, base_url, len(passthrough_messages),
                     )
@@ -6462,7 +6462,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                         _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
                         _msgs_to_send = _strip_unsupported_content_for_openai(_msgs_to_send)
-                        logger.warning(
+                        logger.debug(
                             "[hermes-code] non-streaming call_llm: model=%s provider=%s has_rc=%s echo=%s msgs=%d",
                             resolved_model, prov, _passthrough_has_reasoning, _echo_rc, len(_msgs_to_send),
                         )
@@ -6493,7 +6493,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     content = extract_content_or_reasoning(response_obj).strip()
                     reasoning_content = _extract_reasoning_content_from_msg(msg)
                     if reasoning_content:
-                        logger.warning(
+                        logger.debug(
                             "[hermes-code] non-streaming reasoning_content from provider: model=%s rc_len=%d",
                             provider_model, len(reasoning_content),
                         )
