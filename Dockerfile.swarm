@@ -34,7 +34,7 @@ ENV PYTHONUNBUFFERED=1
 # nodejs + npm  – agent-browser and camofox are Node.js packages
 # ffmpeg        – audio format conversion (tts_tool, transcription_tools)
 RUN apk add --no-cache \
-    bash coreutils shadow tini \
+    bash coreutils shadow tini make \
     git openssh-client ripgrep \
     nodejs npm ffmpeg
 
@@ -56,14 +56,12 @@ WORKDIR /opt/hermes
 # ═══════════════════════════════════════════════════════════════════════════════
 COPY --chown=hermes:hermes pyproject.toml uv.lock* ./
 
-# Build deps are installed, deps resolved, then build deps removed in ONE layer
-# so no compiler/toolchain bloat leaks into the final image.
+# Build deps are kept for npm native compilation (node-pty, etc.)
 RUN apk add --no-cache --virtual .build-deps \
-    gcc musl-dev linux-headers libffi-dev openssl-dev cargo && \
+    gcc g++ musl-dev linux-headers libffi-dev openssl-dev cargo && \
     mkdir -p hermes_cli && touch hermes_cli/__init__.py && \
     uv venv && \
-    uv sync --frozen --no-install-project --no-cache && \
-    apk del .build-deps
+    uv sync --no-install-project --no-cache
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Layer 2 — Source code (cached unless source files change)
@@ -71,7 +69,7 @@ RUN apk add --no-cache --virtual .build-deps \
 COPY --chown=hermes:hermes . .
 
 # Install the project itself (editable .pth pointer only; deps already present)
-RUN uv sync --frozen --no-cache
+RUN uv sync --no-cache
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Layer 3 — Node.js dependencies (root package.json only)
