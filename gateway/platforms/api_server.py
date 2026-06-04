@@ -5580,6 +5580,19 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
+                    # Skip models whose context window cannot safely hold the estimated
+                    # request tokens. This prevents costly "prompt too long" round-trips
+                    # that waste API quota and trigger circuit breakers unnecessarily.
+                    if _approx_tokens > 0 and not _model_can_handle_context(provider_model, _approx_tokens):
+                        _ctx_limit = _model_context_length(provider_model)
+                        logger.warning(
+                            "[hermes-code] %s context too small for ~%d tokens "
+                            "(limit=%s), skipping",
+                            provider_model, _approx_tokens,
+                            f"{_ctx_limit:,}" if _ctx_limit > 0 else "unknown",
+                        )
+                        continue
+
                     # Skip models that require reasoning_content echo when the session
                     # has assistant messages but none have reasoning_content (e.g. mixed-
                     # provider sessions where prior turns were served by non-thinking models).
@@ -5786,12 +5799,17 @@ class APIServerAdapter(BasePlatformAdapter):
                                 logger.info("[hermes-code] client disconnected mid-stream (copilot %s), not penalising provider", provider_model)
                                 passthrough_error = exc
                                 break
-                            try:
-                                from agent.model_cooldown_db import mark_provider_failure
-                                _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
-                                mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
-                            except Exception:
-                                pass
+                            # Don't penalise providers for context-overflow errors — these are
+                            # routing/selection issues (resolved by the pre-filter above), not
+                            # model or API failures that warrant circuit-breaking.
+                            _is_ctx_overflow = _is_context_overflow_error(_exc_str)
+                            if not _is_ctx_overflow:
+                                try:
+                                    from agent.model_cooldown_db import mark_provider_failure
+                                    _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
+                                    mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
+                                except Exception:
+                                    pass
                             _invalidate_selectable_pool_cache()
                             # Check if this is a rate-limit (429) or auth (401) error; cooldown the provider.
                             _status_code = getattr(exc, "status_code", None)
@@ -6202,12 +6220,17 @@ class APIServerAdapter(BasePlatformAdapter):
                             logger.info("[hermes-code] client disconnected mid-stream (%s), not penalising provider", provider_model)
                             passthrough_error = exc
                             break
-                        try:
-                            from agent.model_cooldown_db import mark_provider_failure
-                            _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
-                            mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
-                        except Exception:
-                            pass
+                        # Don't penalise providers for context-overflow errors — these are
+                        # routing/selection issues (resolved by the pre-filter above), not
+                        # model or API failures that warrant circuit-breaking.
+                        _is_ctx_overflow = _is_context_overflow_error(_exc_str)
+                        if not _is_ctx_overflow:
+                            try:
+                                from agent.model_cooldown_db import mark_provider_failure
+                                _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
+                                mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
+                            except Exception:
+                                pass
                         _invalidate_selectable_pool_cache()
                         # Check if this is a rate-limit (429) or auth (401) error; cooldown the provider.
                         _status_code = getattr(exc, "status_code", None)
@@ -6291,6 +6314,19 @@ class APIServerAdapter(BasePlatformAdapter):
                             continue
                     except Exception:
                         pass
+
+                # Skip models whose context window cannot safely hold the estimated
+                # request tokens. This prevents costly "prompt too long" round-trips
+                # that waste API quota and trigger circuit breakers unnecessarily.
+                if _approx_tokens > 0 and not _model_can_handle_context(provider_model, _approx_tokens):
+                    _ctx_limit = _model_context_length(provider_model)
+                    logger.warning(
+                        "[hermes-code] ns-skip %s: context too small for ~%d tokens "
+                        "(limit=%s), skipping",
+                        provider_model, _approx_tokens,
+                        f"{_ctx_limit:,}" if _ctx_limit > 0 else "unknown",
+                    )
+                    continue
 
                 # Skip models that require reasoning_content echo when the session
                 # has assistant messages but none have reasoning_content.
