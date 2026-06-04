@@ -1389,11 +1389,17 @@ def _sanitize_tool_id(tool_id: str) -> str:
 
     Anthropic requires IDs matching [a-zA-Z0-9_-]. Replace invalid
     characters with underscores and ensure non-empty.
+
+    Some providers (e.g. arliai) additionally enforce a max length of 9
+    characters — truncate with a short hash when necessary.
     """
-    import re
+    import hashlib, re
     if not tool_id:
         return "tool_0"
     sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_id)
+    if len(sanitized) > 9:
+        # Deterministic 9-char hash to avoid collisions after truncation
+        sanitized = hashlib.md5(tool_id.encode()).hexdigest()[:9]
     return sanitized or "tool_0"
 
 
