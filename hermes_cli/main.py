@@ -324,6 +324,11 @@ def _apply_profile_override() -> None:
             consume = 1
             break
 
+    # 1.5 If HERMES_HOME is already set and no explicit flag was given, trust it.
+    # This lets child processes (relaunch, subprocess) inherit the parent's
+    # profile choice without having to pass --profile again.
+    if profile_name is None and os.environ.get("HERMES_HOME"):
+        return
     # 1b. Reject values that can't be valid profile names (e.g. pytest's
     # "-p no:xdist" would be misread as profile "no:xdist" otherwise).
     # Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never call
@@ -672,7 +677,7 @@ def _has_any_provider_configured() -> bool:
     env_file = get_env_path()
     if env_file.exists():
         try:
-            for line in env_file.read_text(encoding="utf-8").splitlines():
+            for line in env_file.read_text().splitlines():
                 line = line.strip()
                 if line.startswith("#") or "=" not in line:
                     continue
@@ -1187,8 +1192,6 @@ def _print_tui_exit_summary(
 
         title = db.get_session_title(target)
         message_count = int(session.get("message_count") or 0)
-        if message_count == 0:
-            return  # No real conversation — don't show resume info
         input_tokens = int(session.get("input_tokens") or 0)
         output_tokens = int(session.get("output_tokens") or 0)
         cache_read_tokens = int(session.get("cache_read_tokens") or 0)
@@ -1224,17 +1227,7 @@ def _print_tui_exit_summary(
     )
 
 
-_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer"})
-"""Lockfile fields npm writes non-deterministically at install time.
-
-``ideallyInert`` is npm's runtime annotation for packages it skipped installing
-(per-platform opt-outs).  ``peer`` is dropped from the hidden ``.package-lock.json``
-on dev-dependencies that are *also* declared as peers — the canonical
-``package-lock.json`` records the dual role, but npm 9's actualized tree strips
-it.  Neither key represents a real skew between what was declared and what was
-installed, so we exclude them from the comparison in :func:`_tui_need_npm_install`
-to avoid false-positive reinstalls on every launch.
-"""
+_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert"})
 
 
 def _workspace_root(dir: Path) -> Path:
@@ -1533,6 +1526,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             print("Installing TUI dependencies…")
         result = subprocess.run(
             [npm, "install", "--silent", "--no-fund", "--no-audit", "--progress=false"],
+            cwd=str(tui_dir),
+            stdout=subprocess.DEVNULL,
             cwd=str(_workspace_root(tui_dir)),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1540,8 +1535,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             env={**os.environ, "CI": "1"},
         )
         if result.returncode != 0:
-            combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
-            preview = "\n".join(combined.splitlines()[-30:])
+            err = (result.stderr or "").strip()
+            preview = "\n".join(err.splitlines()[-30:])
             print("npm install failed.")
             if preview:
                 print(preview)
@@ -4746,10 +4741,10 @@ def _model_flow_named_custom(config, provider_info):
     print()
 
     print("Fetching available models...")
-    fetch_kwargs = {"timeout": 8.0}
-    if api_mode:
-        fetch_kwargs["api_mode"] = api_mode
-    models = fetch_api_models(api_key, base_url, **fetch_kwargs)
+    models = fetch_api_models(
+        api_key, base_url, timeout=8.0,
+        api_mode=api_mode or None,
+    )
 
     if models:
         default_idx = 0
@@ -9377,6 +9372,13 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
+    print("→ Fetching from origin...")
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch", "origin"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
     # Fetch both origin and upstream; prefer upstream as the canonical reference.
     # Note: upstream/<branch> may not exist for non-main branches (a fork's
     # bb/gui has no upstream counterpart), so when the caller picks a
@@ -9422,7 +9424,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         elif "Authentication failed" in stderr or "could not read Username" in stderr:
             print("✗ Authentication failed — check your git credentials or SSH key.")
         else:
-            print("✗ Failed to fetch.")
+            print("✗ Failed to fetch from origin.")
             if stderr:
                 print(f"  {stderr.splitlines()[0]}")
         sys.exit(1)
@@ -9442,7 +9444,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         sys.exit(1)
 
     rev_result = subprocess.run(
-        git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
+        git_cmd + ["rev-list", "HEAD..origin/main", "--count"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -9454,7 +9456,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print("✓ Already up to date.")
     else:
         commits_word = "commit" if behind == 1 else "commits"
-        print(f"⚕ Update available: {behind} {commits_word} behind {compare_branch}.")
+        print(f"⚕ Update available: {behind} {commits_word} behind origin/main.")
         from hermes_cli.config import recommended_update_command
 
         print(f"  Run '{recommended_update_command()}' to install.")
@@ -10305,22 +10307,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("Skills sync during update failed: %s", e)
 
-        # Sync bundled skills to all profiles (including the active one).
-        # seed_profile_skills() uses subprocess with an explicit HERMES_HOME so
-        # it is not affected by sync_skills()'s module-level HERMES_HOME cache,
-        # which means the active profile is reliably synced regardless of whether
-        # the caller's HERMES_HOME env var points at the default or a named profile.
+        # Sync bundled skills to all other profiles
         try:
             from hermes_cli.profiles import (
                 list_profiles,
+                get_active_profile_name,
                 seed_profile_skills,
             )
 
-            all_profiles = list_profiles()
-            if all_profiles:
+            active = get_active_profile_name()
+            other_profiles = [p for p in list_profiles() if p.name != active]
+            if other_profiles:
                 print()
-                print("→ Syncing bundled skills to all profiles...")
-                for p in all_profiles:
+                print("→ Syncing bundled skills to other profiles...")
+                for p in other_profiles:
                     try:
                         r = seed_profile_skills(p.path, quiet=True)
                         if r and r.get("skipped_opt_out"):
@@ -13134,24 +13134,7 @@ def main():
     )
     cron_create.add_argument(
         "--script",
-        help=(
-            "Path to a script under ~/.hermes/scripts/. Default mode: "
-            "script stdout is injected into the agent's prompt each run. "
-            "With --no-agent: the script IS the job and its stdout is "
-            "delivered verbatim. .sh/.bash files run via bash, everything "
-            "else via Python."
-        ),
-    )
-    cron_create.add_argument(
-        "--no-agent",
-        dest="no_agent",
-        action="store_true",
-        default=False,
-        help=(
-            "Skip the LLM entirely — run --script on schedule and deliver "
-            "its stdout directly. Empty stdout = silent. Classic watchdog "
-            "pattern (memory alerts, disk alerts, CI pings)."
-        ),
+        help="Path to a Python script whose stdout is injected into the prompt each run",
     )
     cron_create.add_argument(
         "--workdir",
@@ -13197,29 +13180,7 @@ def main():
     )
     cron_edit.add_argument(
         "--script",
-        help=(
-            "Path to a script under ~/.hermes/scripts/. Pass empty string to clear. "
-            "With --no-agent the script IS the job; otherwise its stdout is "
-            "injected into the agent's prompt each run."
-        ),
-    )
-    cron_edit.add_argument(
-        "--no-agent",
-        dest="no_agent",
-        action="store_const",
-        const=True,
-        default=None,
-        help=(
-            "Enable no-agent mode on this job (requires --script or an "
-            "existing script on the job)."
-        ),
-    )
-    cron_edit.add_argument(
-        "--agent",
-        dest="no_agent",
-        action="store_const",
-        const=False,
-        help="Disable no-agent mode on this job (reverts to LLM-driven execution).",
+        help="Path to a Python script whose stdout is injected into the prompt each run. Pass empty string to clear.",
     )
     cron_edit.add_argument(
         "--workdir",
@@ -13509,7 +13470,6 @@ Examples:
     hermes debug share --lines 500  Include more log lines
     hermes debug share --expire 30  Keep paste for 30 days
     hermes debug share --local      Print report locally (no upload)
-    hermes debug share --no-redact  Disable upload-time secret redaction
     hermes debug delete <url>       Delete a previously uploaded paste
 """,
     )
@@ -13534,16 +13494,6 @@ Examples:
         "--local",
         action="store_true",
         help="Print the report locally instead of uploading",
-    )
-    share_parser.add_argument(
-        "--no-redact",
-        action="store_true",
-        help=(
-            "Disable upload-time secret redaction (default: redact). Logs "
-            "are normally run through agent.redact.redact_sensitive_text "
-            "with force=True before upload so credentials are not leaked "
-            "into the public paste service."
-        ),
     )
     delete_parser = debug_sub.add_parser(
         "delete",

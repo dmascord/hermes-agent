@@ -209,6 +209,29 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
                     }
                 }
             )
+        elif ptype == "input_audio":
+            audio_value = item.get("input_audio") or {}
+            if isinstance(audio_value, dict):
+                data = audio_value.get("data", "")
+                fmt = audio_value.get("format", "wav")
+                if data:
+                    mime = f"audio/{fmt}" if fmt and not fmt.startswith("audio/") else (fmt or "audio/wav")
+                    parts.append({"inlineData": {"mimeType": mime, "data": data}})
+        elif ptype == "document":
+            # Anthropic-style document block: {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"..."}}
+            # Gemini supports PDF via inlineData with mimeType application/pdf.
+            source = item.get("source") or {}
+            if isinstance(source, dict) and source.get("type") == "base64":
+                media_type = source.get("media_type", "application/pdf")
+                data = source.get("data", "")
+                if data and isinstance(data, str):
+                    parts.append({"inlineData": {"mimeType": media_type, "data": data}})
+            elif isinstance(source, dict) and source.get("type") == "url":
+                # URL-referenced document — Gemini supports fileData for GCS URIs;
+                # for plain HTTPS URLs we include a fileData part.
+                url = source.get("url", "")
+                if url:
+                    parts.append({"fileData": {"mimeType": source.get("media_type", "application/pdf"), "fileUri": url}})
     return parts
 
 

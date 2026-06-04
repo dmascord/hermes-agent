@@ -1,27 +1,229 @@
-#!/bin/sh
-# s6-overlay shim. The real logic lives in docker/stage2-hook.sh, invoked
-# by /etc/cont-init.d/01-hermes-setup (installed by the Dockerfile). This
-# file exists so external references to docker/entrypoint.sh still work,
-# but it's no longer the ENTRYPOINT — /init is.
+#!/bin/bash
+# Docker/Podman entrypoint: bootstrap config files into the mounted volume, then run hermes.
+set -e
+
+HERMES_HOME="${HERMES_HOME:-/opt/data}"
+INSTALL_DIR="/opt/hermes"
+
+# --- Privilege dropping via gosu ---
+# When started as root (the default for Docker, or fakeroot in rootless Podman),
+# optionally remap the hermes user/group to match host-side ownership, fix volume
+# permissions, then re-exec as hermes.
+if [ "$(id -u)" = "0" ]; then
+    if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "$(id -u hermes)" ]; then
+        echo "Changing hermes UID to $HERMES_UID"
+        usermod -u "$HERMES_UID" hermes
+    fi
+
+    if [ -n "$HERMES_GID" ] && [ "$HERMES_GID" != "$(id -g hermes)" ]; then
+        echo "Changing hermes GID to $HERMES_GID"
+        # -o allows non-unique GID (e.g. macOS GID 20 "staff" may already exist
+        # as "dialout" in the Debian-based container image)
+        groupmod -o -g "$HERMES_GID" hermes 2>/dev/null || true
+    fi
+
+    # Fix ownership of the data volume. When HERMES_UID remaps the hermes user,
+    # files created by previous runs (under the old UID) become inaccessible.
+    # Always chown -R when UID was remapped; otherwise only if top-level is wrong.
+    actual_hermes_uid=$(id -u hermes)
+    needs_chown=false
+    if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "10000" ]; then
+        needs_chown=true
+    elif [ "$(stat -c %u "$HERMES_HOME" 2>/dev/null)" != "$actual_hermes_uid" ]; then
+        needs_chown=true
+    fi
+    if [ "$needs_chown" = true ]; then
+        echo "Fixing ownership of $HERMES_HOME to hermes ($actual_hermes_uid)"
+        # In rootless Podman the container's "root" is mapped to an unprivileged
+        # host UID — chown will fail.  That's fine: the volume is already owned
+        # by the mapped user on the host side.
+        chown -R hermes:hermes "$HERMES_HOME" 2>/dev/null || \
+            echo "Warning: chown failed (rootless container?) — continuing anyway"
+    fi
+
+    # Ensure config.yaml is readable by the hermes runtime user even if it was
+    # edited on the host after initial ownership setup. Must run here (as root)
+    # rather than after the gosu drop, otherwise a non-root caller like
+    # `docker run -u $(id -u):$(id -g)` hits "Operation not permitted" (#15865).
+    if [ -f "$HERMES_HOME/config.yaml" ]; then
+        chown hermes:hermes "$HERMES_HOME/config.yaml" 2>/dev/null || true
+        chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
+    fi
+
+    # Restore codex credential pool entries from backup if they're missing from auth.json.
+    # After a container restart the hermes runtime's write_credential_pool()
+    # rewrites auth.json with only env-var providers, losing manual:device_code
+    # entries that were imported (e.g. via import-next-codex-account.sh or the
+    # add-hermes-codex-pool-fixed.sh helper).
+    #
+    # The backup file ($HERMES_HOME/auth.json.codex-backup) is created by a
+    # post-import step after a successful codex token import.  On every
+    # subsequent restart this block merges backed-up credential pool entries
+    # into the current auth.json, keying on label so that freshly-imported
+    # tokens are preserved (not replaced by stale backup entries).
+    #
+    # NOTE: the backup lives in the bind-mounted volume ($HERMES_HOME, i.e.
+    # /home/tusker/.hermes on tusker deployment), NOT the ephemeral Docker
+    # volume /opt/data.  It persists across container rebuilds.
+    _CODEX_BACKUP="$HERMES_HOME/auth.json.codex-backup"
+    if [ -f "$_CODEX_BACKUP" ]; then
+        python3 - << PYEOF
+import json, os, sys
+
+backup_path = os.path.join(os.environ["HERMES_HOME"], "auth.json.codex-backup")
+auth_path = os.path.join(os.environ["HERMES_HOME"], "auth.json")
+
+with open(backup_path) as f:
+    backup = json.load(f)
+with open(auth_path) as f:
+    current = json.load(f)
+
+backup_codex = backup.get("credential_pool", {}).get("openai-codex", [])
+if not backup_codex:
+    print("Backup has no codex entries to restore")
+    sys.exit(0)
+
+# Merge backup entries into the codex pool, keeping any existing entries
+# that aren't in the backup (e.g. freshly imported codex-4/5/6 from
+# import-next-codex-account.sh).  This is NOT a full replace — otherwise
+# every container restart would wipe newly imported credentials.
+current_pool = current.setdefault("credential_pool", {})
+current_pool.setdefault("openai-codex", [])
+existing_labels = {e.get("label") for e in current_pool["openai-codex"] if isinstance(e, dict)}
+added = 0
+for entry in backup_codex:
+    entry_label = str(entry.get("label") or "unknown")
+    if entry_label in existing_labels:
+        continue  # already present (possibly with fresh tokens from import)
+    # Give each entry a unique source keyed on its label so that
+    # _seed_from_singletons() -> _upsert_entry() dedup (which keys on
+    # source) doesn't collapse multiple manual:device_code entries.
+    entry["source"] = f"manual:device_code:{entry_label}"
+    current_pool["openai-codex"].append(entry)
+    added += 1
+
+# Also fix the source on any existing entries that still use the old
+# generic "manual:device_code" (since _upsert_entry dedup keys on source).
+for entry in current_pool["openai-codex"]:
+    if isinstance(entry, dict) and entry.get("source") == "manual:device_code":
+        lbl = str(entry.get("label") or "unknown")
+        entry["source"] = f"manual:device_code:{lbl}"
+        added += 1  # count as a "fix" for logging
+
+with open(auth_path, "w") as f:
+    json.dump(current, f, indent=2)
+print(f"Restored {added} codex credential entries from backup")
+PYEOF
+        # auth.json is now root-owned (written by Python above as root).
+        # chown it to hermes so the drop-privilege step doesn't break the
+        # hermes runtime's ability to read/write it.
+        chown hermes:hermes "$HERMES_HOME/auth.json" 2>/dev/null || true
+    fi
+
+    echo "Dropping root privileges"
+    exec gosu hermes "$0" "$@"
+fi
+
+# --- Running as hermes from here ---
+source "${INSTALL_DIR}/.venv/bin/activate"
+
+# Create essential directory structure.  Cache and platform directories
+# (cache/images, cache/audio, platforms/whatsapp, etc.) are created on
+# demand by the application — don't pre-create them here so new installs
+# get the consolidated layout from get_hermes_dir().
+# The "home/" subdirectory is a per-profile HOME for subprocesses (git,
+# ssh, gh, npm …).  Without it those tools write to /root which is
+# ephemeral and shared across profiles.  See issue #4426.
+mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
+
+# .env
+if [ ! -f "$HERMES_HOME/.env" ]; then
+    cp "$INSTALL_DIR/.env.example" "$HERMES_HOME/.env"
+fi
+
+# config.yaml
+if [ ! -f "$HERMES_HOME/config.yaml" ]; then
+    cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
+fi
+
+# Enable observability/langfuse plugin if credentials are configured.
+# This is idempotent — re-running only adds the entry if absent.
+if [ -n "${HERMES_LANGFUSE_PUBLIC_KEY:-}" ] && [ -n "${HERMES_LANGFUSE_SECRET_KEY:-}" ]; then
+    python3 - <<'PYEOF'
+import yaml, sys
+from pathlib import Path
+config_path = Path(f"{__import__('os').environ['HERMES_HOME']}/config.yaml")
+try:
+    data = yaml.safe_load(config_path.read_text()) or {}
+    plugins = data.setdefault("plugins", {})
+    enabled = plugins.setdefault("enabled", [])
+    if "observability/langfuse" not in enabled:
+        enabled.append("observability/langfuse")
+        config_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
+        print("[entrypoint] observability/langfuse plugin enabled", flush=True)
+except Exception as e:
+    print(f"[entrypoint] warning: could not enable langfuse plugin: {e}", file=sys.stderr, flush=True)
+PYEOF
+fi
+
+# SOUL.md
+if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
+    cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
+fi
+
+# Sync bundled skills (manifest-based so user edits are preserved)
+if [ -d "$INSTALL_DIR/skills" ]; then
+    python3 "$INSTALL_DIR/tools/skills_sync.py"
+fi
+
+# Optionally start `hermes dashboard` as a side-process.
 #
-# When called directly (e.g. by an old wrapper script that hard-coded
-# docker/entrypoint.sh as the container ENTRYPOINT, or by an external
-# orchestration script that invokes it inside the container), forward to
-# the stage2 hook for parity with the pre-s6 entrypoint behavior. The
-# stage2 hook only handles cont-init bootstrap (UID remap, chown, config
-# seed, skills sync); it does NOT exec the CMD. Callers that depended
-# on the pre-s6 contract "entrypoint.sh sets up state then execs hermes"
-# will see the bootstrap happen but the CMD will not run from this shim.
+# Toggled by HERMES_DASHBOARD=1 (also accepts "true"/"yes", case-insensitive).
+# Host/port/TUI can be overridden via:
+#   HERMES_DASHBOARD_HOST  (default 0.0.0.0 — exposed outside the container)
+#   HERMES_DASHBOARD_PORT  (default 9119, matches `hermes dashboard` default)
+#   HERMES_DASHBOARD_TUI   (already honored by `hermes dashboard` itself)
 #
-# Deprecation: this shim is preserved for one release cycle to give
-# downstream users time to migrate their wrappers to the image's real
-# ENTRYPOINT (`/init`). It will be removed in a future major release.
-# Surface a warning to stderr so anyone still invoking this path
-# sees the migration notice in their logs.
-echo "[hermes] WARNING: docker/entrypoint.sh is a deprecated shim under " \
-    "s6-overlay. The container's real ENTRYPOINT is /init + " \
-    "main-wrapper.sh; this script only runs the stage2 cont-init hook " \
-    "and does NOT exec the CMD. If you hard-coded docker/entrypoint.sh " \
-    "as your ENTRYPOINT, drop the override — docker will use the image's " \
-    "default ENTRYPOINT (/init), which handles bootstrap AND CMD." >&2
-exec /opt/hermes/docker/stage2-hook.sh "$@"
+# The dashboard is a long-lived server.  We background it *before* the final
+# `exec hermes "$@"` so the user's chosen foreground command (chat, gateway,
+# sleep infinity, …) remains PID-of-interest for the container runtime.  When
+# the container stops the whole process tree is torn down, so no explicit
+# cleanup is needed.
+case "${HERMES_DASHBOARD:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        dash_host="${HERMES_DASHBOARD_HOST:-0.0.0.0}"
+        dash_port="${HERMES_DASHBOARD_PORT:-9119}"
+        dash_args=(--host "$dash_host" --port "$dash_port" --no-open)
+        # Binding to anything other than localhost requires --insecure — the
+        # dashboard refuses otherwise because it exposes API keys.  Inside a
+        # container this is the expected deployment (host reaches it via
+        # published port), so opt in automatically.
+        if [ "$dash_host" != "127.0.0.1" ] && [ "$dash_host" != "localhost" ]; then
+            dash_args+=(--insecure)
+        fi
+        echo "Starting hermes dashboard on ${dash_host}:${dash_port} (background)"
+        # Prefix dashboard output so it's distinguishable from the main
+        # process in `docker logs`.  stdbuf keeps the pipe line-buffered.
+        (
+            stdbuf -oL -eL hermes dashboard "${dash_args[@]}" 2>&1 \
+                | sed -u 's/^/[dashboard] /'
+        ) &
+        ;;
+esac
+
+# Final exec: two supported invocation patterns.
+#
+#   docker run <image>                 -> exec `hermes` with no args (legacy default)
+#   docker run <image> chat -q "..."   -> exec `hermes chat -q "..."` (legacy wrap)
+#   docker run <image> sleep infinity  -> exec `sleep infinity` directly
+#   docker run <image> bash            -> exec `bash` directly
+#
+# If the first positional arg resolves to an executable on PATH, we assume the
+# caller wants to run it directly (needed by the launcher which runs long-lived
+# `sleep infinity` sandbox containers — see tools/environments/docker.py).
+# Otherwise we treat the args as a hermes subcommand and wrap with `hermes`,
+# preserving the documented `docker run <image> <subcommand>` behavior.
+if [ $# -gt 0 ] && command -v "$1" >/dev/null 2>&1; then
+    exec "$@"
+fi
+exec hermes "$@"

@@ -124,6 +124,11 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> Lis
             if isinstance(detail, str) and detail.strip():
                 image_part["detail"] = detail.strip()
             converted.append(image_part)
+            continue
+        if ptype == "input_audio":
+            audio_value = part.get("input_audio")
+            if isinstance(audio_value, dict) and audio_value:
+                converted.append({"type": "input_audio", "input_audio": dict(audio_value)})
     return converted
 
 
@@ -740,9 +745,22 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                         if isinstance(detail, str) and detail.strip():
                             image_part["detail"] = detail.strip()
                         validated.append(image_part)
+                    elif ptype == "input_audio":
+                        # Responses API accepts input_audio in user messages.
+                        # Shape: {"type":"input_audio","input_audio":{"data":"...","format":"wav"}}
+                        # Pass through as-is — already in the correct format from
+                        # _chat_content_to_responses_parts.
+                        audio_val = part.get("input_audio")
+                        if isinstance(audio_val, dict) and audio_val:
+                            validated.append({"type": "input_audio", "input_audio": dict(audio_val)})
                     else:
-                        raise ValueError(
-                            f"Codex Responses input[{idx}].content[{part_idx}] has unsupported type {part.get('type')!r}."
+                        # Unknown content type — log and skip rather than crash.
+                        # Callers strip Anthropic-specific blocks (document) before
+                        # reaching here; anything else is unexpected but non-fatal.
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            "Codex Responses input[%d].content[%d] skipping unsupported type %r",
+                            idx, part_idx, part.get("type"),
                         )
                 normalized.append({"role": role, "content": validated})
                 continue

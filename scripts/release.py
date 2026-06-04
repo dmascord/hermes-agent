@@ -202,6 +202,7 @@ AUTHOR_MAP = {
     "zhanganzhe@tenclass.com": "luoyuctl",
     "51604064+luoyuctl@users.noreply.github.com": "luoyuctl",
     "127238744+teknium1@users.noreply.github.com": "teknium1",
+    "aludwin+gh@gmail.com": "adamludwin",
     "tolle.lege+github@gmail.com": "InB4DevOps",
     "73686890+InB4DevOps@users.noreply.github.com": "InB4DevOps",
     "147827411+EloquentBrush@users.noreply.github.com": "AhmetArif0",
@@ -404,10 +405,7 @@ AUTHOR_MAP = {
     "nbot@liizfq.top": "liizfq",
     "274096618+hermes-agent-dhabibi@users.noreply.github.com": "dhabibi",
     "dejie.guo@gmail.com": "JayGwod",
-    "133716830+0xKingBack@users.noreply.github.com": "0xKingBack",
-    "daixin1204@gmail.com": "SimbaKingjoe",
     "maxence@groine.fr": "MaxyMoos",
-    "61830395+leprincep35700@users.noreply.github.com": "leprincep35700",
     # OpenViking viking_read salvage (April 2026)
     "hitesh@gmail.com": "htsh",
     "pty819@outlook.com": "pty819",
@@ -431,20 +429,12 @@ AUTHOR_MAP = {
     "thomasjhon6666@gmail.com": "ThomassJonax",
     "focusflow.app.help@gmail.com": "yes999zc",
     "rob@atlas.lan": "rmoen",
-    # Slack ephemeral slash-ack salvage (May 2026)
-    "probepark@users.noreply.github.com": "probepark",
-    # Slack batch salvage (May 2026)
-    "280484231+prive-fe-bot@users.noreply.github.com": "priveperfumes",
-    "amr@ghanem.sa": "amroessam",
-    "paperlantern.agent@gmail.com": "Hinotoi-agent",
-    "valda@underscore.jp": "valda",
     "162235745+0z1-ghb@users.noreply.github.com": "0z1-ghb",
     "yes999zc@163.com": "yes999zc",
     "343873859@qq.com": "DrStrangerUJN",
     "252818347@qq.com": "hejuntt1014",
     "uzmpsk.dilekakbas@gmail.com": "dlkakbs",
     "beliefanx@gmail.com": "BeliefanX",
-    "changchun989@proton.me": "changchun989",
     "jefferson@heimdallstrategy.com": "Mind-Dragon",
     "44753291+Nanako0129@users.noreply.github.com": "Nanako0129",
     "steve.westerhouse@origami-analytics.com": "westers",
@@ -707,8 +697,6 @@ AUTHOR_MAP = {
     "bennet.yr.wang@gmail.com": "BennetYrWang",
     "greer.guthrie@gmail.com": "g-guthrie",
     "kennyx102@gmail.com": "bobashopcashier",
-    "77253505+bobashopcashier@users.noreply.github.com": "bobashopcashier",
-    "25355950+megastary@users.noreply.github.com": "megastary",  # PR #18325
     "shokatalishaikh95@gmail.com": "areu01or00",
     "bryan@intertwinesys.com": "bryanyoung",
     "christo.mitov@gmail.com": "christomitov",
@@ -837,7 +825,6 @@ AUTHOR_MAP = {
     "centripetal-star@users.noreply.github.com": "centripetal-star",
     "LeonSGP43@users.noreply.github.com": "LeonSGP43",
     "154585401+LeonSGP43@users.noreply.github.com": "LeonSGP43",
-    "cine.dreamer.one@gmail.com": "LeonSGP43",
     "Lubrsy706@users.noreply.github.com": "Lubrsy706",
     "niyant@spicefi.xyz": "spniyant",
     "olafthiele@gmail.com": "olafthiele",
@@ -887,11 +874,6 @@ AUTHOR_MAP = {
     "michel.belleau@malaiwah.com": "malaiwah",
     "gnanasekaran.sekareee@gmail.com": "gnanam1990",
     "jz.pentest@gmail.com": "0xyg3n",
-    "7093928+0xyg3n@users.noreply.github.com": "0xyg3n",
-    "nftpoetrist@gmail.com": "nftpoetrist",  # PR #18982
-    "millerc79@users.noreply.github.com": "millerc79",  # PR #19033
-    "hermes@example.com": "shellybotmoyer",  # PR #18915 (bot-committed)
-    "exx@example.com": "exxmen",  # PR #19555
     "hypnosis.mda@gmail.com": "Hypn0sis",
     "ywt000818@gmail.com": "OwenYWT",
     "dhandhalyabhavik@gmail.com": "v1k22",

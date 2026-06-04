@@ -64,6 +64,46 @@ def validate_copilot_token(token: str) -> tuple[bool, str]:
     return True, "OK"
 
 
+# ─── Cached Copilot Token Resolution ──────────────────────────────────────
+# The `gh auth token` subprocess is expensive and the result is stable for
+# the lifetime of a `gh` session.  Cache the resolved raw token in memory
+# and only re-resolve when the exchanged Copilot API token expires.
+_cached_copilot_raw_token: str = ""
+_cached_copilot_raw_source: str = ""
+
+
+def resolve_and_cache_copilot_token(
+    *, base_url: str | None = None
+) -> tuple[str, str]:
+    """Return ``(exchanged_api_token, source)`` with in-process caching.
+
+    On the first call, runs ``resolve_copilot_token()`` (which may spawn
+    ``gh auth token``) and exchanges the result for a short-lived Copilot
+    API token via ``get_copilot_api_token()``.  Subsequent calls reuse the
+    cached exchanged token while it remains valid (``_jwt_cache`` inside
+    ``exchange_copilot_token()`` handles expiry and refresh automatically).
+
+    Only re-runs ``gh auth token`` when the cached raw token fails to
+    exchange — this avoids the ~200ms subprocess on every pool load.
+    """
+    global _cached_copilot_raw_token, _cached_copilot_raw_source
+
+    if _cached_copilot_raw_token:
+        # Try the cached raw token first — exchange_copilot_token has its
+        # own _jwt_cache with refresh-margin expiry checking, so this is
+        # cheap when the token is still valid.
+        api_token = get_copilot_api_token(_cached_copilot_raw_token, base_url=base_url)
+        # get_copilot_api_token returns the raw token unchanged on failure.
+        if api_token and api_token != _cached_copilot_raw_token:
+            return api_token, _cached_copilot_raw_source
+        # Exchange failed — raw token may be stale (e.g. revoked or
+        # re-authenticated via `gh auth login`).  Fall through to re-resolve.
+
+    _cached_copilot_raw_token, _cached_copilot_raw_source = resolve_copilot_token()
+    api_token = get_copilot_api_token(_cached_copilot_raw_token, base_url=base_url)
+    return api_token, _cached_copilot_raw_source
+
+
 def resolve_copilot_token() -> tuple[str, str]:
     """Resolve a GitHub token suitable for Copilot API use.
 
@@ -288,13 +328,40 @@ _EDITOR_VERSION = "vscode/1.104.1"
 _EXCHANGE_USER_AGENT = "GitHubCopilotChat/0.26.7"
 
 
+def _derive_enterprise_exchange_url(base_url: str | None) -> str | None:
+    """Derive a GHE token-exchange URL from a Copilot Enterprise base URL."""
+    b = str(base_url or "").strip().rstrip("/")
+    if not b:
+        return None
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(b)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return None
+        if host.startswith("copilot-api."):
+            host = "api." + host[len("copilot-api."):]
+        if host in {"api.githubcopilot.com", "api.github.com"}:
+            return None
+        if host.endswith(".ghe.com") or host.startswith("api."):
+            return f"https://{host}/copilot_internal/v2/token"
+    except Exception:
+        return None
+    return None
+
+
 def _token_fingerprint(raw_token: str) -> str:
     """Short fingerprint of a raw token for cache keying (avoids storing full token)."""
     import hashlib
     return hashlib.sha256(raw_token.encode()).hexdigest()[:16]
 
 
-def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[str, float]:
+def exchange_copilot_token(
+    raw_token: str,
+    *,
+    timeout: float = 10.0,
+    base_url: str | None = None,
+) -> tuple[str, float]:
     """Exchange a raw GitHub token for a short-lived Copilot API token.
 
     Calls ``GET https://api.github.com/copilot_internal/v2/token`` with
@@ -308,7 +375,12 @@ def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[st
     """
     import urllib.request
 
-    fp = _token_fingerprint(raw_token)
+    enterprise_exchange = _derive_enterprise_exchange_url(base_url)
+    exchange_candidates: list[str] = [_TOKEN_EXCHANGE_URL]
+    if enterprise_exchange and enterprise_exchange not in exchange_candidates:
+        exchange_candidates.append(enterprise_exchange)
+
+    fp = _token_fingerprint(raw_token + "|" + (enterprise_exchange or "public"))
 
     # Check cache first
     cached = _jwt_cache.get(fp)
@@ -317,40 +389,43 @@ def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[st
         if time.time() < expires_at - _JWT_REFRESH_MARGIN_SECONDS:
             return api_token, expires_at
 
-    req = urllib.request.Request(
-        _TOKEN_EXCHANGE_URL,
-        method="GET",
-        headers={
-            "Authorization": f"token {raw_token}",
-            "User-Agent": _EXCHANGE_USER_AGENT,
-            "Accept": "application/json",
-            "Editor-Version": _EDITOR_VERSION,
-        },
-    )
+    last_exc: Exception | None = None
+    for exchange_url in exchange_candidates:
+        req = urllib.request.Request(
+            exchange_url,
+            method="GET",
+            headers={
+                "Authorization": f"token {raw_token}",
+                "User-Agent": _EXCHANGE_USER_AGENT,
+                "Accept": "application/json",
+                "Editor-Version": _EDITOR_VERSION,
+            },
+        )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as exc:
-        raise ValueError(f"Copilot token exchange failed: {exc}") from exc
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
 
-    api_token = data.get("token", "")
-    expires_at = data.get("expires_at", 0)
-    if not api_token:
-        raise ValueError("Copilot token exchange returned empty token")
+            api_token = data.get("token", "")
+            expires_at = data.get("expires_at", 0)
+            if not api_token:
+                raise ValueError("Copilot token exchange returned empty token")
 
-    # Convert expires_at to float if needed
-    expires_at = float(expires_at) if expires_at else time.time() + 1800
+            # Convert expires_at to float if needed
+            expires_at = float(expires_at) if expires_at else time.time() + 1800
 
-    _jwt_cache[fp] = (api_token, expires_at)
-    logger.debug(
-        "Copilot token exchanged, expires_at=%s",
-        expires_at,
-    )
-    return api_token, expires_at
+            _jwt_cache[fp] = (api_token, expires_at)
+            logger.debug("Copilot token exchanged via %s, expires_at=%s", exchange_url, expires_at)
+            return api_token, expires_at
+        except Exception as exc:
+            last_exc = exc
+            logger.debug("Copilot token exchange failed via %s: %s", exchange_url, exc)
+            continue
+
+    raise ValueError(f"Copilot token exchange failed: {last_exc}")
 
 
-def get_copilot_api_token(raw_token: str) -> str:
+def get_copilot_api_token(raw_token: str, *, base_url: str | None = None) -> str:
     """Exchange a raw GitHub token for a Copilot API token, with fallback.
 
     Convenience wrapper: returns the exchanged token on success, or the
@@ -361,7 +436,7 @@ def get_copilot_api_token(raw_token: str) -> str:
     if not raw_token:
         return raw_token
     try:
-        api_token, _ = exchange_copilot_token(raw_token)
+        api_token, _ = exchange_copilot_token(raw_token, base_url=base_url)
         return api_token
     except Exception as exc:
         logger.debug("Copilot token exchange failed, using raw token: %s", exc)
@@ -374,15 +449,21 @@ def copilot_request_headers(
     *,
     is_agent_turn: bool = True,
     is_vision: bool = False,
+    base_url: str | None = None,
 ) -> dict[str, str]:
     """Build the standard headers for Copilot API requests.
 
     Replicates the header set used by opencode and the Copilot CLI.
     """
+    normalized_base = str(base_url or "").strip().rstrip("/").lower()
+    default_integration_id = "vscode-chat"
+    if "copilot-api." in normalized_base or normalized_base.startswith("https://api.sita.ghe.com"):
+        default_integration_id = "copilot-developer-cli"
+
     headers: dict[str, str] = {
         "Editor-Version": "vscode/1.104.1",
         "User-Agent": "HermesAgent/1.0",
-        "Copilot-Integration-Id": "vscode-chat",
+        "Copilot-Integration-Id": os.getenv("GITHUB_COPILOT_INTEGRATION_ID", default_integration_id),
         "Openai-Intent": "conversation-edits",
         "x-initiator": "agent" if is_agent_turn else "user",
     }

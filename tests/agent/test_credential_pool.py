@@ -2720,6 +2720,373 @@ def test_codex_exhausted_entry_stays_stuck_without_auth_store_update(tmp_path, m
     available = pool._available_entries(clear_expired=True, refresh=False)
     assert available == []
 
+# ── Slow-response penalty tests ─────────────────────────────────────
+
+def test_mark_slow_response_rotates_to_next_credential(tmp_path, monkeypatch):
+    """When api_duration exceeds the threshold, the current credential is
+    penalised and the pool rotates to the next available entry."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-fast",
+                        "label": "fast-key",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-fast",
+                    },
+                    {
+                        "id": "cred-slow",
+                        "label": "slow-key",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-slow",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool, STATUS_SLOW_RESPONSE
+
+    pool = load_pool("anthropic")
+    first = pool.select()
+    assert first is not None
+    assert first.id == "cred-fast"
+
+    # A 45-second call exceeds the default 30-second threshold
+    next_entry = pool.mark_slow_response(api_duration=45.0)
+    assert next_entry is not None
+    assert next_entry.id == "cred-slow"
+
+    # The penalised entry should be marked slow_response
+    fast_entry = [e for e in pool.entries() if e.id == "cred-fast"][0]
+    assert fast_entry.last_status == STATUS_SLOW_RESPONSE
+    assert fast_entry.slow_response_duration == 45.0
+    assert fast_entry.slow_response_count == 1
+
+
+def test_mark_slow_response_below_threshold_is_noop(tmp_path, monkeypatch):
+    """When api_duration is below the threshold, no penalty is applied."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-1",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    first = pool.select()
+    assert first is not None
+
+    # A 10-second call is well below the 30-second threshold
+    result = pool.mark_slow_response(api_duration=10.0)
+    # Should return the same credential — no rotation
+    assert result is not None
+    assert result.id == first.id
+
+
+def test_slow_response_cooldown_skips_entry(tmp_path, monkeypatch):
+    """A slow_response entry is skipped by select() until cooldown elapses."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-1",
+                        "last_status": "slow_response",
+                        "last_status_at": time.time(),
+                        "slow_response_at": time.time(),
+                        "slow_response_duration": 55.0,
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    selected = pool.select()
+    # Should skip the penalised cred-1 and pick cred-2
+    assert selected is not None
+    assert selected.id == "cred-2"
+
+
+def test_slow_response_clears_after_cooldown(tmp_path, monkeypatch):
+    """After cooldown elapses, the slow_response entry becomes available again."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    # Set slow_response_at far enough in the past that cooldown has expired
+    old_time = time.time() - 7200  # 2 hours ago
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-1",
+                        "last_status": "slow_response",
+                        "last_status_at": old_time,
+                        "slow_response_at": old_time,
+                        "slow_response_duration": 55.0,
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    selected = pool.select()
+    # Cooldown expired — cred-1 should be available again
+    assert selected is not None
+    assert selected.id == "cred-1"
+
+
+def test_all_slow_response_returns_none(tmp_path, monkeypatch):
+    """When all credentials are in slow_response cooldown, select() returns None."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    now = time.time()
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-1",
+                        "last_status": "slow_response",
+                        "last_status_at": now,
+                        "slow_response_at": now,
+                        "slow_response_duration": 60.0,
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-2",
+                        "last_status": "slow_response",
+                        "last_status_at": now,
+                        "slow_response_at": now,
+                        "slow_response_duration": 45.0,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    selected = pool.select()
+    # Both in cooldown — should return None
+    assert selected is None
+
+
+def test_clear_slow_response_removes_penalty(tmp_path, monkeypatch):
+    """clear_slow_response() clears the penalty so entries become available."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    now = time.time()
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-1",
+                        "last_status": "slow_response",
+                        "last_status_at": now,
+                        "slow_response_at": now,
+                        "slow_response_duration": 60.0,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool, STATUS_OK
+
+    pool = load_pool("anthropic")
+    # Entry is penalised — select should return None
+    assert pool.select() is None
+
+    # Clear the penalty
+    pool.clear_slow_response()
+
+    # Now it should be available
+    entry = pool.select()
+    assert entry is not None
+    assert entry.id == "cred-1"
+    assert entry.last_status == STATUS_OK
+
+
+def test_slow_response_count_increments(tmp_path, monkeypatch):
+    """Repeated slow-response calls increment slow_response_count."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-1",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool, SLOW_RESPONSE_COOLDOWN_SECONDS
+
+    pool = load_pool("anthropic")
+    pool.select()  # cred-1
+
+    next_entry = pool.mark_slow_response(api_duration=45.0)
+    assert next_entry is not None
+    assert next_entry.id == "cred-2"
+
+    cred1 = [e for e in pool.entries() if e.id == "cred-1"][0]
+    assert cred1.slow_response_count == 1
+
+    # Clear penalty manually to allow re-selection
+    pool.clear_slow_response()
+
+    # Select cred-1 again
+    pool.select()
+    pool.mark_slow_response(api_duration=50.0)
+
+    cred1 = [e for e in pool.entries() if e.id == "cred-1"][0]
+    assert cred1.slow_response_count == 2
+    assert cred1.slow_response_duration == 50.0
+
+
+def test_reset_statuses_clears_slow_response_fields(tmp_path, monkeypatch):
+    """reset_statuses() also clears slow_response fields."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    now = time.time()
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-1",
+                        "last_status": "slow_response",
+                        "last_status_at": now,
+                        "slow_response_at": now,
+                        "slow_response_duration": 45.0,
+                        "slow_response_count": 3,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    count = pool.reset_statuses()
+    assert count == 1
+
+    entry = pool.entries()[0]
+    assert entry.last_status is None
+    assert entry.slow_response_at is None
+    assert entry.slow_response_duration is None
+    # slow_response_count is NOT reset — it's a lifetime counter
+    assert entry.slow_response_count == 3
 
 # ---------------------------------------------------------------------------
 # xAI OAuth terminal error quarantine

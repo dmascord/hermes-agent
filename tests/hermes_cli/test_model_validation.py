@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 from hermes_cli.models import (
+    _copilot_catalog_cache,
     azure_foundry_model_api_mode,
     copilot_model_api_mode,
     fetch_github_model_catalog,
@@ -283,6 +284,7 @@ class TestFetchApiModels:
             def read(self):
                 return b'{"data": [{"id": "gpt-5.4", "model_picker_enabled": true, "supported_endpoints": ["/responses"], "capabilities": {"type": "chat", "supports": {"reasoning_effort": ["low", "medium", "high"]}}}, {"id": "text-embedding-3-small", "model_picker_enabled": true, "capabilities": {"type": "embedding"}}]}'
 
+        _copilot_catalog_cache.clear()
         with patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
             catalog = fetch_github_model_catalog("gh-token")
 
@@ -334,13 +336,22 @@ class TestCopilotNormalization:
         assert copilot_model_api_mode("gpt-5-mini") == "chat_completions"
 
     def test_copilot_api_mode_non_gpt5_uses_chat(self):
-        """Non-GPT-5 models use Chat Completions."""
+        """Non-GPT-5 models default to Chat Completions without catalog hints."""
         assert copilot_model_api_mode("gpt-4.1") == "chat_completions"
         assert copilot_model_api_mode("gpt-4o") == "chat_completions"
         assert copilot_model_api_mode("gpt-4o-mini") == "chat_completions"
         assert copilot_model_api_mode("claude-sonnet-4.6") == "chat_completions"
         assert copilot_model_api_mode("claude-opus-4.6") == "chat_completions"
         assert copilot_model_api_mode("gemini-2.5-pro") == "chat_completions"
+
+    def test_copilot_api_mode_claude_prefers_messages_when_catalog_lists_it(self):
+        catalog = [{
+            "id": "claude-sonnet-4.6",
+            "supported_endpoints": ["/chat/completions", "/v1/messages"],
+            "capabilities": {"type": "chat"},
+        }]
+        assert copilot_model_api_mode("claude-sonnet-4.6", catalog=catalog) == "anthropic_messages"
+        assert copilot_model_api_mode("github-copilot-enterprise/claude-sonnet-4.6", catalog=catalog) == "anthropic_messages"
 
     def test_copilot_api_mode_with_catalog_both_endpoints(self):
         """When catalog shows both endpoints, model ID pattern wins."""

@@ -1,0 +1,33 @@
+# code-overlay — Fast-iteration overlay image for hermes-swarm
+#
+# Builds a small layer on top of hermes-agent-runtime-base:latest (which
+# already has all system/npm/pip/Playwright deps installed).  Only the
+# Python/app source is replaced, so rebuilds are fast.
+#
+# Usage:
+#   docker build -f Dockerfile.base -t hermes-agent-runtime-base:latest .
+#   docker build -f Dockerfile.code-overlay -t hermes-agent:latest .
+#
+FROM hermes-agent-runtime-base:latest
+
+WORKDIR /opt/hermes
+
+# Copy source code (replaces previous overlay layers)
+COPY --chown=hermes:hermes . .
+
+# Rebuild web dashboard + TUI assets (output changes with code changes)
+RUN cd web && npm run build && \
+    cd ../ui-tui && npm run build
+
+# Ensure install dir is world-readable
+RUN chmod -R a+rX /opt/hermes
+
+# Reinstall Python package (picks up new/changed deps if any)
+RUN uv pip install --python /opt/hermes/.venv/bin/python -e ".[all]"
+
+# ── Runtime config (mirrors the main Dockerfile) ──────────────────────
+ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
+ENV HERMES_HOME=/opt/data
+ENV PATH="/opt/data/.local/bin:${PATH}"
+VOLUME [ "/opt/data" ]
+ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]

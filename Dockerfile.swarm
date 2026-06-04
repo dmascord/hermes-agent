@@ -1,0 +1,107 @@
+# syntax=docker/dockerfile:1
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dockerfile.swarm — Lean Alpine-based image for hermes-swarm (gateway-only)
+# ═══════════════════════════════════════════════════════════════════════════════
+# This image is optimised for running the Hermes gateway/API server in the
+# swarm deployment.  It deliberately excludes:
+#   • Web dashboard build  (React/Vite SPA — not used by gateway)
+#   • TUI build            (Ink terminal UI — not used by gateway)
+#   • Playwright browsers  (Chromium baked by agent-browser on first use)
+#   • Debian base image    (replaced with Alpine for ~60% base-size reduction)
+#
+# Build command (from repo root):
+#   docker build -f Dockerfile.swarm -t hermes-agent:swarm .
+#
+# BuildKit automatically uses Dockerfile.swarm.dockerignore (same-name suffix
+# convention) so tests/, website/, and docs/ are excluded from the context.
+#
+# Expected size: ~1.0–1.3 GB (vs 5.4 GB Debian image).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FROM tianon/gosu:1.19 AS gosu_source
+FROM python:3.13-alpine
+
+ENV PYTHONUNBUFFERED=1
+
+# ── System runtime packages ─────────────────────────────────────────────────
+# bash          – entrypoint is a bash script
+# coreutils     – GNU stdbuf (used by entrypoint for line-buffered pipes)
+# shadow        – usermod / groupmod (entrypoint remaps UID/GID at runtime)
+# tini          – zombie-reaping init (same role as in Debian image)
+# git           – tool subprocesses need git
+# openssh-client – tool subprocesses need ssh
+# ripgrep       – used by ripgrep tool
+# nodejs + npm  – agent-browser and camofox are Node.js packages
+# ffmpeg        – audio format conversion (tts_tool, transcription_tools)
+RUN apk add --no-cache \
+    bash coreutils shadow tini \
+    git openssh-client ripgrep \
+    nodejs npm ffmpeg
+
+# Install uv via pip (simpler than extracting from distroless image; uvx is included)
+RUN pip install --no-cache-dir uv
+
+# Copy gosu static binary (Go binary, works on musl and glibc)
+COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
+
+# Create hermes user (matches Debian image: UID 10000, home /opt/data)
+RUN addgroup -g 10000 hermes 2>/dev/null || true && \
+    adduser -D -u 10000 -G hermes -h /opt/data hermes && \
+    mkdir -p /opt/data && chown hermes:hermes /opt/data
+
+WORKDIR /opt/hermes
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Layer 1 — Python dependencies (cached unless pyproject.toml / uv.lock change)
+# ═══════════════════════════════════════════════════════════════════════════════
+COPY --chown=hermes:hermes pyproject.toml uv.lock* ./
+
+# Build deps are installed, deps resolved, then build deps removed in ONE layer
+# so no compiler/toolchain bloat leaks into the final image.
+RUN apk add --no-cache --virtual .build-deps \
+    gcc musl-dev linux-headers libffi-dev openssl-dev cargo && \
+    mkdir -p hermes_cli && touch hermes_cli/__init__.py && \
+    uv venv && \
+    uv sync --frozen --no-install-project --no-cache && \
+    apk del .build-deps
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Layer 2 — Source code (cached unless source files change)
+# ═══════════════════════════════════════════════════════════════════════════════
+COPY --chown=hermes:hermes . .
+
+# Install the project itself (editable .pth pointer only; deps already present)
+RUN uv sync --frozen --no-cache
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Layer 3 — Node.js dependencies (root package.json only)
+# ═══════════════════════════════════════════════════════════════════════════════
+# We deliberately SKIP:
+#   • web/package.json  – React dashboard SPA (not used by gateway)
+#   • ui-tui/package.json – Ink TUI (not used by gateway)
+#   • playwright install  – agent-browser downloads Chromium lazily on first use
+#
+# Only the root manifest is needed so that tools/browser_tool.py can resolve
+# agent-browser and @askjo/camofox-browser from node_modules/.bin/ .
+RUN npm install --prefer-offline --no-audit --no-fund && \
+    npm cache clean --force && \
+    rm -rf /root/.cache/camoufox /tmp/camoufox-*
+
+# NOTE: No chmod -R layer here.  The Debian image wastes 1.17 GB because it does:
+#     RUN chmod -R a+rX /opt/hermes
+# which forces overlayfs to copy-up every single inode.
+#
+# In this image files are world-readable by default (root umask 022), so the
+# remapped hermes user can read the install tree without a separate chmod.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Runtime
+# ═══════════════════════════════════════════════════════════════════════════════
+ENV HERMES_HOME=/opt/data
+ENV PATH="/opt/data/.local/bin:/opt/hermes/.venv/bin:${PATH}"
+VOLUME ["/opt/data"]
+
+# Start as root so the entrypoint can usermod/groupmod + gosu drop.
+# (Same pattern as the Debian Dockerfile.)
+USER root
+ENTRYPOINT ["/sbin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh"]

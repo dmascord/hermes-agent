@@ -1,0 +1,33 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dockerfile.swarm.dockerignore — Build context exclusions for the swarm image
+# ═══════════════════════════════════════════════════════════════════════════════
+# BuildKit automatically uses this file when building Dockerfile.swarm
+# (naming convention: <dockerfile>.dockerignore)
+
+# Include all exclusions from the base .dockerignore
+.git
+.gitignore
+.gitmodules
+node_modules
+**/.venv
+.env
+*.md
+
+# Exclude test suite (not needed at runtime)
+tests/
+
+# Exclude documentation and website (not needed at runtime)
+website/
+docs/
+
+# Exclude CI/CD
+.github/
+
+# Exclude built artifacts that are regenerated
+ui-tui/dist/
+ui-tui/packages/hermes-ink/dist/
+
+# Exclude runtime data directories
+data/
+hermes-config/
+runtime/

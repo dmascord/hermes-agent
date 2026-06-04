@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -13,11 +14,13 @@ from hermes_cli import auth as auth_mod
 from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
 from hermes_cli.auth import (
     AuthError,
+    CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     DEFAULT_CODEX_BASE_URL,
     DEFAULT_QWEN_BASE_URL,
     DEFAULT_XAI_OAUTH_BASE_URL,
     PROVIDER_REGISTRY,
     _agent_key_is_usable,
+    _codex_access_token_is_expiring,
     format_auth_error,
     resolve_provider,
     resolve_nous_runtime_credentials,
@@ -333,6 +336,9 @@ def _resolve_runtime_from_pool_entry(
         if cfg_provider == "anthropic":
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
+    elif provider == "synthetic-anthropic":
+        api_mode = "anthropic_messages"
+        base_url = base_url or "https://api.synthetic.new/anthropic/v1"
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
     elif provider == "xai":
@@ -1306,6 +1312,8 @@ def resolve_runtime_provider(
         pool = load_pool(provider) if should_use_pool else None
     except Exception:
         pool = None
+    entry = None  # Defensive initialization
+    pool_api_key = ""  # Defensive initialization
     if pool and pool.has_credentials():
         entry = pool.select()
         pool_api_key = ""
@@ -1330,7 +1338,63 @@ def resolve_runtime_provider(
             if not _agent_key_is_usable(nous_state, min_ttl):
                 logger.debug("Nous pool entry agent_key expired/missing, falling through to runtime resolution")
                 pool_api_key = ""
-        if entry is not None and pool_api_key:
+
+    # For Codex pool entries, each entry carries its own refresh_token.
+    # If the entry's access_token is expired, refresh it using that entry's
+    # refresh_token so the pool can rotate through damien-02, dmascord, and
+    # damien-01 independently (each with their own refresh token).
+    if provider == "openai-codex" and entry is not None and pool_api_key:
+        entry_rt = getattr(entry, "refresh_token", None)
+        if entry_rt:
+            try:
+                from hermes_cli.auth import (
+                    _codex_access_token_is_expiring,
+                    refresh_codex_oauth_pure,
+                )
+                if _codex_access_token_is_expiring(pool_api_key, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS):
+                    refreshed = refresh_codex_oauth_pure(
+                        str(pool_api_key or ""),
+                        str(entry_rt),
+                        timeout_seconds=float(os.getenv("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", "20")),
+                    )
+                    pool_api_key = refreshed["access_token"]
+                    # Persist the refreshed token ONLY to the pool entry on disk.
+                    # We intentionally do NOT call _save_codex_tokens (which would
+                    # overwrite providers["openai-codex"]) — each pool entry manages
+                    # its own refresh token independently so rotation works correctly.
+                    try:
+                        from hermes_cli.auth import write_credential_pool
+                        from dataclasses import replace as _replace
+                        updated_dict = {
+                            "access_token": refreshed["access_token"],
+                            "refresh_token": refreshed.get("refresh_token", entry_rt),
+                            "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        }
+                        for _f in ("id", "label", "auth_type", "priority", "source",
+                                   "base_url", "expires_at", "last_status",
+                                   "last_status_at", "last_error_code", "last_error_reason",
+                                   "last_error_message", "last_error_reset_at",
+                                   "request_count"):
+                            _v = getattr(entry, _f, None)
+                            if _v is not None and _f not in updated_dict:
+                                updated_dict[_f] = _v
+                        updated_entries = []
+                        for _e in pool._entries:
+                            if _e is entry:
+                                updated_entries.append(_replace(entry, **updated_dict).to_dict())
+                            else:
+                                updated_entries.append(_e.to_dict())
+                        write_credential_pool(provider, updated_entries)
+                        for _i, _e in enumerate(pool._entries):
+                            if _e is entry:
+                                pool._entries[_i] = _replace(entry, **updated_dict)
+                                break
+                    except Exception:
+                        pass  # Non-critical if persistence fails
+            except Exception:
+                pass  # Fall through with existing pool_api_key; pool will mark entry exhausted on error
+
+    if entry is not None and pool_api_key:
             return _resolve_runtime_from_pool_entry(
                 provider=provider,
                 entry=entry,
@@ -1375,12 +1439,15 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
         except AuthError:
-            if requested_provider != "auto":
+            # Codex credentials are stale/unavailable.  When the user explicitly
+            # configured HERMES_INFERENCE_PROVIDER=openai-codex we raise so they
+            # know re-auth is needed.  When openai-codex was selected as the
+            # default (requested_provider was None → resolved to "openai-codex"
+            # by resolve_requested_provider), fall through to env-var providers
+            # so other models can still be used.
+            if requested_provider and requested_provider != "auto":
                 raise
-            # Auto-detected Codex but credentials are stale/revoked —
-            # fall through to env-var providers (e.g. OpenRouter).
-            logger.info("Auto-detected Codex provider but credentials failed; "
-                        "falling through to next provider.")
+            logger.info("Codex credentials unavailable; falling through to env-var providers.")
 
     if provider == "xai-oauth":
         try:

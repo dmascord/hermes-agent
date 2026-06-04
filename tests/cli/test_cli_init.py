@@ -499,7 +499,7 @@ class TestRootLevelProviderOverride:
         config_path.write_text(yaml.safe_dump({
             "provider": "opencode-go",  # stale root-level key
             "model": {
-                "default": "google/gemini-3-flash-preview",
+                "default": "google/gemini-2.5-flash:free",
                 "provider": "openrouter",  # correct canonical key
             },
         }))
@@ -522,7 +522,7 @@ class TestRootLevelProviderOverride:
         config_path.write_text(yaml.safe_dump({
             "provider": "opencode-go",  # stale root key
             "model": {
-                "default": "google/gemini-3-flash-preview",
+                "default": "google/gemini-2.5-flash:free",
                 # no explicit model.provider — defaults provide "auto"
             },
         }))

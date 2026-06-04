@@ -346,6 +346,7 @@ class TestPartitionNousModelsByTier:
 
     _PAID = {"prompt": "0.000003", "completion": "0.000015"}
     _FREE = {"prompt": "0", "completion": "0"}
+    _EXPECTED_FREE_MODEL = "google/gemini-2.5-flash:free"
 
     def test_paid_tier_all_selectable(self):
         """Paid users get all models as selectable, none unavailable."""
@@ -367,8 +368,27 @@ class TestPartitionNousModelsByTier:
         assert sel == ["xiaomi/mimo-v2-pro"]
         assert unav == ["anthropic/claude-opus-4.6", "openai/gpt-5.4"]
 
+    def test_expected_free_model_without_pricing_stays_selectable(self):
+        """Expected-free models stay selectable while pricing metadata is missing."""
+        models = [self._EXPECTED_FREE_MODEL, "anthropic/claude-opus-4.6"]
+        pricing = {"anthropic/claude-opus-4.6": self._PAID}
+        sel, unav = partition_nous_models_by_tier(models, pricing, free_tier=True)
+        assert sel == [self._EXPECTED_FREE_MODEL]
+        assert unav == ["anthropic/claude-opus-4.6"]
+
+    def test_expected_free_model_is_demoted_when_live_pricing_turns_paid(self):
+        """Non-zero live pricing overrides the expected-free fallback."""
+        models = [self._EXPECTED_FREE_MODEL, "xiaomi/mimo-v2-pro"]
+        pricing = {
+            self._EXPECTED_FREE_MODEL: self._PAID,
+            "xiaomi/mimo-v2-pro": self._FREE,
+        }
+        sel, unav = partition_nous_models_by_tier(models, pricing, free_tier=True)
+        assert sel == ["xiaomi/mimo-v2-pro"]
+        assert unav == [self._EXPECTED_FREE_MODEL]
+
     def test_no_pricing_returns_all(self):
-        """Without pricing data, all models are selectable."""
+        """Without any pricing data, all models are selectable."""
         models = ["anthropic/claude-opus-4.6", "openai/gpt-5.4"]
         sel, unav = partition_nous_models_by_tier(models, {}, free_tier=True)
         assert sel == models
@@ -729,12 +749,12 @@ class TestNousRecommendedModels:
         "paidRecommendedCompactionModel": None,
         "paidRecommendedVisionModel": None,
         "freeRecommendedCompactionModel": {
-            "modelName": "google/gemini-3-flash-preview",
-            "displayName": "Google: Gemini 3 Flash Preview",
+            "modelName": "google/gemini-2.5-flash:free",
+            "displayName": "Google: Gemini 2.5 Flash",
         },
         "freeRecommendedVisionModel": {
-            "modelName": "google/gemini-3-flash-preview",
-            "displayName": "Google: Gemini 3 Flash Preview",
+            "modelName": "google/gemini-2.5-flash:free",
+            "displayName": "Google: Gemini 2.5 Flash",
         },
     }
 
@@ -794,7 +814,7 @@ class TestNousRecommendedModels:
         ):
             # Free tier → free vision recommendation.
             model = get_nous_recommended_aux_model(vision=True, free_tier=True)
-        assert model == "google/gemini-3-flash-preview"
+        assert model == "google/gemini-2.5-flash:free"
 
     def test_get_aux_model_returns_compaction_recommendation(self):
         from hermes_cli.models import get_nous_recommended_aux_model
@@ -838,9 +858,9 @@ class TestNousRecommendedModels:
         from hermes_cli.models import get_nous_recommended_aux_model
         payload = {
             "paidRecommendedCompactionModel": {"modelName": "anthropic/claude-opus-4.7"},
-            "freeRecommendedCompactionModel": {"modelName": "google/gemini-3-flash-preview"},
+            "freeRecommendedCompactionModel": {"modelName": "google/gemini-2.5-flash:free"},
             "paidRecommendedVisionModel": {"modelName": "openai/gpt-5.4"},
-            "freeRecommendedVisionModel": {"modelName": "google/gemini-3-flash-preview"},
+            "freeRecommendedVisionModel": {"modelName": "google/gemini-2.5-flash:free"},
         }
         with patch("hermes_cli.models.fetch_nous_recommended_models", return_value=payload):
             text = get_nous_recommended_aux_model(vision=False, free_tier=False)
@@ -853,15 +873,15 @@ class TestNousRecommendedModels:
         from hermes_cli.models import get_nous_recommended_aux_model
         payload = {
             "paidRecommendedCompactionModel": None,
-            "freeRecommendedCompactionModel": {"modelName": "google/gemini-3-flash-preview"},
+            "freeRecommendedCompactionModel": {"modelName": "google/gemini-2.5-flash:free"},
             "paidRecommendedVisionModel": None,
-            "freeRecommendedVisionModel": {"modelName": "google/gemini-3-flash-preview"},
+            "freeRecommendedVisionModel": {"modelName": "google/gemini-2.5-flash:free"},
         }
         with patch("hermes_cli.models.fetch_nous_recommended_models", return_value=payload):
             text = get_nous_recommended_aux_model(vision=False, free_tier=False)
             vision = get_nous_recommended_aux_model(vision=True, free_tier=False)
-        assert text == "google/gemini-3-flash-preview"
-        assert vision == "google/gemini-3-flash-preview"
+        assert text == "google/gemini-2.5-flash:free"
+        assert vision == "google/gemini-2.5-flash:free"
 
     def test_free_tier_never_uses_paid_recommendation(self):
         """Free-tier users must not get paid-only recommendations."""

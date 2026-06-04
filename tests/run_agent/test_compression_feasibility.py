@@ -75,7 +75,7 @@ def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_clien
     mock_client = MagicMock()
     mock_client.base_url = "https://openrouter.ai/api/v1"
     mock_client.api_key = "sk-aux"
-    mock_get_client.return_value = (mock_client, "google/gemini-3-flash-preview")
+    mock_get_client.return_value = (mock_client, "google/gemini-2.5-flash:free")
 
     messages = []
     agent._emit_status = lambda msg: messages.append(msg)
@@ -386,7 +386,7 @@ def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
     mock_client = MagicMock()
     mock_client.base_url = "https://openrouter.ai/api/v1"
     mock_client.api_key = "sk-aux"
-    mock_get_client.return_value = (mock_client, "google/gemini-3-flash-preview")
+    mock_get_client.return_value = (mock_client, "google/gemini-2.5-flash:free")
 
     # Phase 1: __init__ — _emit_status prints (CLI) but callback is None
     vprint_messages = []

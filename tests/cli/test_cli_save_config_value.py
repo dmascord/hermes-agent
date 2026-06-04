@@ -46,10 +46,10 @@ class TestSaveConfigValueAtomic:
     def test_creates_nested_keys(self, config_env):
         """Dot-separated paths create intermediate dicts as needed."""
         from cli import save_config_value
-        save_config_value("auxiliary.compression.model", "google/gemini-3-flash-preview")
+        save_config_value("auxiliary.compression.model", "google/gemini-2.5-flash:free")
 
         result = yaml.safe_load(config_env.read_text())
-        assert result["auxiliary"]["compression"]["model"] == "google/gemini-3-flash-preview"
+        assert result["auxiliary"]["compression"]["model"] == "google/gemini-2.5-flash:free"
 
     def test_overwrites_existing_value(self, config_env):
         """Updating an existing key replaces the value."""

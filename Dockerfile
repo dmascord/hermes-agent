@@ -133,6 +133,17 @@ RUN npm install --prefer-offline --no-audit && \
     npx playwright install --with-deps chromium --only-shell && \
     npm cache clean --force
 
+# ---------- Python virtualenv — deps layer (cached unless pyproject.toml/uv.lock change) ----------
+# Copy only the packaging metadata so that resolving + installing all
+# third-party dependencies is cached independently of the source tree.
+# Editing any .py file will NOT bust this layer; only changing
+# pyproject.toml or uv.lock will.
+COPY pyproject.toml uv.lock* ./
+# Stub out the package entry point so uv can do --no-install-project
+# without complaining about missing source.
+RUN mkdir -p hermes_cli && touch hermes_cli/__init__.py
+RUN uv venv && \
+    uv sync --frozen --no-install-project --no-cache
 # ---------- Layer-cached Python dependency install ----------
 # Copy only pyproject.toml + uv.lock so the Python dep resolve + wheel
 # download + native-extension compile layer is cached unless those inputs
@@ -171,7 +182,13 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
+# Copying source only invalidates layers from here down — the heavy
+# OS/npm/pip-deps layers above remain cached on every code-only rebuild.
 COPY --chown=hermes:hermes . .
+
+# Editable install: fast because all deps are already present above.
+# This just writes the .pth pointer so `import hermes_agent` resolves.
+RUN uv sync --frozen --no-cache
 
 # Build browser dashboard and terminal UI assets.
 RUN cd web && npm run build && \

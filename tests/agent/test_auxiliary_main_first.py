@@ -109,14 +109,14 @@ class TestResolveAutoMainFirst:
             return_value=(None, None),  # main provider has no client
         ), patch(
             "agent.auxiliary_client._try_openrouter",
-            return_value=(chain_client, "google/gemini-3-flash-preview"),
+            return_value=(chain_client, "google/gemini-2.5-flash:free"),
         ):
             from agent.auxiliary_client import _resolve_auto
 
             client, model = _resolve_auto()
 
         assert client is chain_client
-        assert model == "google/gemini-3-flash-preview"
+        assert model == "google/gemini-2.5-flash:free"
 
     def test_no_main_config_uses_chain_directly(self):
         """No main provider configured → skip step 1, use chain (no regression)."""
@@ -127,7 +127,7 @@ class TestResolveAutoMainFirst:
             "agent.auxiliary_client._read_main_model", return_value="",
         ), patch(
             "agent.auxiliary_client._try_openrouter",
-            return_value=(chain_client, "google/gemini-3-flash-preview"),
+            return_value=(chain_client, "google/gemini-2.5-flash:free"),
         ):
             from agent.auxiliary_client import _resolve_auto
 
@@ -212,7 +212,7 @@ class TestResolveVisionMainFirst:
             return_value=("auto", None, None, None, None),
         ), patch(
             "agent.auxiliary_client._resolve_strict_vision_backend",
-            return_value=(MagicMock(), "google/gemini-3-flash-preview"),
+            return_value=(MagicMock(), "google/gemini-2.5-flash:free"),
         ):
             from agent.auxiliary_client import resolve_vision_provider_client
 
@@ -220,7 +220,7 @@ class TestResolveVisionMainFirst:
 
         assert provider == "nous"
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == "google/gemini-2.5-flash:free"
 
     def test_nous_main_vision_uses_free_tier_nous_vision_backend(self):
         """Free-tier Nous main → aux vision uses MiMo omni, not the text main model."""
@@ -348,6 +348,55 @@ class TestResolveVisionMainFirst:
         assert captured == {"is_agent_turn": True, "is_vision": False}
         assert "default_headers" not in mock_openai.call_args.kwargs
 
+    def test_copilot_credential_pool_source_prefers_enterprise_base(self):
+        class _Entry:
+            def __init__(self, base_url, token):
+                self.base_url = base_url
+                self.access_token = token
+                self.runtime_api_key = ""
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def entries(self):
+                return [
+                    _Entry("https://api.githubcopilot.com", "gho_public"),
+                    _Entry("https://copilot-api.sita.ghe.com", "gho_enterprise"),
+                ]
+
+        with patch(
+            "agent.auxiliary_client.OpenAI",
+        ) as mock_openai, patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "provider": "copilot",
+                "api_key": "gho_public",
+                "base_url": "https://api.githubcopilot.com",
+                "source": "credential_pool:copilot",
+            },
+        ), patch(
+            "agent.auxiliary_client.load_pool",
+            return_value=_Pool(),
+        ), patch(
+            "hermes_cli.copilot_auth.copilot_request_headers",
+            return_value={"x-test": "1"},
+        ):
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, model = resolve_provider_client(
+                "copilot",
+                "github-copilot-enterprise/gpt-5.4",
+            )
+
+        assert client is not None
+        assert model == "gpt-5.4"
+        assert mock_openai.call_args.kwargs["api_key"] == "gho_enterprise"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://copilot-api.sita.ghe.com"
+
     def test_main_unavailable_vision_falls_through_to_aggregators(self):
         """Main provider fails → fall back to OpenRouter/Nous strict backends."""
         fallback_client = MagicMock()
@@ -360,7 +409,7 @@ class TestResolveVisionMainFirst:
             return_value=(None, None),
         ), patch(
             "agent.auxiliary_client._resolve_strict_vision_backend",
-            return_value=(fallback_client, "google/gemini-3-flash-preview"),
+            return_value=(fallback_client, "google/gemini-2.5-flash:free"),
         ), patch(
             "agent.auxiliary_client._resolve_task_provider_model",
             return_value=("auto", None, None, None, None),

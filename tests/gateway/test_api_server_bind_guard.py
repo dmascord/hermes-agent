@@ -131,3 +131,25 @@ class TestConnectBindGuard:
         assert adapter._api_key == "sk-test"
         assert is_network_accessible("0.0.0.0") is True
         # Combined: the guard condition is False (key is set), so it passes
+
+
+class TestExplicitBindSocket:
+    def test_create_listen_socket_for_ipv4_wildcard(self):
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"host": "0.0.0.0", "port": 0, "key": "sk-test"})
+        )
+
+        sock = adapter._create_listen_socket()
+        try:
+            host, port = sock.getsockname()
+            assert host == "0.0.0.0"
+            assert port > 0
+        finally:
+            sock.close()
+
+    def test_create_listen_socket_skips_hostnames(self):
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"host": "localhost", "port": 0, "key": "sk-test"})
+        )
+
+        assert adapter._create_listen_socket() is None

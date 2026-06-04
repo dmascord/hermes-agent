@@ -9,6 +9,7 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+import inspect
 import logging
 import os
 import re
@@ -197,6 +198,7 @@ _SYSTEM_CONFIG_PATH = (
 _SENSITIVE_WRITE_TARGET = (
     rf'(?:{_SYSTEM_CONFIG_PATH}|/dev/sd|'
     rf'{_SSH_SENSITIVE_PATH}|'
+    rf'{_HERMES_ENV_PATH})'
     rf'{_HERMES_ENV_PATH}|'
     rf'{_HERMES_CONFIG_PATH}|'
     rf'{_SHELL_RC_FILES}|'
@@ -780,8 +782,18 @@ def prompt_dangerous_approval(command: str, description: str,
 
     if approval_callback is not None:
         try:
+            sig = inspect.signature(approval_callback) if hasattr(inspect, 'signature') else None
+            if sig and 'allow_permanent' not in sig.parameters:
+                return approval_callback(command, description)
             return approval_callback(command, description,
                                      allow_permanent=allow_permanent)
+        except TypeError:
+            # Callback does not accept allow_permanent — call without it
+            try:
+                return approval_callback(command, description)
+            except Exception as e:
+                logger.error("Approval callback failed: %s", e, exc_info=True)
+                return "deny"
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
             return "deny"

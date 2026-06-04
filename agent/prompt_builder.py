@@ -125,6 +125,13 @@ DEFAULT_AGENT_IDENTITY = (
     "analyzing information, creative work, and executing actions via your tools. "
     "You communicate clearly, admit uncertainty when appropriate, and prioritize "
     "being genuinely useful over being verbose unless otherwise directed below. "
+    "Be targeted and efficient in your exploration and investigations.\n\n"
+    "# Important deployment safety\n"
+    "IMPORTANT: If the API server runs as a Docker container (e.g., hermes-swarm "
+    "on port 8642), NEVER run commands that restart, stop, or remove that container "
+    "(e.g., docker stop, docker rm, docker restart, or systemctl restart). "
+    "Doing so will crash the API server and terminate your current session. "
+    "For debugging, use read-only commands like docker logs, docker inspect, or docker stats."
     "Be targeted and efficient in your exploration and investigations."
 )
 
@@ -153,13 +160,7 @@ MEMORY_GUIDANCE = (
     "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
     "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
     "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
-    "Write memories as declarative facts, not instructions to yourself. "
-    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
-    "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
-    "Imperative phrasing gets re-read as a directive in later sessions and can "
-    "cause repeated work or override the user's current request. Procedures and "
-    "workflows belong in skills, not memory."
+    "necessary later, save it as a skill with the skill tool."
 )
 
 SESSION_SEARCH_GUIDANCE = (
@@ -177,7 +178,37 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+HERMES_AGENT_HELP_GUIDANCE = (
+    "# Hermes help guidance\n"
+    "If the user asks what you can do, how Hermes works, or how to use the "
+    "assistant, answer from your current tools and instructions. Be concise, "
+    "practical, and avoid inventing unavailable commands or capabilities."
+)
+
 KANBAN_GUIDANCE = (
+    "# Kanban worker mode\n"
+    "You are a Kanban worker when HERMES_KANBAN_TASK is set. Treat the assigned "
+    "task as your source of truth and use the kanban tools for coordination; do "
+    "not shell out to inspect or modify the kanban database directly.\n"
+    "Start by calling kanban_show() to read the current task, acceptance criteria, "
+    "dependencies, comments, and latest events. Keep the board current while you "
+    "work: use kanban_comment for useful progress notes, kanban_heartbeat for "
+    "long-running work, kanban_block when you cannot proceed without external "
+    "input, kanban_create for newly discovered subtasks, and kanban_complete only "
+    "after the stated acceptance criteria are satisfied.\n"
+    "Lifecycle rules: (1) inspect the task before acting; (2) verify prerequisites "
+    "and dependencies before making changes; (3) make progress autonomously using "
+    "normal tools; (4) record material decisions or blockers on the task; (5) avoid "
+    "duplicating existing subtasks; (6) complete the task with a concise summary "
+    "and evidence of verification. If blocked, call kanban_block with the concrete "
+    "reason and the smallest next input needed. If you create child tasks, explain "
+    "why they are separate and what each one should deliver.\n"
+    "Do not shell out to sqlite, edit task files by hand, or bypass the kanban "
+    "tools — they work across profiles and keep worker state consistent. Prefer "
+    "small, verifiable steps over broad changes. Never mark a task complete just "
+    "because a command ran; inspect results and confirm they satisfy the task. "
+    "When reporting final status, mention the task id, what changed, tests or "
+    "checks run, and any follow-up tasks created."
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "
     "the shared board at `~/.hermes/kanban.db`. Your task id is in "
@@ -359,7 +390,7 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Grounding: are factual claims backed by tool outputs or provided context?\n"
     "- Formatting: does the output match the requested format or schema?\n"
     "- Safety: if the next step has side effects (file writes, commands, API calls), "
-    "confirm scope before executing.\n"
+    "execute directly when it is within the user's stated scope; only ask for confirmation when approval policy or explicit user constraints require it.\n"
     "</verification>\n"
     "\n"
     "<missing_context>\n"
@@ -461,10 +492,6 @@ PLATFORM_HINTS = {
         "Standard markdown is automatically converted to Telegram format. "
         "Supported: **bold**, *italic*, ~~strikethrough~~, ||spoiler||, "
         "`inline code`, ```code blocks```, [links](url), and ## headers. "
-        "Telegram has NO table syntax — prefer bullet lists or labeled "
-        "key: value pairs over pipe tables (any tables you do emit are "
-        "auto-rewritten into row-group bullets, which you can produce "
-        "directly for cleaner output). "
         "You can send media files natively: to deliver a file to the user, "
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
@@ -511,13 +538,7 @@ PLATFORM_HINTS = {
     ),
     "cli": (
         "You are a CLI AI Agent. Try not to use markdown but simple text "
-        "renderable inside a terminal. "
-        "File delivery: there is no attachment channel — the user reads your "
-        "response directly in their terminal. Do NOT emit MEDIA:/path tags "
-        "(those are only intercepted on messaging platforms like Telegram, "
-        "Discord, Slack, etc.; on the CLI they render as literal text). "
-        "When referring to a file you created or changed, just state its "
-        "absolute path in plain text; the user can open it from there."
+        "renderable inside a terminal."
     ),
     "sms": (
         "You are communicating via SMS. Keep responses concise and use plain text "
@@ -530,32 +551,6 @@ PLATFORM_HINTS = {
         "appear as text messages. You can send media files natively: include "
         "MEDIA:/absolute/path/to/file in your response. Images (.jpg, .png, "
         ".heic) appear as photos and other files arrive as attachments."
-    ),
-    "mattermost": (
-        "You are in a Mattermost workspace communicating with your user. "
-        "Mattermost renders standard Markdown — headings, bold, italic, code "
-        "blocks, and tables all work. "
-        "You can send media files natively: include MEDIA:/absolute/path/to/file "
-        "in your response. Images (.jpg, .png, .webp) are uploaded as photo "
-        "attachments, audio and video as file attachments. "
-        "Image URLs in markdown format ![alt](url) are rendered as inline previews automatically."
-    ),
-    "matrix": (
-        "You are in a Matrix room communicating with your user. "
-        "Matrix renders Markdown — bold, italic, code blocks, and links work; "
-        "the adapter converts your Markdown to HTML for rich display. "
-        "You can send media files natively: include MEDIA:/absolute/path/to/file "
-        "in your response. Images (.jpg, .png, .webp) are sent as inline photos, "
-        "audio (.ogg, .mp3) as voice/audio messages, video (.mp4) inline, "
-        "and other files as downloadable attachments."
-    ),
-    "feishu": (
-        "You are in a Feishu (Lark) workspace communicating with your user. "
-        "Feishu renders Markdown in messages — bold, italic, code blocks, and "
-        "links are supported. "
-        "You can send media files natively: include MEDIA:/absolute/path/to/file "
-        "in your response. Images (.jpg, .png, .webp) are uploaded and displayed "
-        "inline, audio files as voice messages, and other files as attachments."
     ),
     "weixin": (
         "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "
@@ -1075,20 +1070,20 @@ def build_skills_system_prompt(
         or get_session_env("HERMES_SESSION_PLATFORM")
         or ""
     )
-    disabled = get_disabled_skill_names()
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
-        tuple(sorted(disabled)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
             return cached
+
+    disabled = get_disabled_skill_names()
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
     snapshot = _load_skills_snapshot(skills_dir)
@@ -1116,7 +1111,7 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(category, []).append(
-                (frontmatter_name, entry.get("description", ""))
+                (skill_name, entry.get("description", ""))
             )
         category_descriptions = {
             str(k): str(v)
@@ -1141,7 +1136,7 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(entry["category"], []).append(
-                (entry["frontmatter_name"], entry["description"])
+                (skill_name, entry["description"])
             )
 
         # Read category-level DESCRIPTION.md files
@@ -1184,10 +1179,9 @@ def build_skills_system_prompt(
                     continue
                 entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
                 skill_name = entry["skill_name"]
-                frontmatter_name = entry["frontmatter_name"]
-                if frontmatter_name in seen_skill_names:
+                if skill_name in seen_skill_names:
                     continue
-                if frontmatter_name in disabled or skill_name in disabled:
+                if entry["frontmatter_name"] in disabled or skill_name in disabled:
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),
@@ -1195,9 +1189,9 @@ def build_skills_system_prompt(
                     available_toolsets,
                 ):
                     continue
-                seen_skill_names.add(frontmatter_name)
+                seen_skill_names.add(skill_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (skill_name, entry["description"])
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
@@ -1249,11 +1243,6 @@ def build_skills_system_prompt(
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "
@@ -1410,18 +1399,38 @@ def _load_hermes_md(cwd_path: Path) -> str:
 
 
 def _load_agents_md(cwd_path: Path) -> str:
-    """AGENTS.md — top-level only (no recursive walk)."""
-    for name in ["AGENTS.md", "agents.md"]:
-        candidate = cwd_path / name
-        if candidate.exists():
-            try:
-                content = candidate.read_text(encoding="utf-8").strip()
-                if content:
-                    content = _scan_context_content(content, name)
-                    result = f"## {name}\n\n{content}"
-                    return _truncate_content(result, "AGENTS.md")
-            except Exception as e:
-                logger.debug("Could not read %s: %s", candidate, e)
+    """AGENTS.md — prefer cwd, then walk ancestors up to git root."""
+    git_root = _find_git_root(cwd_path)
+    current = cwd_path
+    candidate_dirs = [cwd_path]
+    while current.parent != current:
+        current = current.parent
+        candidate_dirs.append(current)
+        if git_root is not None and current == git_root:
+            break
+
+    seen = set()
+    for directory in candidate_dirs:
+        resolved = directory.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        for name in ["AGENTS.md", "agents.md"]:
+            candidate = directory / name
+            if candidate.exists():
+                try:
+                    content = candidate.read_text(encoding="utf-8").strip()
+                    if content:
+                        rel = name
+                        try:
+                            rel = str(candidate.relative_to(cwd_path))
+                        except ValueError:
+                            pass
+                        content = _scan_context_content(content, rel)
+                        result = f"## {rel}\n\n{content}"
+                        return _truncate_content(result, "AGENTS.md")
+                except Exception as e:
+                    logger.debug("Could not read %s: %s", candidate, e)
     return ""
 
 
@@ -1476,7 +1485,7 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
 
     Priority (first found wins — only ONE project context type is loaded):
       1. .hermes.md / HERMES.md  (walk to git root)
-      2. AGENTS.md / agents.md   (cwd only)
+      2. AGENTS.md / agents.md   (cwd, then ancestors up to git root)
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 

@@ -2006,6 +2006,7 @@ def _run_browser_command(
         if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
             idle_ms = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
             browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = idle_ms
+        
 
         # Inject --no-sandbox when needed (issue #15765):
         # - Running as root: Chromium always refuses to start without it
@@ -3580,11 +3581,11 @@ def _chromium_installed() -> bool:
        ``chromium-*`` or ``chromium_headless_shell-*``.
 
     agent-browser (0.26+) downloads Playwright's chromium / headless-shell
-    builds into ``PLAYWRIGHT_BROWSERS_PATH`` and won't start without at least
-    one of the three above being present.  Without a browser binary the CLI
-    hangs on first use until the command timeout fires (often ~30s).  Guarding
-    the tool behind this check prevents advertising a capability that will
-    fail at runtime.
+    builds into ``PLAYWRIGHT_BROWSERS_PATH`` and won't start without them.
+    When the CLI is present but no browser build is, the first browser tool
+    call hangs for the full command timeout (often ~30s each) before
+    surfacing a useless error. Guarding the tool behind this check prevents
+    advertising a capability that will fail at runtime.
     """
     global _cached_chromium_installed
     if _cached_chromium_installed is not None:
@@ -3660,12 +3661,7 @@ def check_browser_requirements() -> bool:
     if _is_camofox_mode():
         return True
 
-    # CDP override mode can connect to an existing remote/local browser endpoint
-    # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
-        return True
-
-    # The agent-browser CLI is required for local launch and cloud-provider flows.
+    # The agent-browser CLI is always required
     try:
         browser_cmd = _find_agent_browser()
     except FileNotFoundError:

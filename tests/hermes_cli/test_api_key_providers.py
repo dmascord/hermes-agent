@@ -417,6 +417,32 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["base_url"] == "https://api.githubcopilot.com"
         assert creds["source"] == "gh auth token"
 
+    def test_resolve_copilot_with_credential_pool_fallback(self, monkeypatch):
+        class _Entry:
+            runtime_api_key = ""
+            access_token = "gho_pool_secret"
+            base_url = "https://copilot-api.example.test"
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def peek(self):
+                return _Entry()
+
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth.resolve_copilot_token",
+            lambda: ("", ""),
+        )
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: _Pool())
+
+        creds = resolve_api_key_provider_credentials("copilot")
+
+        assert creds["provider"] == "copilot"
+        assert creds["api_key"] == "gho_pool_secret"
+        assert creds["base_url"] == "https://api.githubcopilot.com"
+        assert creds["source"] == "credential_pool:copilot"
+
     def test_resolve_lmstudio_uses_token_and_base_url_from_env(self, monkeypatch):
         monkeypatch.setenv("LM_API_KEY", "lm-token")
         monkeypatch.setenv("LM_BASE_URL", "http://lmstudio.remote:4321/v1")
