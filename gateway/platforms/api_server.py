@@ -5632,64 +5632,129 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     if provider_model.startswith("github-copilot") or provider_model.startswith("copilot-"):
                         try:
-                            from agent.anthropic_adapter import build_anthropic_client
                             runtime_kwargs, resolved_model = _runtime_kwargs_for_model_id(provider_model)
                             api_key = runtime_kwargs.get("api_key", "")
                             base_url = runtime_kwargs.get("base_url", "") or None
+                            api_mode = runtime_kwargs.get("api_mode", "anthropic_messages")
 
                             if not api_key:
                                 logger.warning("[hermes-code] passthrough copilot %s: no API key, skipping", provider_model)
                                 continue
 
-                            anthropic_client = build_anthropic_client(api_key, base_url)
-                            anthropic_messages, anthropic_tools = _transform_messages_to_anthropic(passthrough_messages, tools)
+                            _mapper = None  # no arliai sanitization needed for copilot
 
-                            api_kwargs: Dict[str, Any] = {
-                                "model": resolved_model,
-                                "messages": anthropic_messages,
-                                "max_tokens": 16384,
-                            }
-                            if anthropic_tools:
-                                api_kwargs["tools"] = anthropic_tools
+                            # ── Dispatch by API mode ──
+                            if api_mode == "anthropic_messages":
+                                # Anthropic Messages API (Claude models)
+                                from agent.anthropic_adapter import build_anthropic_client
+                                anthropic_client = build_anthropic_client(api_key, base_url)
+                                anthropic_messages, anthropic_tools = _transform_messages_to_anthropic(passthrough_messages, tools)
 
-                            _s_loop = asyncio.get_running_loop()
-                            response_obj = await _s_loop.run_in_executor(
-                                None,
-                                lambda: anthropic_client.messages.create(**api_kwargs),
-                            )
-                            try:
-                                from agent.model_cooldown_db import mark_provider_success
-                                _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
-                                mark_provider_success(_cb_prov, provider_model, base_url=base_url or "")
-                            except Exception:
-                                pass
+                                api_kwargs: Dict[str, Any] = {
+                                    "model": resolved_model,
+                                    "messages": anthropic_messages,
+                                    "max_tokens": 16384,
+                                }
+                                if anthropic_tools:
+                                    api_kwargs["tools"] = anthropic_tools
 
-                            response_text = ""
-                            content_out = ""
-                            tool_calls_out = []
-                            if hasattr(response_obj, 'content') and response_obj.content:
-                                for block in response_obj.content:
-                                    if hasattr(block, 'text') and block.text:
-                                        content_out = block.text
-                                        response_text = content_out
-                                    elif hasattr(block, 'type') and block.type == 'tool_use':
+                                _s_loop = asyncio.get_running_loop()
+                                response_obj = await _s_loop.run_in_executor(
+                                    None,
+                                    lambda: anthropic_client.messages.create(**api_kwargs),
+                                )
+
+                                # Parse Anthropic response
+                                response_text = ""
+                                content_out = ""
+                                tool_calls_out = []
+                                if hasattr(response_obj, 'content') and response_obj.content:
+                                    for block in response_obj.content:
+                                        if hasattr(block, 'text') and block.text:
+                                            content_out = block.text
+                                            response_text = content_out
+                                        elif hasattr(block, 'type') and block.type == 'tool_use':
+                                            tool_calls_out.append({
+                                                "id": block.id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": block.name,
+                                                    "arguments": json.dumps(block.input)
+                                                }
+                                            })
+                                tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                                usage_obj = getattr(response_obj, 'usage', None)
+                                reasoning_content_out = None
+                                finish_reason = "tool_calls" if tool_calls_out else "stop"
+
+                            else:
+                                # OpenAI-compatible API (chat_completions or codex_responses)
+                                from openai import OpenAI
+                                from hermes_cli.copilot_auth import copilot_request_headers
+
+                                _s_loop = asyncio.get_running_loop()
+                                headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
+                                client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
+
+                                if api_mode == "codex_responses":
+                                    # Responses API (GPT-5.x): wrap in CodexAuxiliaryClient
+                                    from agent.auxiliary_client import CodexAuxiliaryClient
+                                    wrapped = CodexAuxiliaryClient(client, resolved_model)
+                                    response_obj = await _s_loop.run_in_executor(
+                                        None,
+                                        lambda: wrapped.chat.completions.create(
+                                            messages=passthrough_messages,
+                                            model=resolved_model,
+                                            max_tokens=16384,
+                                            tools=passthrough_tools,
+                                        ),
+                                    )
+                                else:
+                                    # Chat Completions API (GPT-5-mini, GPT-4o-mini, etc.)
+                                    response_obj = await _s_loop.run_in_executor(
+                                        None,
+                                        lambda: client.chat.completions.create(
+                                            model=resolved_model,
+                                            messages=passthrough_messages,
+                                            max_tokens=16384,
+                                            tools=passthrough_tools,
+                                            timeout=300,
+                                        ),
+                                    )
+
+                                # Parse OpenAI-style response
+                                msg = response_obj.choices[0].message
+                                content_out = extract_content_or_reasoning(response_obj).strip()
+                                reasoning_content_out = _extract_reasoning_content_from_msg(msg)
+                                tool_calls_raw = getattr(msg, "tool_calls", []) or []
+                                tool_calls_out = []
+                                for tc in tool_calls_raw:
+                                    if hasattr(tc, "model_dump"):
+                                        tool_calls_out.append(tc.model_dump())
+                                    elif hasattr(tc, "dict"):
+                                        tool_calls_out.append(tc.dict())
+                                    elif isinstance(tc, dict):
+                                        tool_calls_out.append(tc)
+                                    else:
+                                        _func = getattr(tc, "function", None)
                                         tool_calls_out.append({
-                                            "id": block.id,
+                                            "id": str(getattr(tc, "id", "")),
                                             "type": "function",
                                             "function": {
-                                                "name": block.name,
-                                                "arguments": json.dumps(block.input)
-                                            }
+                                                "name": str(getattr(_func, "name", getattr(tc, "name", ""))),
+                                                "arguments": str(getattr(_func, "arguments", getattr(tc, "arguments", "{}"))),
+                                            },
                                         })
-                            tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                                tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                                usage_obj = getattr(response_obj, "usage", None)
+                                response_text = content_out
+                                finish_reason = getattr(response_obj.choices[0], "finish_reason", "stop")
+                                if tool_calls_out:
+                                    finish_reason = "tool_calls"
 
-                            # Restore original (client-side) tool_call_ids from sanitized
-                            # upstream IDs so the client receives consistent identifiers.
-                            if _mapper is not None and tool_calls_out:
-                                tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
+                            # ── Common variables and success marking ──
                             completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
                             created = int(time.time())
-                            finish_reason = "tool_calls" if tool_calls_out else "stop"
                             _args_preview = [
                                 (tc.get("function", {}).get("name", ""),
                                  tc.get("function", {}).get("arguments", "")[:200])
@@ -5704,6 +5769,17 @@ class APIServerAdapter(BasePlatformAdapter):
                                 len(content_out) if content_out else 0,
                             )
 
+                            try:
+                                from agent.model_cooldown_db import mark_provider_success
+                                _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
+                                mark_provider_success(_cb_prov, provider_model, base_url=base_url or "")
+                            except Exception:
+                                pass
+
+                            if _mapper is not None and tool_calls_out:
+                                tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
+
+                            # ── SSE serialisation (shared by all api_modes) ──
                             sse_headers = {
                                 "Content-Type": "text/event-stream",
                                 "Cache-Control": "no-cache",
@@ -5721,6 +5797,18 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                             }
                             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+
+                            # Stream reasoning_content deltas (OpenAI models only)
+                            if reasoning_content_out:
+                                for i in range(0, len(reasoning_content_out), 200):
+                                    rc_chunk = reasoning_content_out[i:i+200]
+                                    rc_chunk_data = {
+                                        "id": completion_id, "object": "chat.completion.chunk",
+                                        "created": created, "model": model_name,
+                                        "choices": [{"index": 0, "delta": {"reasoning_content": rc_chunk}, "finish_reason": None}],
+                                    }
+                                    await response.write(f"data: {json.dumps(rc_chunk_data)}\n\n".encode())
+                                    await asyncio.sleep(0.005)
 
                             if response_text:
                                 for i in range(0, len(response_text), 100):
@@ -5742,20 +5830,27 @@ class APIServerAdapter(BasePlatformAdapter):
                                     }
                                     await response.write(f"data: {json.dumps(tool_chunk)}\n\n".encode())
 
-                            usage_obj = getattr(response_obj, 'usage', None)
+                            # Normalise both Anthropic-style (input_tokens) and OpenAI-style (prompt_tokens) usage
+                            _pt = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+                            if not _pt:
+                                _pt = int(getattr(usage_obj, "input_tokens", 0) or 0)
+                            _ct = int(getattr(usage_obj, "completion_tokens", 0) or 0)
+                            if not _ct:
+                                _ct = int(getattr(usage_obj, "output_tokens", 0) or 0)
                             finish_chunk = {
                                 "id": completion_id, "object": "chat.completion.chunk",
                                 "created": created, "model": model_name,
                                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                                 "usage": {
-                                    "prompt_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
-                                    "completion_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
-                                    "total_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0) + int(getattr(usage_obj, "output_tokens", 0) or 0),
+                                    "prompt_tokens": _pt,
+                                    "completion_tokens": _ct,
+                                    "total_tokens": _pt + _ct,
                                 },
                             }
                             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
                             await response.write(b"data: [DONE]\n\n")
                             await response.write_eof()
+
                             if provided_session_id:
                                 try:
                                     _persist_passthrough_session_delta(
@@ -5767,6 +5862,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         assistant_content=content_out,
                                         assistant_tool_calls=tool_calls_out,
                                         finish_reason=finish_reason,
+                                        reasoning_content=reasoning_content_out,
                                     )
                                 except Exception as _persist_exc:
                                     logger.warning("[api_server] failed to persist passthrough stream session delta for %s: %s", session_id, _persist_exc)
@@ -5774,14 +5870,14 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "post_api_request",
                                 task_id="", session_id=session_id or "", platform="api_server",
                                 model=provider_model, provider=provider_model.split("/")[0],
-                                base_url=base_url or "", api_mode="anthropic_messages",
+                                base_url=base_url or "", api_mode=api_mode or "anthropic_messages",
                                 api_call_count=_pt_call_count[0],
                                 finish_reason=finish_reason,
                                 assistant_content_chars=len(content_out) if content_out else 0,
                                 assistant_tool_call_count=len(tool_calls_out),
                                 usage={
-                                    "input_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
-                                    "output_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
+                                    "input_tokens": _pt,
+                                    "output_tokens": _ct,
                                 },
                             )
                             return response
@@ -6366,37 +6462,127 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 if provider_model.startswith("github-copilot") or provider_model.startswith("copilot-"):
                     try:
-                        from agent.anthropic_adapter import build_anthropic_client
-
                         runtime_kwargs, resolved_model = _runtime_kwargs_for_model_id(provider_model)
                         api_key = runtime_kwargs.get("api_key", "")
                         base_url = runtime_kwargs.get("base_url", "") or None
+                        api_mode = runtime_kwargs.get("api_mode", "anthropic_messages")
 
                         if not api_key:
                             logger.debug("hermes-code passthrough: %s has no API key, skipping", provider_model)
                             continue
 
-                        logger.debug(
-                            "[hermes-code] passthrough (copilot): model=%s tools=%s",
-                            resolved_model, bool(tools),
-                        )
+                        # ── Dispatch by API mode ──
+                        if api_mode == "anthropic_messages":
+                            # Anthropic Messages API (Claude models)
+                            from agent.anthropic_adapter import build_anthropic_client
+                            anthropic_client = build_anthropic_client(api_key, base_url)
+                            anthropic_messages, anthropic_tools = _transform_messages_to_anthropic(passthrough_messages, tools)
 
-                        anthropic_client = build_anthropic_client(api_key, base_url)
-                        anthropic_messages, anthropic_tools = _transform_messages_to_anthropic(passthrough_messages, tools)
+                            api_kwargs: Dict[str, Any] = {
+                                "model": resolved_model,
+                                "messages": anthropic_messages,
+                                "max_tokens": 16384,
+                            }
+                            if anthropic_tools:
+                                api_kwargs["tools"] = anthropic_tools
 
-                        api_kwargs: Dict[str, Any] = {
-                            "model": resolved_model,
-                            "messages": anthropic_messages,
-                            "max_tokens": 16384,
-                        }
-                        if anthropic_tools:
-                            api_kwargs["tools"] = anthropic_tools
+                            _ns_loop = asyncio.get_running_loop()
+                            response_obj = await _ns_loop.run_in_executor(
+                                None,
+                                lambda: anthropic_client.messages.create(**api_kwargs),
+                            )
 
-                        _ns_loop = asyncio.get_running_loop()
-                        response_obj = await _ns_loop.run_in_executor(
-                            None,
-                            lambda: anthropic_client.messages.create(**api_kwargs),
-                        )
+                            # Parse Anthropic response
+                            response_text = ""
+                            tool_calls = []
+                            finish_reason = "stop"
+                            if hasattr(response_obj, 'content') and response_obj.content:
+                                for block in response_obj.content:
+                                    if hasattr(block, 'text') and block.text:
+                                        response_text = block.text
+                                    elif hasattr(block, 'type') and block.type == 'tool_use':
+                                        tool_calls.append({
+                                            "id": block.id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": block.name,
+                                                "arguments": json.dumps(block.input)
+                                            }
+                                        })
+                            if hasattr(response_obj, 'stop_reason'):
+                                if response_obj.stop_reason == 'tool_use':
+                                    finish_reason = "tool_calls"
+                                else:
+                                    finish_reason = response_obj.stop_reason or "stop"
+                            tool_calls = _enrich_client_tool_calls(tool_calls)
+                            usage_obj = getattr(response_obj, 'usage', None)
+                            reasoning_content = None
+
+                        else:
+                            # OpenAI-compatible API (chat_completions or codex_responses)
+                            from openai import OpenAI
+                            from hermes_cli.copilot_auth import copilot_request_headers
+
+                            _ns_loop = asyncio.get_running_loop()
+                            headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
+                            client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
+
+                            if api_mode == "codex_responses":
+                                # Responses API (GPT-5.x): wrap in CodexAuxiliaryClient
+                                from agent.auxiliary_client import CodexAuxiliaryClient
+                                wrapped = CodexAuxiliaryClient(client, resolved_model)
+                                response_obj = await _ns_loop.run_in_executor(
+                                    None,
+                                    lambda: wrapped.chat.completions.create(
+                                        messages=passthrough_messages,
+                                        model=resolved_model,
+                                        max_tokens=16384,
+                                        tools=passthrough_tools,
+                                    ),
+                                )
+                            else:
+                                # Chat Completions API (GPT-5-mini, GPT-4o-mini, etc.)
+                                response_obj = await _ns_loop.run_in_executor(
+                                    None,
+                                    lambda: client.chat.completions.create(
+                                        model=resolved_model,
+                                        messages=passthrough_messages,
+                                        max_tokens=16384,
+                                        tools=passthrough_tools,
+                                        timeout=300,
+                                    ),
+                                )
+
+                            # Parse OpenAI-style response
+                            msg = response_obj.choices[0].message
+                            response_text = extract_content_or_reasoning(response_obj).strip()
+                            reasoning_content = _extract_reasoning_content_from_msg(msg)
+                            tool_calls_raw = getattr(msg, "tool_calls", []) or []
+                            tool_calls = []
+                            for tc in tool_calls_raw:
+                                if hasattr(tc, "model_dump"):
+                                    tool_calls.append(tc.model_dump())
+                                elif hasattr(tc, "dict"):
+                                    tool_calls.append(tc.dict())
+                                elif isinstance(tc, dict):
+                                    tool_calls.append(tc)
+                                else:
+                                    _func = getattr(tc, "function", None)
+                                    tool_calls.append({
+                                        "id": str(getattr(tc, "id", "")),
+                                        "type": "function",
+                                        "function": {
+                                            "name": str(getattr(_func, "name", getattr(tc, "name", ""))),
+                                            "arguments": str(getattr(_func, "arguments", getattr(tc, "arguments", "{}"))),
+                                        },
+                                    })
+                            tool_calls = _enrich_client_tool_calls(tool_calls)
+                            usage_obj = getattr(response_obj, "usage", None)
+                            finish_reason = getattr(response_obj.choices[0], "finish_reason", "stop")
+                            if tool_calls:
+                                finish_reason = "tool_calls"
+
+                        # ── Common success marking + JSON response ──
                         try:
                             from agent.model_cooldown_db import mark_provider_success
                             _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
@@ -6404,44 +6590,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                        response_text = ""
-                        tool_calls = []
-                        finish_reason = "stop"
-
-                        if hasattr(response_obj, 'content') and response_obj.content:
-                            for block in response_obj.content:
-                                if hasattr(block, 'text') and block.text:
-                                    response_text = block.text
-                                elif hasattr(block, 'type') and block.type == 'tool_use':
-                                    tool_calls.append({
-                                        "id": block.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": block.name,
-                                            "arguments": json.dumps(block.input)
-                                        }
-                                    })
-
-                        if hasattr(response_obj, 'stop_reason'):
-                            if response_obj.stop_reason == 'tool_use':
-                                finish_reason = "tool_calls"
-                            else:
-                                finish_reason = response_obj.stop_reason or "stop"
-
                         assistant_msg: Dict[str, Any] = {"role": "assistant"}
-                        tool_calls = _enrich_client_tool_calls(tool_calls)
                         if tool_calls:
                             assistant_msg["tool_calls"] = tool_calls
                         if response_text:
                             assistant_msg["content"] = response_text
 
-                        usage_obj = getattr(response_obj, 'usage', None)
                         # Record GHE AIU spend and enforce monthly limit.
                         try:
                             from agent.copilot_spend_db import record_and_check
                             record_and_check(response_obj, provider_model=provider_model, base_url=base_url or "")
                         except Exception as _spend_exc:
                             logger.warning("[copilot_spend] record failed: %s", _spend_exc)
+
+                        # Normalise both Anthropic-style (input_tokens) and OpenAI-style (prompt_tokens) usage
+                        _pt = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+                        if not _pt:
+                            _pt = int(getattr(usage_obj, "input_tokens", 0) or 0)
+                        _ct = int(getattr(usage_obj, "completion_tokens", 0) or 0)
+                        if not _ct:
+                            _ct = int(getattr(usage_obj, "output_tokens", 0) or 0)
 
                         response_data = {
                             "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
@@ -6454,9 +6622,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "finish_reason": finish_reason,
                             }],
                             "usage": {
-                                "prompt_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
-                                "completion_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
-                                "total_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0) + int(getattr(usage_obj, "output_tokens", 0) or 0),
+                                "prompt_tokens": _pt,
+                                "completion_tokens": _ct,
+                                "total_tokens": _pt + _ct,
                             },
                         }
                         if provided_session_id:
@@ -6470,6 +6638,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     assistant_content=response_text,
                                     assistant_tool_calls=tool_calls,
                                     finish_reason=finish_reason,
+                                    reasoning_content=reasoning_content,
                                 )
                             except Exception as _persist_exc:
                                 logger.warning("[api_server] failed to persist passthrough session delta for %s: %s", session_id, _persist_exc)
@@ -6478,14 +6647,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             "post_api_request",
                             task_id="", session_id=session_id or "", platform="api_server",
                             model=provider_model, provider=provider_model.split("/")[0],
-                            base_url=base_url or "", api_mode="anthropic_messages",
+                            base_url=base_url or "", api_mode=api_mode or "anthropic_messages",
                             api_call_count=_pt_call_count[0],
                             finish_reason=finish_reason,
                             assistant_content_chars=len(response_text) if response_text else 0,
                             assistant_tool_call_count=len(tool_calls),
                             usage={
-                                "input_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
-                                "output_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
+                                "input_tokens": _pt,
+                                "output_tokens": _ct,
                             },
                         )
                         return web.json_response(response_data, headers=headers)
