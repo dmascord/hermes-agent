@@ -63,7 +63,9 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     try:
         retry_after = exc.response.headers.get("Retry-After") or exc.response.headers.get("retry-after")  # type: ignore[union-attr]
         if retry_after:
-            return max(60.0, float(retry_after))
+            # Cap at 5 min — upstream sometimes sends 86400 s (24 h) which
+            # would effectively kill the provider for the whole day.
+            return min(300.0, max(60.0, float(retry_after)))
     except Exception:
         pass
 
@@ -433,7 +435,8 @@ class _RerankRouter:
         retry_after = headers.get("retry-after") or headers.get("Retry-After") or ""
         if retry_after:
             try:
-                return max(1.0, float(retry_after))
+                # Cap at 5 min — upstream sometimes sends 86400 s (24 h).
+                return min(300.0, max(1.0, float(retry_after)))
             except ValueError:
                 pass
         return 60.0
