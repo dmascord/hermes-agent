@@ -760,6 +760,7 @@ def release_all_scoped_locks(
 
 _TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
 _TAKEOVER_MARKER_TTL_S = 60  # Marker older than this is treated as stale
+_PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json"
 
 
 def _get_takeover_marker_path() -> Path:
