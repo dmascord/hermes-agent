@@ -1717,12 +1717,10 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             logger.debug("MiniMax OAuth token seed failed: %s", exc)
 
     elif provider == "openai-codex":
-        # Respect user suppression — `hermes auth remove openai-codex` marks
-        # the device_code source as suppressed so it won't be re-seeded from
-        # the Hermes auth store.  Without this gate the removal is instantly
-        # undone on the next load_pool() call.
-        if _is_suppressed(provider, "device_code"):
-            return changed, active_sources
+        # Suppression gate for the device_code singleton source only.
+        # Env-var entries (CODEX_POOL_N_*) are checked individually below
+        # and are not blocked by the device_code suppression.
+        _codex_device_code_suppressed = _is_suppressed(provider, "device_code")
 
         state = _load_provider_state(auth_store, "openai-codex")
         tokens = state.get("tokens") if isinstance(state, dict) else None
@@ -1732,7 +1730,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # refresh_token_reused race failures.  Users who want to adopt
         # existing Codex CLI credentials get a one-time, explicit prompt
         # via `hermes auth openai-codex`.
-        if isinstance(tokens, dict) and tokens.get("access_token"):
+        if not _codex_device_code_suppressed and isinstance(tokens, dict) and tokens.get("access_token"):
             active_sources.add("device_code")
             changed |= _upsert_entry(
                 entries,
@@ -1754,6 +1752,37 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # re-seed them so the pool isn't empty after restart.  Supports
         # both old ("manual:device_code") and new ("manual:device_code:<label>")
         # source formats so multi-account pools survive _upsert_entry dedup.
+        # Env-var seeding: CODEX_POOL_N_ACCESS_TOKEN / CODEX_POOL_N_REFRESH_TOKEN / CODEX_POOL_N_LABEL
+        # Allows Vault-backed tokens to seed the pool on start without any backup file.
+        # Env entries use source "env:CODEX_POOL_N" so they're evicted by
+        # _prune_stale_seeded_entries if the var is later removed, and they don't
+        # interfere with manually-imported entries (which use "manual:device_code:*").
+        # Env entries are seeded regardless of active_sources so they coexist with
+        # a singleton device_code entry (supporting mixed setups).
+        for _n in range(1, 10):
+            _at = (get_env_value(f"CODEX_POOL_{_n}_ACCESS_TOKEN") or "").strip()
+            if not _at:
+                break
+            _rt = (get_env_value(f"CODEX_POOL_{_n}_REFRESH_TOKEN") or "").strip()
+            _label = (get_env_value(f"CODEX_POOL_{_n}_LABEL") or f"CODEX_POOL_{_n}").strip()
+            _src = f"env:CODEX_POOL_{_n}"
+            if _is_suppressed(provider, _src):
+                continue
+            active_sources.add(_src)
+            changed |= _upsert_entry(
+                entries,
+                provider,
+                _src,
+                {
+                    "source": _src,
+                    "auth_type": AUTH_TYPE_OAUTH,
+                    "access_token": _at,
+                    "refresh_token": _rt or None,
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "label": _label,
+                },
+            )
+
         if not active_sources:
             pool_entries = (
                 auth_store.get("credential_pool", {})
@@ -1786,7 +1815,6 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                                     "label": str(entry.get("label") or unique_source),
                                 },
                             )
-
     return changed, active_sources
 
 
