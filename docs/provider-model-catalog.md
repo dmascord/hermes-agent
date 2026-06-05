@@ -218,3 +218,27 @@ The code echoes reasoning_content for ALL opencode-zen/go models. This is correc
 
 ### Known "no tools" (skip when tools are provided)
 None identified as absolute — all models in the chain are tried with tools. The 120s cooldown handles text-only models.
+-+-
+## Test Results (2026-06-06)
+Tested 57 models through the live Hermes gateway. **100% TOOLS_OK.**
+All models in the HERMES_CODE_FALLBACK chain return tool calls successfully.
+### Latency rankings (CODE_FALLBACK chain, gateway-tested)
+1. opencode-go/kimi-k2.6 — 1,128ms
+2. ollama/kimi-k2-thinking — 1,242ms
+3. minimax/MiniMax-M2.5 — 1,270ms
+4. opencode-go/deepseek-v4-flash — 1,559ms
+5. ollama/deepseek-v4-flash — 1,859ms
+6. google/gemini-2.5-flash — 1,910ms
+7. opencode-go/glm-5 — 2,044ms
+8. ollama/glm-5.1 — 2,055ms
+9. ollama/qwen3-coder-next — 2,234ms
+10. minimax/MiniMax-M2.7 — 2,302ms
+### OpenRouter free top-5 by latency
+1. openrouter/free — 841ms
+2. nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free — 1,042ms
+3. poolside/laguna-xs.2:free — 1,066ms
+4. nvidia/nemotron-3.5-content-safety:free — 2,008ms
+5. liquid/lfm-2.5-1.2b-instruct:free — 1,423ms
+### Key finding
+opencode-go/zen return error 1010 when hit directly, but work perfectly through Hermes gateway.
+The gateway URL normalization and auth resolution are essential.
