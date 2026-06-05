@@ -5542,6 +5542,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
                     if fb and fb not in _passthrough_models:
                         _passthrough_models.append(fb)
+            # ── Quality-based reordering ─────────────────────────────────────────
+            # Re-sort fallback models by live quality score (best first).
+            # The first model (from _select_hermes_code_model or user request)
+            # stays pinned — only fallbacks are reordered by quality.
+            if len(_passthrough_models) > 1:
+                try:
+                    from agent.model_quality_db import get_quality_score
+                    _first_model = _passthrough_models[0]
+                    _fallbacks = _passthrough_models[1:]
+                    # Sort by quality score descending (best first)
+                    _fallbacks.sort(
+                        key=lambda m: get_quality_score(
+                            m.split("/")[0] if "/" in m else "",
+                            m,
+                        ),
+                        reverse=True,
+                    )
+                    _passthrough_models = [_first_model] + _fallbacks
+                    logger.debug(
+                        "[hermes-code] quality-sorted fallback chain: top5=%s",
+                        [f"{m.split('/')[-1]}:{get_quality_score(m.split('/')[0], m):.0f}" for m in _passthrough_models[:5]],
+                    )
+                except Exception:
+                    pass
+            # ── End quality reordering ──────────────────────────────────────────
             logger.debug("[hermes-code] passthrough chain: first=%s models=%d", _passthrough_models[0] if _passthrough_models else "EMPTY", len(_passthrough_models))
 
             # ── Context overflow guard ──────────────────────────────────────────────
@@ -5807,6 +5832,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 from agent.model_cooldown_db import mark_provider_success
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
                                 mark_provider_success(_cb_prov, provider_model, base_url=base_url or "")
+                            except Exception:
+                                pass
+                            # Record quality metrics
+                            try:
+                                from agent.model_quality_db import record_success
+                                record_success(_cb_prov, provider_model, base_url=base_url or "", latency_ms=0)
                             except Exception:
                                 pass
 
