@@ -5560,7 +5560,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         reverse=True,
                     )
                     _passthrough_models = [_first_model] + _fallbacks
-                    logger.warning(
+                    logger.debug(
                         "[hermes-code] quality-sorted fallback chain: top5=%s",
                         [f"{m.split('/',1)[-1] if '/' in m else m}:{get_quality_score(m.split('/',1)[0], m.split('/',1)[1] if '/' in m else m):.0f}" for m in _passthrough_models[:5]],
                     )
