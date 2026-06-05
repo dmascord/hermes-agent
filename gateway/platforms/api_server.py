@@ -6063,7 +6063,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _rc_in_msgs = [len(m.get("reasoning_content") or "") for m in _msgs_to_send if m.get("reasoning_content")]
                                 logger.debug("[hermes-code] streaming call_llm: rc lengths in msgs=%s", _rc_in_msgs)
                                 # Deep trace: show role+rc for each message going to DeepSeek provider
-                                if prov and "opencode" in prov.lower() or "deepseek" in resolved_model.lower():
+                                if prov and ("opencode" in prov.lower() or "deepseek" in resolved_model.lower()):
                                     _trace = [(m.get("role"), len(m.get("reasoning_content") or ""), len(m.get("content") or "")) for m in _msgs_to_send if m.get("role") in ("user", "assistant")]
                                     logger.debug("[hermes-code] DEEP TRACE → provider=%s model=%s msgs_sample=%s", prov, resolved_model, _trace[:5])
                                 # Log what we're actually passing (just the assistant messages with rc)
@@ -6149,26 +6149,48 @@ class APIServerAdapter(BasePlatformAdapter):
                                     except Exception as _dex:
                                         logger.debug("[hermes-code] DEEPHEX: direct call failed: %s, falling through to call_llm", _dex)
                                         _skip_normal_call = False
-                            if not _skip_normal_call:
-                                response_obj = await _s_loop.run_in_executor(
-                                    None,
-                                    lambda: call_llm(
-                                        task="chat",
-                                        messages=_msgs_to_send,
-                                        provider=prov,
-                                        model=resolved_model,
-                                        base_url=base_url,
-                                        api_key=api_key,
-                                        max_tokens=16384,
-                                        timeout=300,
-                                        tools=passthrough_tools,
-                                    ),
+                        # ── Enforce parallel stream limit ─────────────────────────
+                        _acquired_stream = False
+                        try:
+                            from agent.provider_parallel_limiter import acquire_stream, release_stream
+                            if acquire_stream(prov, wait=True, timeout=30.0):
+                                _acquired_stream = True
+                            else:
+                                logger.warning(
+                                    "[hermes-code] cannot acquire parallel stream slot for provider=%s model=%s, skipping",
+                                    prov, resolved_model,
                                 )
+                                passthrough_error = Exception(f"{provider_model}: concurrent stream limit reached")
+                                continue
+                        except Exception:
+                            pass
+                        if not _skip_normal_call:
+                            response_obj = await _s_loop.run_in_executor(
+                                None,
+                                lambda: call_llm(
+                                    task="chat",
+                                    messages=_msgs_to_send,
+                                    provider=prov,
+                                    model=resolved_model,
+                                    base_url=base_url,
+                                    api_key=api_key,
+                                    max_tokens=16384,
+                                    timeout=300,
+                                    tools=passthrough_tools,
+                                ),
+                            )
                         try:
                             from agent.model_cooldown_db import mark_provider_success
                             mark_provider_success(prov, resolved_model, base_url=base_url or "")
                         except Exception:
                             pass
+                        # Release parallel stream slot on success
+                        if _acquired_stream:
+                            try:
+                                from agent.provider_parallel_limiter import release_stream
+                                release_stream(prov)
+                            except Exception:
+                                pass
 
                         msg = response_obj.choices[0].message
                         content_out = extract_content_or_reasoning(response_obj).strip()
@@ -6381,6 +6403,13 @@ class APIServerAdapter(BasePlatformAdapter):
                             "trying next provider",
                             provider_model,
                         )
+                        # Release parallel stream slot on skip
+                        if _acquired_stream:
+                            try:
+                                from agent.provider_parallel_limiter import release_stream
+                                release_stream(prov)
+                            except Exception:
+                                pass
                         passthrough_error = _skip_exc
                         continue
 
@@ -6396,7 +6425,21 @@ class APIServerAdapter(BasePlatformAdapter):
                         if _is_client_disconnect:
                             logger.info("[hermes-code] client disconnected mid-stream (%s), not penalising provider", provider_model)
                             passthrough_error = exc
+                            # Release parallel stream slot on client disconnect
+                            if _acquired_stream:
+                                try:
+                                    from agent.provider_parallel_limiter import release_stream
+                                    release_stream(prov)
+                                except Exception:
+                                    pass
                             break
+                        # Release parallel stream slot on provider error
+                        if _acquired_stream:
+                            try:
+                                from agent.provider_parallel_limiter import release_stream
+                                release_stream(prov)
+                            except Exception:
+                                pass
                         # Don't penalise providers for context-overflow errors — these are
                         # routing/selection issues (resolved by the pre-filter above), not
                         # model or API failures that warrant circuit-breaking.
@@ -6799,6 +6842,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     if not api_key:
                         logger.warning("[hermes-code] passthrough: %s has no API key, skipping", provider_model)
                         continue
+                    # ── Enforce parallel stream limit ─────────────────────────
+                    _acquired_stream_ns = False
+                    try:
+                        from agent.provider_parallel_limiter import acquire_stream, release_stream
+                        if acquire_stream(prov, wait=True, timeout=30.0):
+                            _acquired_stream_ns = True
+                        else:
+                            logger.warning(
+                                "[hermes-code] ns: cannot acquire parallel stream slot for provider=%s model=%s, skipping",
+                                prov, resolved_model,
+                            )
+                            passthrough_error = Exception(f"{provider_model}: concurrent stream limit reached")
+                            continue
+                    except Exception:
+                        pass
 
 
                     _ns_loop = asyncio.get_running_loop()
@@ -7016,6 +7074,13 @@ class APIServerAdapter(BasePlatformAdapter):
                             "output_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
                         },
                     )
+                    # Release parallel stream slot on success
+                    if _acquired_stream_ns:
+                        try:
+                            from agent.provider_parallel_limiter import release_stream
+                            release_stream(prov)
+                        except Exception:
+                            pass
                     return web.json_response(response_data, headers=headers)
 
                 except _CodexPassthroughSkip as _skip_exc:
@@ -7024,10 +7089,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         "trying next provider",
                         provider_model,
                     )
+                    # Release parallel stream slot on skip
+                    if _acquired_stream_ns:
+                        try:
+                            from agent.provider_parallel_limiter import release_stream
+                            release_stream(prov)
+                        except Exception:
+                            pass
                     passthrough_error = _skip_exc
                     continue
-
                 except Exception as exc:
+                    # Release parallel stream slot on provider error
+                    if _acquired_stream_ns:
+                        try:
+                            from agent.provider_parallel_limiter import release_stream
+                            release_stream(prov)
+                        except Exception:
+                            pass
                     passthrough_error = exc
                     try:
                         from agent.model_cooldown_db import mark_provider_failure
