@@ -5571,32 +5571,48 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # ── Context overflow guard ──────────────────────────────────────────────
             # When ALL passthrough models have KNOWN context windows too small for the
-            # estimated token count, return 413 telling the client to compact.
+            # estimated token count, OR all context-capable models are on cooldown,
+            # return 413 telling the client to compact.
             #
             # NOTE: Models with UNKNOWN context are NOT assumed to handle the request
-            # — they may fail for other reasons (text-only responses, network errors,
-            # rate limits). If all KNOWN models are too small, we return 413 rather
-            # than trying unknown models and risking a 503.
+            # — they may fail for other reasons. If all KNOWN models are too small
+            # (or on cooldown), we return 413 rather than burning through the chain
+            # and producing a 503.
             if _approx_tokens > 0 and len(_passthrough_models) > 0:
                 _max_known_ctx = 0
-                _any_known_can_handle = False
+                _any_viable = False
                 _known_models = []
                 for _pm in _passthrough_models:
                     _ctx = _model_context_length(_pm)
                     if _ctx > 0:
-                        # Known context — track it
                         _known_models.append((_pm, _ctx))
                         if _ctx > _max_known_ctx:
                             _max_known_ctx = _ctx
                         if _model_can_handle_context(_pm, _approx_tokens):
-                            _any_known_can_handle = True
-                # Only return 413 if we have known models AND all known models are too small.
-                if not _any_known_can_handle and _known_models:
+                            # Check this model's cooldown before declaring it viable
+                            _prov = _pm.split("/")[0] if "/" in _pm else ""
+                            _on_cooldown = False
+                            if _prov:
+                                try:
+                                    from agent.model_cooldown_db import model_cooldown_remaining
+                                    _rem = model_cooldown_remaining(_prov, _pm)
+                                    if _rem and _rem > 0:
+                                        _on_cooldown = True
+                                except Exception:
+                                    pass
+                            if not _on_cooldown:
+                                _any_viable = True
+                if not _any_viable:
                     _models_summary = ", ".join(
                         f"{m}({f'{c:,}'})" for m, c in _known_models[:5]
                     )
+                    # Differentiate context-too-small from all-on-cooldown
+                    if _max_known_ctx < _approx_tokens:
+                        _detail = f"~{_approx_tokens:,} tokens exceeds max model context ({_max_known_ctx:,})"
+                    else:
+                        _detail = f"all context-capable models on cooldown (~{_approx_tokens:,} tokens)"
                     logger.warning(
-                        "[hermes-code] ALL %d known models too small for ~%d tokens "
+                        "[hermes-code] ALL %d known models not viable for ~%d tokens "
                         "(max: %s). Returning 413 — client should compact. Chain: %s",
                         len(_known_models), _approx_tokens,
                         f"{_max_known_ctx:,}" if _max_known_ctx > 0 else "unknown",
@@ -5604,8 +5620,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     return web.json_response(
                         _openai_error(
-                            f"Context too large: ~{_approx_tokens:,} tokens exceeds "
-                            f"maximum known model context ({_max_known_ctx:,} tokens). "
+                            f"Context too large: {_detail}. "
                             f"Please compact the conversation history and retry.",
                             err_type="invalid_request_error",
                             code="context_too_large",
