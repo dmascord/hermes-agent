@@ -6500,6 +6500,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 logger.info("[hermes-code] stream %s cooled down for %.0fs after 429", provider_model, _cooldown_seconds_for_429(exc))
                             except Exception:
                                 pass
+                        elif _status_code == 400:
+                            # 400 errors (bad request) won't resolve on retry.
+                            try:
+                                from agent.model_cooldown_db import mark_model_cooldown
+                                mark_model_cooldown(
+                                    provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
+                                    model=provider_model,
+                                    cooldown_seconds=3600.0,
+                                    reason="hermes_code_stream_400",
+                                )
+                                logger.warning("[hermes-code] stream %s cooled down for 3600s after 400", provider_model)
+                            except Exception:
+                                pass
                         elif _is_auth_error:
                             # For pool-backed credentials (openai-codex), skip the model-level
                             # cooldown — the credential pool's mark_exhausted_and_rotate() below
@@ -7121,7 +7134,6 @@ class APIServerAdapter(BasePlatformAdapter):
                             pass
                     elif _status_code == 400:
                         # 400 errors (bad request format) won't resolve on retry.
-                        # Give a 1h cooldown to skip this model for the session.
                         try:
                             from agent.model_cooldown_db import mark_model_cooldown
                             mark_model_cooldown(
