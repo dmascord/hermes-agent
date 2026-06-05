@@ -388,6 +388,9 @@ def reset_all() -> None:
 # ── Internal ───────────────────────────────────────────────────────────
 
 def _make_key(provider: str, model: str, base_url: str = "") -> str:
+    # Strip provider prefix if model already includes it (e.g. "opencode-go/mimo-v2.5")
+    if "/" in model:
+        model = model.split("/", 1)[1]
     if base_url:
         return f"{provider}/{model}::{base_url}"
     return f"{provider}/{model}"
