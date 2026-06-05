@@ -7119,6 +7119,20 @@ class APIServerAdapter(BasePlatformAdapter):
                             logger.info("[hermes-code] %s cooled down for %.0fs after 429", provider_model, _cooldown_seconds_for_429(exc))
                         except Exception:
                             pass
+                    elif _status_code == 400:
+                        # 400 errors (bad request format) won't resolve on retry.
+                        # Give a 1h cooldown to skip this model for the session.
+                        try:
+                            from agent.model_cooldown_db import mark_model_cooldown
+                            mark_model_cooldown(
+                                provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
+                                model=provider_model,
+                                cooldown_seconds=3600.0,
+                                reason="hermes_code_passthrough_400",
+                            )
+                            logger.warning("[hermes-code] %s cooled down for 3600s after 400", provider_model)
+                        except Exception:
+                            pass
                     logger.warning("[hermes-code] passthrough %s failed: %s", provider_model, exc)
                     continue
 
