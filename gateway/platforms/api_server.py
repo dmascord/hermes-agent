@@ -6044,6 +6044,22 @@ class APIServerAdapter(BasePlatformAdapter):
                                     logger.warning("[hermes-code] stream %s cooled down for 3600s after 401 — token invalid, won't retry soon", provider_model)
                                 except Exception:
                                     pass
+                            elif _status_code == 400:
+                                # 400 errors (e.g. "Invalid value: 'tool'" on copilot gpt-5.x)
+                                # are client-side request format issues that won't resolve
+                                # on retry.  Give the model a short cooldown to avoid burning
+                                # 2-5s on each request.
+                                try:
+                                    from agent.model_cooldown_db import mark_model_cooldown
+                                    mark_model_cooldown(
+                                        provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
+                                        model=provider_model,
+                                        cooldown_seconds=3600.0,
+                                        reason="hermes_code_stream_400",
+                                    )
+                                    logger.warning("[hermes-code] stream %s cooled down for 3600s after 400", provider_model)
+                                except Exception:
+                                    pass
                             logger.warning("[hermes-code] passthrough stream copilot %s failed: %s", provider_model, exc)
                             passthrough_error = exc
                             continue
