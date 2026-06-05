@@ -5545,32 +5545,43 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[hermes-code] passthrough chain: first=%s models=%d", _passthrough_models[0] if _passthrough_models else "EMPTY", len(_passthrough_models))
 
             # ── Compression fallback ──────────────────────────────────────────────
-            # Proactively compact when estimated tokens exceed 128K.  This makes
-            # more models eligible (most have 128-200K context) and prevents 503
-            # errors when the few large-context models fail for other reasons.
-            # Also triggers when ALL models are genuinely too small.
-            _COMPACT_THRESHOLD = 128_000
-            if _approx_tokens > _COMPACT_THRESHOLD and len(_passthrough_models) > 0:
-                # Find the best model to target (largest context among available)
-                _best_ctx = 0
-                _best_model = ""
+            # Safety net: if ALL models in the passthrough chain have context
+            # windows too small for the estimated token count, compact the
+            # message history to fit the largest available model before
+            # attempting any provider call. This prevents every model in the
+            # chain from being skipped (which would produce a 503 error).
+            # NOTE: This only affects the local passthrough_messages for this
+            # single API call. The client's history is NOT modified. The client
+            # is responsible for its own context management (e.g. pi/opencode
+            # compaction).
+            if _approx_tokens > 0 and len(_passthrough_models) > 0:
+                _all_too_small = True
+                _largest_ctx = 0
+                _largest_model = ""
                 for _pm in _passthrough_models:
                     _ctx = _model_context_length(_pm)
-                    if _ctx > _best_ctx:
-                        _best_ctx = _ctx
-                        _best_model = _pm
-                if _best_model:
+                    if _ctx <= 0:
+                        # Unknown context — assume it can handle the request
+                        _all_too_small = False
+                        break
+                    if _ctx > _largest_ctx:
+                        _largest_ctx = _ctx
+                        _largest_model = _pm
+                    if _model_can_handle_context(_pm, _approx_tokens):
+                        _all_too_small = False
+                        break
+                if _all_too_small and _largest_model:
                     logger.warning(
-                        "[hermes-code] ~%d tokens exceeds compact threshold (%s). "
-                        "Compacting to fit %s (limit=%s) before fallback chain.",
-                        _approx_tokens, _COMPACT_THRESHOLD,
-                        _best_model, f"{_best_ctx:,}",
+                        "[hermes-code] ALL %d passthrough models too small for ~%d tokens. "
+                        "Compacting conversation to fit %s (limit=%s) before fallback chain.",
+                        len(_passthrough_models), _approx_tokens,
+                        _largest_model, f"{_largest_ctx:,}",
                     )
                     passthrough_messages = _compact_message_history(
                         passthrough_messages,
                         session_id=session_id or "unknown",
                         system_prompt="",
-                        target_model=_best_model,
+                        target_model=_largest_model,
                     )
                     try:
                         from agent.model_metadata import estimate_request_tokens_rough
