@@ -5552,37 +5552,44 @@ class APIServerAdapter(BasePlatformAdapter):
             #
             # The client (pi/opencode) manages its own context compaction. The
             # 503 "context_too_large" error is the signal to trigger that.
+            # ── Context overflow guard ──────────────────────────────────────────────
+            # When ALL passthrough models have KNOWN context windows too small for the
+            # estimated token count, return 413 telling the client to compact.
+            #
+            # NOTE: Models with UNKNOWN context are NOT assumed to handle the request
+            # — they may fail for other reasons (text-only responses, network errors,
+            # rate limits). If all KNOWN models are too small, we return 413 rather
+            # than trying unknown models and risking a 503.
             if _approx_tokens > 0 and len(_passthrough_models) > 0:
-                _max_ctx = 0
-                _any_can_handle = False
+                _max_known_ctx = 0
+                _any_known_can_handle = False
+                _known_models = []
                 for _pm in _passthrough_models:
                     _ctx = _model_context_length(_pm)
-                    if _ctx <= 0:
-                        # Unknown context — assume it can handle the request
-                        _any_can_handle = True
-                        break
-                    if _ctx > _max_ctx:
-                        _max_ctx = _ctx
-                    if _model_can_handle_context(_pm, _approx_tokens):
-                        _any_can_handle = True
-                        break
-                if not _any_can_handle:
+                    if _ctx > 0:
+                        # Known context — track it
+                        _known_models.append((_pm, _ctx))
+                        if _ctx > _max_known_ctx:
+                            _max_known_ctx = _ctx
+                        if _model_can_handle_context(_pm, _approx_tokens):
+                            _any_known_can_handle = True
+                # Only return 413 if we have known models AND all known models are too small.
+                # Unknown-context models are not assumed to handle the request.
+                if not _any_known_can_handle and _known_models:
                     _models_summary = ", ".join(
-                        f"{m}({f'{_model_context_length(m):,}' if _model_context_length(m) > 0 else '?'})"
-                        for m in _passthrough_models[:5]
+                        f"{m}({f'{c:,}'})" for m, c in _known_models[:5]
                     )
                     logger.warning(
-                        "[hermes-code] ALL %d models too small for ~%d tokens "
-                        "(max available: %s). Returning context_too_large error — "
-                        "client should compact context. Chain: %s",
-                        len(_passthrough_models), _approx_tokens,
-                        f"{_max_ctx:,}" if _max_ctx > 0 else "unknown",
+                        "[hermes-code] ALL %d known models too small for ~%d tokens "
+                        "(max: %s). Returning 413 — client should compact. Chain: %s",
+                        len(_known_models), _approx_tokens,
+                        f"{_max_known_ctx:,}" if _max_known_ctx > 0 else "unknown",
                         _models_summary,
                     )
                     return web.json_response(
                         _openai_error(
                             f"Context too large: ~{_approx_tokens:,} tokens exceeds "
-                            f"maximum available model context ({_max_ctx:,} tokens). "
+                            f"maximum known model context ({_max_known_ctx:,} tokens). "
                             f"Please compact the conversation history and retry.",
                             err_type="invalid_request_error",
                             code="context_too_large",
