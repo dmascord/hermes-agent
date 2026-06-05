@@ -5593,12 +5593,28 @@ class APIServerAdapter(BasePlatformAdapter):
             primary = os.getenv("HERMES_CODE_MODEL", "").strip()
             if primary and "/" in primary and primary not in _passthrough_models:
                 _passthrough_models.append(primary)
-            # Then fallback chain
-            for idx in range(1, 33):
-                fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
-                if fb and fb not in _passthrough_models:
-                    _passthrough_models.append(fb)
-
+            # Then fallback chain — filter through cooldown check so we skip
+            # models that will be rejected anyway.  Uses lightweight DB-only
+            # cooldown check (not the heavier _hermes_code_model_is_selectable
+            # which loads credential pools and catalog checks).
+            _cool = []
+            try:
+                from agent.model_cooldown_db import model_cooldown_remaining
+                for idx in range(1, 33):
+                    fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
+                    if fb and fb not in _passthrough_models:
+                        _prov = fb.split("/")[0] if "/" in fb else ""
+                        _rem = model_cooldown_remaining(_prov, fb) if _prov else 0
+                        if _rem and _rem > 0:
+                            logger.debug("[hermes-code] passthrough: skipping %s in cooldown (%.0fs)", fb, _rem)
+                            continue
+                        _passthrough_models.append(fb)
+            except Exception:
+                # Fallback: add all models without checking (original behaviour)
+                for idx in range(1, 33):
+                    fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
+                    if fb and fb not in _passthrough_models:
+                        _passthrough_models.append(fb)
             logger.debug("[hermes-code] passthrough chain: first=%s models=%d", _passthrough_models[0] if _passthrough_models else "EMPTY", len(_passthrough_models))
 
             # ── Compression fallback ──────────────────────────────────────────────
