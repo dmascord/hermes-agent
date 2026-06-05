@@ -5554,15 +5554,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Sort by quality score descending (best first)
                     _fallbacks.sort(
                         key=lambda m: get_quality_score(
-                            m.split("/")[0] if "/" in m else "",
-                            m,
+                            m.split("/", 1)[0] if "/" in m else "",
+                            m.split("/", 1)[1] if "/" in m else m,
                         ),
                         reverse=True,
                     )
                     _passthrough_models = [_first_model] + _fallbacks
                     logger.debug(
                         "[hermes-code] quality-sorted fallback chain: top5=%s",
-                        [f"{m.split('/')[-1]}:{get_quality_score(m.split('/')[0], m):.0f}" for m in _passthrough_models[:5]],
+                        [f"{m.split('/',1)[-1] if '/' in m else m}:{get_quality_score(m.split('/',1)[0], m.split('/',1)[1] if '/' in m else m):.0f}" for m in _passthrough_models[:5]],
                     )
                 except Exception:
                     pass
@@ -5591,7 +5591,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         if _model_can_handle_context(_pm, _approx_tokens):
                             _any_known_can_handle = True
                 # Only return 413 if we have known models AND all known models are too small.
-                # Unknown-context models are not assumed to handle the request.
                 if not _any_known_can_handle and _known_models:
                     _models_summary = ", ".join(
                         f"{m}({f'{c:,}'})" for m, c in _known_models[:5]
