@@ -5544,55 +5544,52 @@ class APIServerAdapter(BasePlatformAdapter):
                         _passthrough_models.append(fb)
             logger.debug("[hermes-code] passthrough chain: first=%s models=%d", _passthrough_models[0] if _passthrough_models else "EMPTY", len(_passthrough_models))
 
-            # ── Compression fallback ──────────────────────────────────────────────
-            # Safety net: if ALL models in the passthrough chain have context
-            # windows too small for the estimated token count, compact the
-            # message history to fit the largest available model before
-            # attempting any provider call. This prevents every model in the
-            # chain from being skipped (which would produce a 503 error).
-            # NOTE: This only affects the local passthrough_messages for this
-            # single API call. The client's history is NOT modified. The client
-            # is responsible for its own context management (e.g. pi/opencode
-            # compaction).
+            # ── Context overflow guard ──────────────────────────────────────────────
+            # When ALL passthrough models have context windows too small for the
+            # estimated token count, return a clear error telling the client to
+            # compact its context. We do NOT silently compress server-side because
+            # the client keeps the full history and would send it again next time.
+            #
+            # The client (pi/opencode) manages its own context compaction. The
+            # 503 "context_too_large" error is the signal to trigger that.
             if _approx_tokens > 0 and len(_passthrough_models) > 0:
-                _all_too_small = True
-                _largest_ctx = 0
-                _largest_model = ""
+                _max_ctx = 0
+                _any_can_handle = False
                 for _pm in _passthrough_models:
                     _ctx = _model_context_length(_pm)
                     if _ctx <= 0:
                         # Unknown context — assume it can handle the request
-                        _all_too_small = False
+                        _any_can_handle = True
                         break
-                    if _ctx > _largest_ctx:
-                        _largest_ctx = _ctx
-                        _largest_model = _pm
+                    if _ctx > _max_ctx:
+                        _max_ctx = _ctx
                     if _model_can_handle_context(_pm, _approx_tokens):
-                        _all_too_small = False
+                        _any_can_handle = True
                         break
-                if _all_too_small and _largest_model:
+                if not _any_can_handle:
+                    _models_summary = ", ".join(
+                        f"{m}({f'{_model_context_length(m):,}' if _model_context_length(m) > 0 else '?'})"
+                        for m in _passthrough_models[:5]
+                    )
                     logger.warning(
-                        "[hermes-code] ALL %d passthrough models too small for ~%d tokens. "
-                        "Compacting conversation to fit %s (limit=%s) before fallback chain.",
+                        "[hermes-code] ALL %d models too small for ~%d tokens "
+                        "(max available: %s). Returning context_too_large error — "
+                        "client should compact context. Chain: %s",
                         len(_passthrough_models), _approx_tokens,
-                        _largest_model, f"{_largest_ctx:,}",
+                        f"{_max_ctx:,}" if _max_ctx > 0 else "unknown",
+                        _models_summary,
                     )
-                    passthrough_messages = _compact_message_history(
-                        passthrough_messages,
-                        session_id=session_id or "unknown",
-                        system_prompt="",
-                        target_model=_largest_model,
+                    return web.json_response(
+                        _openai_error(
+                            f"Context too large: ~{_approx_tokens:,} tokens exceeds "
+                            f"maximum available model context ({_max_ctx:,} tokens). "
+                            f"Please compact the conversation history and retry.",
+                            err_type="invalid_request_error",
+                            code="context_too_large",
+                        ),
+                        status=413,
                     )
-                    try:
-                        from agent.model_metadata import estimate_request_tokens_rough
-                        _approx_tokens = estimate_request_tokens_rough(
-                            passthrough_messages,
-                            system_prompt=system_prompt or "",
-                            tools=tools,
-                        )
-                    except Exception:
-                        _approx_tokens = 0
-            # ── End compression fallback ──────────────────────────────────────────
+            # ── End context overflow guard ──────────────────────────────────────────
 
             passthrough_error = None
             _pt_call_count = [0]  # mutable counter: incremented per provider attempt
