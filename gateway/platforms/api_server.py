@@ -5985,6 +5985,14 @@ class APIServerAdapter(BasePlatformAdapter):
                                     mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
                                 except Exception:
                                     pass
+                            # Record quality failure (unless context overflow — that's a routing issue)
+                            if not _is_ctx_overflow:
+                                try:
+                                    from agent.model_quality_db import record_failure
+                                    _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
+                                    record_failure(_cb_prov, provider_model, base_url=base_url or "", error_message=str(exc)[:200])
+                                except Exception:
+                                    pass
                             _invalidate_selectable_pool_cache()
                             # Check if this is a rate-limit (429) or auth (401) error; cooldown the provider.
                             _status_code = getattr(exc, "status_code", None)
@@ -6289,6 +6297,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                     )
                                 except Exception:
                                     pass
+                                try:
+                                    from agent.model_quality_db import record_text_only
+                                    record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
+                                except Exception:
+                                    pass
                                 raise _CodexPassthroughSkip()
                             else:
                                 logger.warning(
@@ -6328,6 +6341,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             _args_preview,
                             len(content_out) if content_out else 0,
                         )
+                        try:
+                            from agent.model_quality_db import record_success
+                            _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
+                            record_success(_cb_prov, provider_model, base_url=base_url or "", latency_ms=0)
+                        except Exception:
+                            pass
 
                         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
                         created = int(time.time())
@@ -6494,6 +6513,14 @@ class APIServerAdapter(BasePlatformAdapter):
                                 from agent.model_cooldown_db import mark_provider_failure
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
                                 mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
+                            except Exception:
+                                pass
+                        # Record quality failure (unless context overflow — routing issue)
+                        if not _is_ctx_overflow:
+                            try:
+                                from agent.model_quality_db import record_failure
+                                _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
+                                record_failure(_cb_prov, provider_model, base_url=base_url or "", error_message=str(exc)[:200])
                             except Exception:
                                 pass
                         _invalidate_selectable_pool_cache()
@@ -6769,6 +6796,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             mark_provider_success(_cb_prov, provider_model, base_url=base_url or "")
                         except Exception:
                             pass
+                        try:
+                            from agent.model_quality_db import record_success
+                            _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
+                            record_success(_cb_prov, provider_model, base_url=base_url or "", latency_ms=0)
+                        except Exception:
+                            pass
 
                         assistant_msg: Dict[str, Any] = {"role": "assistant"}
                         if tool_calls:
@@ -6847,6 +6880,13 @@ class APIServerAdapter(BasePlatformAdapter):
                             mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
                         except Exception:
                             pass
+                        try:
+                            from agent.model_quality_db import record_failure
+                            _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
+                            record_failure(_cb_prov, provider_model, base_url=base_url or "", error_message=str(exc)[:200])
+                        except Exception:
+                            pass
+
                         _invalidate_selectable_pool_cache()
                         # Check if this is a rate-limit error; if so, cooldown the provider
                         _is_rate_limit = False
@@ -6982,6 +7022,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             mark_provider_success(prov, resolved_model, base_url=base_url or "")
                         except Exception:
                             pass
+                        try:
+                            from agent.model_quality_db import record_success
+                            record_success(prov, provider_model, base_url=base_url or "", latency_ms=0)
+                        except Exception:
+                            pass
 
                     msg = response_obj.choices[0].message
                     content = extract_content_or_reasoning(response_obj).strip()
@@ -7034,6 +7079,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                     cooldown_seconds=120.0,
                                     reason="text_only_with_tools",
                                 )
+                            except Exception:
+                                pass
+                            try:
+                                from agent.model_quality_db import record_text_only
+                                record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
                             except Exception:
                                 pass
                             raise _CodexPassthroughSkip()
@@ -7156,6 +7206,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         from agent.model_cooldown_db import mark_provider_failure
                         _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
                         mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
+                    except Exception:
+                        pass
+                    try:
+                        from agent.model_quality_db import record_failure
+                        _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
+                        record_failure(_cb_prov, provider_model, base_url=base_url or "", error_message=str(exc)[:200])
                     except Exception:
                         pass
                     _invalidate_selectable_pool_cache()
