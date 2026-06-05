@@ -5545,14 +5545,6 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[hermes-code] passthrough chain: first=%s models=%d", _passthrough_models[0] if _passthrough_models else "EMPTY", len(_passthrough_models))
 
             # ── Context overflow guard ──────────────────────────────────────────────
-            # When ALL passthrough models have context windows too small for the
-            # estimated token count, return a clear error telling the client to
-            # compact its context. We do NOT silently compress server-side because
-            # the client keeps the full history and would send it again next time.
-            #
-            # The client (pi/opencode) manages its own context compaction. The
-            # 503 "context_too_large" error is the signal to trigger that.
-            # ── Context overflow guard ──────────────────────────────────────────────
             # When ALL passthrough models have KNOWN context windows too small for the
             # estimated token count, return 413 telling the client to compact.
             #
