@@ -700,62 +700,27 @@ _HERMES_CODE_PREMIUM_MODELS = (
     "github-copilot-enterprise/gpt-5.4",
     "github-copilot-enterprise/gpt-5.3-codex",
     "github-copilot-enterprise/gpt-5-mini",
-    # xiaomi models - reasonable cost/quality
-    "xiaomi/mimo-v2.5-pro",
-    "xiaomi/mimo-v2-pro",
-    "xiaomi/mimo-v2-omni",
     # minimax
-    "minimax/MiniMax-M2.7-highspeed",
     "minimax/MiniMax-M2.7",
-    # opencode-go models
+    "minimax/MiniMax-M2.5",
+    # opencode-go
     "opencode-go/deepseek-v4-pro",
     "opencode-go/kimi-k2.6",
-    "opencode-go/minimax-m2.7",
     "opencode-go/qwen3.6-plus",
     "opencode-go/glm-5.1",
     # opencode-zen
     "opencode-zen/big-pickle",
     "opencode-zen/minimax-m2.5-free",
-    "opencode-zen/hy3-preview-free",
-    # arliai
-    "arliai/Mistral-Medium-3.5-128B",
-    "arliai/Gemma-4-31B-Claude-4.6-Opus-Reasoning-Distilled",
-    "arliai/Gemma-4-31B-it",
-    "arliai/GLM-4.7",
-    "arliai/GLM-4.6-Derestricted-v5",
     # zai
     "zai/glm-4.7",
     "zai/glm-5.1",
-    # ollama-mac — local M4 Max MLX models (LAN-only, free, 58 tok/s for 35B MoE)
-    "ollama-mac/qwopus3.6-35b-a3b:latest",  # 35B MoE, ~3.6B active, 58 tok/s — best Mac model
-    # ollama cloud — ordered L1→L3, L4 models excluded from auto-fallback
-    # L1 (cheapest: small/sparse, ~4B effective params)
-    "ollama/gpt-oss:20b",          # 20B MoE, MXFP4, ~4B active — thinking+tools, very cheap
-    "ollama/nemotron-3-nano:30b",  # 30B MoE, 4B active — strong for cost
-    "ollama/rnj-1:8b",             # 8B dense — fast, good for code/STEM
-    "ollama/ministral-3:8b",       # 8B dense — reliable fallback
-    # L2 (medium: 20-40B effective or strong specialist)
-    "ollama/devstral-small-2:24b", # 24B dense, coding-specialist (Mistral)
-    "ollama/glm-4.7",              # ~40B MoE, 9B active — strong coding
-    "ollama/kimi-k2.6",            # MoE, vision+tools+thinking — strong agentic
-    "ollama/nemotron-3-super",     # 120B MoE, 12B active — reasoning at L2 cost
-    "ollama/gpt-oss:120b",         # 120B MoE, MXFP4 — very capable at manageable cost
-    # L3 (heavy: use only when quality matters and L1/L2 exhausted)
-    "ollama/glm-5.1",              # 744B/40B active — SWE-bench leader for agentic coding
-    "ollama/minimax-m2.7",         # strong reasoning, expensive
-    "ollama/deepseek-v4-flash",    # 284B/13B active — cheaper than size implies
-    # synthetic - last resort
-    "synthetic/hf:MiniMaxAI/MiniMax-M2.5",
-    "synthetic/hf:Qwen/Qwen3-Coder-480B-A35B-Instruct",
-    "synthetic/hf:deepseek-ai/DeepSeek-V3.2",
-    "synthetic/hf:moonshotai/Kimi-K2.5",
-    "synthetic/hf:zai-org/GLM-5.1",
-    # More arliai
-    "arliai/Qwen3.5-27B-Anko",
-    "arliai/Qwen3.5-27B-BlueStar-v3-Derestricted",
-    "arliai/Qwen3.5-27B-Infracelestial",
-    "arliai/Qwen3.5-27B-Writer-V2-Derestricted",
-    "arliai/Qwen3.5-27B-Omega-Evolution-v2.0-Derestricted",
+    # ollama-mac — local M4 Max MLX models (LAN-only, free)
+    "ollama-mac/qwopus3.6-35b-a3b:latest",
+    # ollama — ordered by cost/quality
+    "ollama/glm-4.7",
+    "ollama/kimi-k2.6",
+    "ollama/glm-5.1",
+    "ollama/deepseek-v4-flash",
 )
 
 _GITHUB_COPILOT_ENTERPRISE_SCOUT_MODELS = (
