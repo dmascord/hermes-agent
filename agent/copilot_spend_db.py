@@ -47,23 +47,51 @@ _DEFAULT_MONTHLY_AIU_LIMIT: float = 8000.0
 
 # All GHE provider prefixes that share the same spend pool.
 _GHE_PROVIDER = "github-copilot-enterprise"
+# Separate AIU limits by endpoint:
+# - Public: https://api.githubcopilot.com (dmascord's GitHub Copilot)
+# - Enterprise: https://copilot-api.sita.ghe.com (SITA GHE, separate budget)
+_GHE_PUBLIC_BASE = "https://api.githubcopilot.com"
+_GHE_ENTERPRISE_BASE = "https://copilot-api.sita.ghe.com"
 
 
 def _db_path() -> Path:
     return get_hermes_home() / "copilot_spend.json"
 
 
-def _monthly_limit_aiu() -> float:
+# Return limit for a given base_url.
+# - Public (api.githubcopilot.com): 3000 AIU (dmascord's GitHub Copilot)
+# - Enterprise (copilot-api.sita.ghe.com): 3900 AIU (SITA GHE)
+def _monthly_limit_for(base_url: str) -> float:
+    base = (base_url or "").rstrip("/")
+    if base == _GHE_PUBLIC_BASE:
+        raw = os.getenv("COPILOT_PUBLIC_MONTHLY_AIU_LIMIT", "").strip()
+        if raw:
+            try:
+                return max(0, float(raw))
+            except (ValueError, TypeError):
+                pass
+        return 3000.0
+    elif base == _GHE_ENTERPRISE_BASE:
+        raw = os.getenv("COPILOT_ENTERPRISE_MONTHLY_AIU_LIMIT", "").strip()
+        if raw:
+            try:
+                return max(0, float(raw))
+            except (ValueError, TypeError):
+                pass
+        return 3900.0
+    # Fallback: legacy env var
     raw = os.getenv("COPILOT_MONTHLY_AIU_LIMIT", "").strip()
     try:
         v = float(raw)
         return v if v > 0 else _DEFAULT_MONTHLY_AIU_LIMIT
     except (ValueError, TypeError):
         return _DEFAULT_MONTHLY_AIU_LIMIT
+# Legacy function for backward compatibility.
+_monthly_limit_aiu = _monthly_limit_for  # noqa: E731
 
 
 def _empty_db() -> dict[str, Any]:
-    return {"version": 1, "events": []}
+    return {"version": 1, "events": {}}
 
 
 def _load_unlocked() -> dict[str, Any]:
@@ -75,7 +103,15 @@ def _load_unlocked() -> dict[str, Any]:
     except Exception as exc:
         logger.warning("[copilot_spend] failed to read %s: %s", path, exc)
         return _empty_db()
-    if not isinstance(data, dict) or not isinstance(data.get("events"), list):
+    # Migrate legacy list format to per-base dict.
+    raw_events = data.get("events")
+    if isinstance(raw_events, list):
+        # Legacy: all events in one list. Assign to enterprise base (existing
+        # behaviour for pre-split deployments), then save new dict format.
+        events = {_GHE_ENTERPRISE_BASE: raw_events}
+        data["events"] = events
+        _save_unlocked(data)
+    elif not isinstance(raw_events, dict):
         return _empty_db()
     return data
 
@@ -104,7 +140,6 @@ def extract_nano_aiu(response_obj: Any) -> int:
     try:
         cu = getattr(response_obj, "copilot_usage", None)
         if cu is None:
-            # Fall back to model_extra for forward-compat with SDK changes.
             me = getattr(response_obj, "model_extra", None) or {}
             cu = me.get("copilot_usage")
         if not isinstance(cu, dict):
@@ -113,7 +148,14 @@ def extract_nano_aiu(response_obj: Any) -> int:
         return int(v) if isinstance(v, (int, float)) and v > 0 else 0
     except Exception:
         return 0
-
+def _normalize_base(base_url: str) -> str:
+    """Return the canonical bucket key for *base_url*."""
+    base = (base_url or "").rstrip("/")
+    if base == _GHE_PUBLIC_BASE:
+        return _GHE_PUBLIC_BASE
+    if base == _GHE_ENTERPRISE_BASE:
+        return _GHE_ENTERPRISE_BASE
+    return base or _GHE_ENTERPRISE_BASE
 
 def record_and_check(
     response_obj: Any,
@@ -121,97 +163,79 @@ def record_and_check(
     provider_model: str = "",
     base_url: str = "",
 ) -> None:
-    """Record AIU spend from *response_obj* and enforce monthly limit.
-
-    Call this immediately after every successful GHE response.  No-ops
-    silently when the response has no ``copilot_usage`` field (non-GHE
-    providers).
-
+    """Record AIU spend from *response_obj* and enforce per-account monthly limit.
+    The spend is bucketed by base_url so the public GitHub Copilot account
+    (dmascord, 3000 AIU) and SITA GHE account (3900 AIU) are tracked separately.
     Args:
         response_obj: The ChatCompletion object returned by the OpenAI SDK.
         provider_model: Full model string, e.g. ``"github-copilot-enterprise/gpt-5.4"``.
-        base_url: The GHE base URL used for the request (for cooldown scoping).
+        base_url: The GHE base URL used for the request.
     """
     nano_aiu = extract_nano_aiu(response_obj)
     if nano_aiu <= 0:
         return
-
     now = time.time()
-    limit_nano = int(_monthly_limit_aiu() * _NANO_AIU_PER_AIU)
-
+    bucket = _normalize_base(base_url)
+    limit_aiu = _monthly_limit_for(bucket)
+    limit_nano = int(limit_aiu * _NANO_AIU_PER_AIU)
     with _LOCK:
         data = _load_unlocked()
-        events: list = data.get("events", [])
-        events = _prune_old_events(events, now)
-        events.append([now, nano_aiu])
-        data["events"] = events
-
-        rolling_nano = _rolling_total_nano_aiu(events)
+        events_by_base: dict = data.get("events", {})
+        bucket_events: list = _prune_old_events(events_by_base.get(bucket, []), now)
+        bucket_events.append([now, nano_aiu])
+        events_by_base[bucket] = bucket_events
+        data["events"] = events_by_base
+        rolling_nano = _rolling_total_nano_aiu(bucket_events)
         rolling_aiu = rolling_nano / _NANO_AIU_PER_AIU
-
         logger.info(
-            "[copilot_spend] recorded %.4f AIU (%.4f AIU rolling/30d, limit=%.0f AIU) model=%s",
+            "[copilot_spend] recorded %.4f AIU (%.4f AIU rolling/30d, limit=%.0f AIU) model=%s base=%s",
             nano_aiu / _NANO_AIU_PER_AIU,
             rolling_aiu,
-            _monthly_limit_aiu(),
+            limit_aiu,
             provider_model,
+            bucket,
         )
-
         _save_unlocked(data)
-
     if rolling_nano > limit_nano:
-        _enforce_cooldown(rolling_nano, limit_nano, now, base_url=base_url)
+        _enforce_cooldown(bucket, rolling_nano, limit_nano, now)
 
 
 def _enforce_cooldown(
+    base: str,
     rolling_nano: int,
     limit_nano: int,
     now: float,
-    *,
-    base_url: str = "",
 ) -> None:
-    """Place all GHE models into cooldown until the rolling window clears.
-
-    The cooldown duration is set to expire when the oldest event in the
-    window would fall out of the 30-day look-back, making the monthly total
-    drop below the limit again.  We conservatively add 60 s of padding.
-    """
+    """Place GHE models for *base* into cooldown until the rolling window clears."""
     try:
         from agent.model_cooldown_db import mark_model_cooldown
     except Exception as exc:
         logger.error("[copilot_spend] cannot import mark_model_cooldown: %s", exc)
         return
-
-    # Determine when the window clears: oldest event timestamp + 30 days.
     with _LOCK:
         data = _load_unlocked()
-        events = _prune_old_events(data.get("events", []), now)
-
-    # Find the oldest event that is still pushing us over the limit.
-    # Walk from oldest → newest, dropping events until we're under limit.
+        events_by_base: dict = data.get("events", {})
+        events = _prune_old_events(events_by_base.get(base, []), now)
     rolling = _rolling_total_nano_aiu(events)
-    window_clears_at = now + _ROLLING_WINDOW_SECONDS  # pessimistic default
+    window_clears_at = now + _ROLLING_WINDOW_SECONDS
     for e in sorted(events, key=lambda x: x[0]):
         rolling -= int(e[1])
         if rolling <= limit_nano:
-            # Once this event drops out of the window we'd be under limit.
             window_clears_at = e[0] + _ROLLING_WINDOW_SECONDS
             break
-
     cooldown_seconds = max(60.0, window_clears_at - now + 60.0)
     rolling_aiu = rolling_nano / _NANO_AIU_PER_AIU
     limit_aiu = limit_nano / _NANO_AIU_PER_AIU
-
+    label = "public" if base == _GHE_PUBLIC_BASE else "enterprise"
     logger.warning(
-        "[copilot_spend] monthly AIU limit exceeded: %.2f / %.0f AIU — "
+        "[copilot_spend] monthly AIU limit exceeded (%s): %.2f / %.0f AIU — "
         "placing github-copilot-enterprise into cooldown for %.0fs (%.1f days)",
+        label,
         rolling_aiu,
         limit_aiu,
         cooldown_seconds,
         cooldown_seconds / 3600 / 24,
     )
-
-    # Cooldown every known GHE model so the router skips the entire pool.
     _GHE_MODELS = [
         "gpt-4o-mini",
         "gpt-4o-mini-2024-07-18",
@@ -220,9 +244,6 @@ def _enforce_cooldown(
         "gpt-5.3-codex",
         "claude-sonnet-4.6",
         "claude-opus-4.6",
-        # Wildcard sentinel: the router checks cooldown_remaining for the
-        # raw provider_model string too, so record a global provider-level
-        # entry using an empty model to catch anything we don't list here.
         "",
     ]
     for model in _GHE_MODELS:
@@ -230,7 +251,7 @@ def _enforce_cooldown(
             mark_model_cooldown(
                 _GHE_PROVIDER,
                 model or "*",
-                base_url=base_url,
+                base_url=base,
                 cooldown_seconds=cooldown_seconds,
                 reason="monthly_aiu_limit_exceeded",
             )
@@ -238,10 +259,21 @@ def _enforce_cooldown(
             logger.error("[copilot_spend] mark_model_cooldown failed model=%s: %s", model, exc)
 
 
-def rolling_spend_aiu() -> float:
-    """Return the current rolling 30-day AIU spend (read-only, no locking needed for monitoring)."""
+def rolling_spend_aiu(base_url: str = "") -> float:
+    """Return the current rolling 30-day AIU spend for the given *base_url*.
+    When *base_url* is empty/omitted, returns the combined total (legacy
+    monitoring). Call with the specific base to get per-account spend.
+    """
     now = time.time()
+    bucket = _normalize_base(base_url) if base_url else "*"
     with _LOCK:
         data = _load_unlocked()
-        events = _prune_old_events(data.get("events", []), now)
+        events_by_base: dict = data.get("events", {})
+        if bucket == "*":
+            total = sum(
+                _rolling_total_nano_aiu(_prune_old_events(evts, now))
+                for evts in events_by_base.values()
+            )
+            return total / _NANO_AIU_PER_AIU
+        events = _prune_old_events(events_by_base.get(bucket, []), now)
     return _rolling_total_nano_aiu(events) / _NANO_AIU_PER_AIU
