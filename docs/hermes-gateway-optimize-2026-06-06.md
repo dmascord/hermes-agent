@@ -77,6 +77,8 @@ Scout chain had a gap at position 3, now filled:
 Cleared excessive ollama cooldowns (167h / 7-day week limit) — models verified working.
 Cooldowns use passthrough key format (provider\x1fmodel\x1f\x1f), matching both read and write paths.
 
+Set `HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN=3600` (1h cap) to prevent 7-day cooldowns for ollama and other models that return weekly quota error messages.
+
 ## Known Constraints
 
 ### Google Gemini Free Tier (20 req/day)
