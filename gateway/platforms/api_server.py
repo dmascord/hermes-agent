@@ -6242,9 +6242,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                     if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
                                         for _tc in _msg["tool_calls"]:
                                             if isinstance(_tc, dict) and _tc.get("type") == "function":
-                                                _fn = _tc.get("function") or {}
-                                                if isinstance(_fn, dict) and "thoughtSignature" not in _fn:
-                                                    _fn["thoughtSignature"] = "skip_thought_signature_validator"
+                                                # thoughtSignature goes at functionCall level, not inside function object.
+                                                if "thoughtSignature" not in _tc:
+                                                    _tc["thoughtSignature"] = "skip_thought_signature_validator"
 
                             # ── arliai tool_call_id sanitization ────────────────────
                             # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
