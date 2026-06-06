@@ -6213,6 +6213,19 @@ class APIServerAdapter(BasePlatformAdapter):
                             if _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url):
                                 _msgs_to_send = _synthesize_reasoning_for_tool_calls(_msgs_to_send)
 
+                            # ── Google thought_signature injection ──────────────────
+                            # Google's OpenAI-compatible API requires thoughtSignature on
+                            # function_call parts in assistant messages. Without it, Gemini
+                            # 3.1+ returns 400. Inject a sentinel for all function calls.
+                            if "generativelanguage.googleapis.com" in (base_url or ""):
+                                for _msg in _msgs_to_send:
+                                    if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
+                                        for _tc in _msg["tool_calls"]:
+                                            if isinstance(_tc, dict) and _tc.get("type") == "function":
+                                                _fn = _tc.get("function") or {}
+                                                if isinstance(_fn, dict) and "thoughtSignature" not in _fn:
+                                                    _fn["thoughtSignature"] = "skip_thought_signature_validator"
+
                             # ── arliai tool_call_id sanitization ────────────────────
                             # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
                             # mapper so the client sees the original IDs while upstream
