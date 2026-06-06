@@ -59,34 +59,52 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     errors (weekly / daily / N-hour limits) are cooled down for the full
     reset window instead of the default 10-minute generic cooldown.
     """
+    import os as _os
+    import re as _re
+    import time as _time
+
     # 1. Honour Retry-After header if the underlying HTTP response is attached.
     try:
         retry_after = exc.response.headers.get("Retry-After") or exc.response.headers.get("retry-after")  # type: ignore[union-attr]
         if retry_after:
-            # Honor the actual value from the upstream provider — 24 h resets
-            # would be honoured the same as a 60 s rate-limit window.
-            # An optional HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN env var can cap
-            # this at runtime if a hard upper bound is ever needed.
-            import os as _os
             _max = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
             _val = max(60.0, float(retry_after))
             return _val if _max <= 0 else min(_val, _max)
     except Exception:
         pass
 
-    # 2. Parse the error body for quota-exhaustion keywords.
+    # 2. Check for X-RateLimit-Reset header (Unix timestamp).
+    try:
+        reset_ts = exc.response.headers.get("X-RateLimit-Reset") or exc.response.headers.get("x-ratelimit-reset")  # type: ignore[union-attr]
+        if reset_ts:
+            _remaining = max(60.0, float(reset_ts) - _time.time())
+            return _remaining
+    except Exception:
+        pass
+
+    # 3. Parse the error body for quota-exhaustion keywords and actual reset time.
     body = str(exc).lower()
-    _import_os_once = __import__("os")
-    _max_cap = float(_import_os_once.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
+    _max_cap = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
+
+    # Look for "reset in X" or "X remaining" patterns in the error body.
+    # Common formats: "reset in 5 days", "5 days remaining", "retry in 24 hours"
+    _reset_match = _re.search(r'(?:reset in|retry in|retry_after|remaining)[:\s]*(\d+)\s*(second|minute|hour|day|week)s?', body)
+    if _reset_match:
+        _amount = int(_reset_match.group(1))
+        _unit = _reset_match.group(2)
+        _multipliers = {"second": 1, "minute": 60, "hour": 3600, "day": 86400, "week": 604800}
+        _raw = _amount * _multipliers.get(_unit, 3600)
+        # Only cap hourly limits — weekly/daily limits should be respected.
+        return _raw if _max_cap <= 0 else min(_raw, _max_cap)
+
     if "weekly" in body or "week" in body:
         # Weekly limit — respect the full window, don't cap it.
-        # Capping a weekly limit to 1h would cause constant retry spam.
         return 7 * 24 * 3600.0
     if "daily" in body or "day" in body:
         # Daily limit — respect the full window, don't cap it.
         return 24 * 3600.0
     # "5 hour", "5-hour", "5hour" etc.
-    _hour_match = re.search(r'(\d+)\s*-?\s*hour', body)
+    _hour_match = _re.search(r'(\d+)\s*-?\s*hour', body)
     if _hour_match:
         _raw = max(3600.0, int(_hour_match.group(1)) * 3600.0)
         # Only cap hourly limits — they might be overly aggressive.
@@ -94,7 +112,7 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     if "hour" in body:
         return 3600.0
 
-    # 3. Generic rate-limit — 10 minutes.
+    # 4. Generic rate-limit — 10 minutes.
     return 600.0
 
 
