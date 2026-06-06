@@ -6084,31 +6084,34 @@ class APIServerAdapter(BasePlatformAdapter):
                                 except Exception:
                                     pass
                             elif _is_auth_error:
+                                # Auth errors (401) — reduce to 120s cooldown instead of 3600s
+                                # so models recover faster. Auth errors are transient
+                                # (token rotation, rate limits) and 1h is too long when
+                                # all large-context models share the same credential pool.
                                 try:
                                     from agent.model_cooldown_db import mark_model_cooldown
                                     mark_model_cooldown(
                                         provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
                                         model=provider_model,
-                                        cooldown_seconds=3600.0,
+                                        cooldown_seconds=120.0,
                                         reason="hermes_code_stream_401",
                                     )
-                                    logger.warning("[hermes-code] stream %s cooled down for 3600s after 401 — token invalid, won't retry soon", provider_model)
+                                    logger.warning("[hermes-code] stream %s cooled down for 120s after 401", provider_model)
                                 except Exception:
                                     pass
                             elif _status_code == 400:
-                                # 400 errors (e.g. "Invalid value: 'tool'" on copilot gpt-5.x)
-                                # are client-side request format issues that won't resolve
-                                # on retry.  Give the model a short cooldown to avoid burning
-                                # 2-5s on each request.
+                                # 400 errors (bad request) — reduce to 120s cooldown.
+                                # These won't resolve on retry but 1h is too aggressive
+                                # when large-context models are in high demand.
                                 try:
                                     from agent.model_cooldown_db import mark_model_cooldown
                                     mark_model_cooldown(
                                         provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
                                         model=provider_model,
-                                        cooldown_seconds=3600.0,
+                                        cooldown_seconds=120.0,
                                         reason="hermes_code_stream_400",
                                     )
-                                    logger.warning("[hermes-code] stream %s cooled down for 3600s after 400", provider_model)
+                                    logger.warning("[hermes-code] stream %s cooled down for 120s after 400", provider_model)
                                 except Exception:
                                     pass
                             logger.warning("[hermes-code] passthrough stream copilot %s failed: %s", provider_model, exc)
@@ -6634,17 +6637,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass
                         elif _status_code == 400:
-                            # 400 errors (bad request) won't resolve on retry.
+                            # 400 errors (bad request) — reduce to 120s cooldown.
                             try:
                                 from agent.model_cooldown_db import mark_model_cooldown
                                 mark_model_cooldown(
                                     provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
                                     model=provider_model,
-                                    cooldown_seconds=3600.0,
+                                    cooldown_seconds=120.0,
                                     reason="hermes_code_stream_400",
                                 )
-                                logger.warning("[hermes-code] stream %s cooled down for 3600s after 400", provider_model)
-
+                                logger.warning("[hermes-code] stream %s cooled down for 120s after 400", provider_model)
                             except Exception:
                                 pass
                         elif _is_auth_error:
@@ -6660,10 +6662,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                     mark_model_cooldown(
                                         provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
                                         model=provider_model,
-                                        cooldown_seconds=3600.0,
+                                        cooldown_seconds=120.0,
                                         reason="hermes_code_stream_401",
                                     )
-                                    logger.warning("[hermes-code] stream %s cooled down for 3600s after 401 — token invalid, won't retry soon", provider_model)
+                                    logger.warning("[hermes-code] stream %s cooled down for 120s after 401", provider_model)
                                 except Exception:
                                     pass
                             # For pool-backed credentials (openai-codex), rotate to the next
@@ -7347,16 +7349,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
                     elif _status_code == 400:
-                        # 400 errors (bad request format) won't resolve on retry.
+                        # 400 errors (bad request format) — reduce to 120s cooldown.
                         try:
                             from agent.model_cooldown_db import mark_model_cooldown
                             mark_model_cooldown(
                                 provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
                                 model=provider_model,
-                                cooldown_seconds=3600.0,
+                                cooldown_seconds=120.0,
                                 reason="hermes_code_passthrough_400",
                             )
-                            logger.warning("[hermes-code] %s cooled down for 3600s after 400", provider_model)
+                            logger.warning("[hermes-code] %s cooled down for 120s after 400", provider_model)
                         except Exception:
                             pass
                     logger.warning("[hermes-code] passthrough %s failed: %s", provider_model, exc)
