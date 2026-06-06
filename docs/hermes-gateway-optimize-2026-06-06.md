@@ -12,12 +12,6 @@
 
 Created `plugins/model-providers/arliai/__init__.py` — registers 66 open-weight models via `api.arliai.com/v1`. **Constraint**: 2 concurrent requests max (ADVANCED tier).
 
-### Code Passthrough Chain (1 primary + 29 fallbacks = 30 unique models)
-
-Reordered by measured quality data (text-only rates), added 3 new providers (synthetic, ollama-cloud, arliai), moved gemini-2.5-flash to lower priority (20 req/day free tier limit).
-
-**Provider breakdown**: cerebras (1), cohere (1), opencode-go (5), ollama (4), arliai (4), minimax (3), synthetic (3), nous (2), ollama-cloud (2), google (2), github-copilot-enterprise (1), opencode-zen (1), zai (1), groq (1)
-|
 | # | Model | Provider | Notes |
 |---|-------|----------|-------|
 | 1 | `github-copilot-enterprise/gpt-5.4-mini` | copilot | PRIMARY |
@@ -31,24 +25,24 @@ Reordered by measured quality data (text-only rates), added 3 new providers (syn
 | 9 | `ollama/deepseek-v4-flash` | ollama | Low text-only (8.3%) |
 | 10 | `zai/glm-4.7` | zai | 20% text-only |
 | 11 | `cerebras/gpt-oss-120b` | cerebras | **NEW** — 120B params, 1.5s latency, tools OK |
-| 12 | `cohere/command-r-plus-08-2024` | cohere | **NEW** — 2.7s latency, verified tools OK |
-| 13 | `opencode-go/qwen3.6-plus` | opencode-go | 100% score |
+| 12 | `cohere/command-r-plus-08-2024` | cohere | **NEW** — 2.7s latency, tools OK |
+| 13 | `groq/llama-3.3-70b-versatile` | groq | Fast, reliable, tools OK |
 | 14 | `opencode-go/kimi-k2.6` | opencode-go | 21% text-only |
 | 15 | `nous/stepfun/step-3.7-flash:free` | nous | Free tier |
 | 16 | `ollama/qwen3-coder-next` | ollama | 31% text-only |
 | 17 | `ollama/glm-5.1` | ollama | 23% text-only |
-| 18 | `google/gemini-3.1-flash-preview` | google | ✅ UNLIMITED (0/0 RPD) — replaced 2.5-flash |
+| 18 | `google/gemini-3.1-flash-preview` | google | ✅ UNLIMITED (0/0 RPD) |
 | 19 | `nous/nvidia/nemotron-3-ultra:free` | nous | Free tier |
 | 20 | `ollama/kimi-k2-thinking` | ollama | Last resort (75% text-only) |
-| 21 | `arliai/GLM-4.7` | arliai | **NEW** — verified tools OK |
-| 22 | `synthetic/syn:large:text` | synthetic | **NEW** — HF distillations |
+| 21 | `arliai/GLM-4.7` | arliai | **NEW** — tools OK |
+| 22 | `synthetic/syn:large:text` | synthetic | **NEW** |
 | 23 | `synthetic/hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | synthetic | **NEW** — 120B param |
 | 24 | `synthetic/hf:moonshotai/Kimi-K2.6` | synthetic | **NEW** — Kimi 2.6 |
 | 25 | `ollama-cloud/deepseek-v4-flash` | ollama-cloud | **NEW** — 1M ctx |
 | 26 | `ollama-cloud/glm-5.1` | ollama-cloud | **NEW** |
-| 27 | `arliai/Mistral-Medium-3.5-128B` | arliai | **NEW** — 128B model |
-| 28 | `arliai/Qwen3.5-27B-Anko` | arliai | **NEW** — Qwen-based |
-| 29 | `arliai/Gemma-4-31B-Claude-4.6-Opus-Reasoning-Distilled` | arliai | **NEW** — Reasoning distilled |
+| 27 | `arliai/Mistral-Medium-3.5-128B` | arliai | **NEW** |
+| 28 | `arliai/Qwen3.5-27B-Anko` | arliai | **NEW** |
+| 29 | `arliai/Gemma-4-31B-Claude-4.6-Opus-Reasoning-Distilled` | arliai | **NEW** |
 | 30 | `google/gemini-3.1-flash-lite-preview` | google | **NEW** — 500 RPD |
 
 ### Swarm Chain (22 unique models)
