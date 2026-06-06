@@ -56,12 +56,12 @@ Removed 3 duplicates, replaced 3 stale free models, replaced broken OpenAI Codex
 - `openrouter/mistralai/mistral-7b-instruct:free` → `openrouter/poolside/laguna-xs.2:free`
 ### Large Context Chain (5 models)
 
-Reordered by context window:
+Reordered by context window, replaced broken codex/openrouter models:
 1. `ollama-cloud/deepseek-v4-flash` (1M ctx) — **NEW**
 2. `google/gemini-3.1-flash-preview` (1M ctx) — replaced limited gemini-2.5-flash
-3. `openai/gpt-5.3-codex` (400K ctx)
-4. `openai/gpt-5.2-codex` (400K ctx)
-5. `openrouter/qwen/qwen3-coder:free` (262K ctx)
+3. `opencode-go/deepseek-v4-flash` (400K ctx) — replaced broken openai/gpt-5.3-codex
+4. `ollama/deepseek-v4-flash` (400K ctx) — replaced broken openai/gpt-5.2-codex
+5. `minimax/MiniMax-M3` (128K ctx) — replaced broken openrouter/qwen3-coder:free
 
 ## Known Constraints
 
