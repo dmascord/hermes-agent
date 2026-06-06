@@ -5071,11 +5071,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     assistant_entry["reasoning_content"] = reasoning_content
                 conversation_messages.append(assistant_entry)
             elif role == "tool":
-                tool_entry: Dict[str, Any] = {"role": "tool", "content": content}
-                tool_call_id = msg.get("tool_call_id")
-                if isinstance(tool_call_id, str) and tool_call_id.strip():
-                    tool_entry["tool_call_id"] = tool_call_id.strip()
-                conversation_messages.append(tool_entry)
+                # Copilot API rejects role="tool" — convert to user message.
+                # Tool results are sent as user messages with the result content.
+                tool_content = content if content else "(tool result)"
+                conversation_messages.append({"role": "user", "content": tool_content})
             elif role == "user":
                 conversation_messages.append({"role": role, "content": preserved_content})
 

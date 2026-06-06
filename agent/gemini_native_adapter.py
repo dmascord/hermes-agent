@@ -265,8 +265,13 @@ def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         }
     }
     thought_signature = _tool_call_extra_signature(tool_call)
+    # Sentinel signature — matches opencode-gemini-auth's approach.
+    # Without this, Gemini 3.1+ rejects function calls that originated
+    # outside its own chain (e.g. from a non-Gemini model).
     if thought_signature:
         part["thoughtSignature"] = thought_signature
+    else:
+        part["thoughtSignature"] = "skip_thought_signature_validator"
     return part
 
 
