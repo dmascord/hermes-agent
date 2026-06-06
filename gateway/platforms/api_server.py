@@ -79,15 +79,17 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     _import_os_once = __import__("os")
     _max_cap = float(_import_os_once.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
     if "weekly" in body or "week" in body:
-        _raw = 7 * 24 * 3600.0   # skip for the rest of the week
-        return _raw if _max_cap <= 0 else min(_raw, _max_cap)
+        # Weekly limit — respect the full window, don't cap it.
+        # Capping a weekly limit to 1h would cause constant retry spam.
+        return 7 * 24 * 3600.0
     if "daily" in body or "day" in body:
-        _raw = 24 * 3600.0
-        return _raw if _max_cap <= 0 else min(_raw, _max_cap)
+        # Daily limit — respect the full window, don't cap it.
+        return 24 * 3600.0
     # "5 hour", "5-hour", "5hour" etc.
     _hour_match = re.search(r'(\d+)\s*-?\s*hour', body)
     if _hour_match:
         _raw = max(3600.0, int(_hour_match.group(1)) * 3600.0)
+        # Only cap hourly limits — they might be overly aggressive.
         return _raw if _max_cap <= 0 else min(_raw, _max_cap)
     if "hour" in body:
         return 3600.0
