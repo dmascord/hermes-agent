@@ -5636,9 +5636,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     # Differentiate context-too-small from all-on-cooldown
                     if _max_known_ctx < _approx_tokens:
-                        _detail = f"~{_approx_tokens:,} tokens exceeds max model context ({_max_known_ctx:,})"
+                        _detail = f"too many tokens: ~{_approx_tokens:,} exceeds max model context ({_max_known_ctx:,})"
                     else:
-                        _detail = f"all context-capable models on cooldown (~{_approx_tokens:,} tokens)"
+                        _detail = f"too many tokens: ~{_approx_tokens:,} and all context-capable models on cooldown"
                     logger.warning(
                         "[hermes-code] ALL %d known models not viable for ~%d tokens "
                         "(max: %s). Returning 413 — client should compact. Chain: %s",
