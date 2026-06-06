@@ -6388,7 +6388,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
                                 except Exception:
                                     pass
-                                raise _CodexPassthroughSkip()
+                                # Return text to client, let quality DB track text-only rate
                             else:
                                 logger.warning(
                                     "[hermes-code] %s returned bash with empty command despite tools being provided, "
