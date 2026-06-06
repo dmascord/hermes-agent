@@ -5841,7 +5841,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _args_preview,
                                 len(content_out) if content_out else 0,
                             )
-
+                            if passthrough_tools and not tool_calls_out and content_out:
+                                logger.warning(
+                                    "[hermes-code] DIAGNOSTIC %s text-only content preview: %s",
+                                    provider_model, content_out[:300],
+                                )
                             try:
                                 from agent.model_cooldown_db import mark_provider_success
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
@@ -6341,6 +6345,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             _args_preview,
                             len(content_out) if content_out else 0,
                         )
+                        if passthrough_tools and not tool_calls_out and content_out:
+                            logger.warning(
+                                "[hermes-code] DIAGNOSTIC %s text-only content preview: %s",
+                                provider_model, content_out[:300],
+                            )
                         try:
                             from agent.model_quality_db import record_success
                             _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
