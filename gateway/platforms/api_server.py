@@ -5071,10 +5071,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     assistant_entry["reasoning_content"] = reasoning_content
                 conversation_messages.append(assistant_entry)
             elif role == "tool":
-                # Copilot API rejects role="tool" — convert to user message.
-                # Tool results are sent as user messages with the result content.
-                tool_content = content if content else "(tool result)"
-                conversation_messages.append({"role": "user", "content": tool_content})
+                tool_entry: Dict[str, Any] = {"role": "tool", "content": content}
+                tool_call_id = msg.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id.strip():
+                    tool_entry["tool_call_id"] = tool_call_id.strip()
+                conversation_messages.append(tool_entry)
             elif role == "user":
                 conversation_messages.append({"role": role, "content": preserved_content})
 
@@ -5815,6 +5816,21 @@ class APIServerAdapter(BasePlatformAdapter):
                                 from openai import OpenAI
                                 from hermes_cli.copilot_auth import copilot_request_headers
 
+                                # Copilot API rejects role="tool" — convert to user messages.
+                                # DeepSeek/Gemini expect proper tool-role messages, so we do
+                                # this conversion only here in the Copilot-specific path.
+                                def _copilot_messages(msgs):
+                                    result = []
+                                    for m in msgs:
+                                        if m.get("role") == "tool":
+                                            result.append({
+                                                "role": "user",
+                                                "content": m.get("content", "(tool result)")
+                                            })
+                                        else:
+                                            result.append(m)
+                                    return result
+
                                 _s_loop = asyncio.get_running_loop()
                                 headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
                                 client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
@@ -5826,7 +5842,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     response_obj = await _s_loop.run_in_executor(
                                         None,
                                         lambda: wrapped.chat.completions.create(
-                                            messages=passthrough_messages,
+                                            messages=_copilot_messages(passthrough_messages),
                                             model=resolved_model,
                                             max_tokens=16384,
                                             tools=passthrough_tools,
@@ -5838,7 +5854,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         None,
                                         lambda: client.chat.completions.create(
                                             model=resolved_model,
-                                            messages=passthrough_messages,
+                                            messages=_copilot_messages(passthrough_messages),
                                             max_tokens=16384,
                                             tools=passthrough_tools,
                                             timeout=30,
