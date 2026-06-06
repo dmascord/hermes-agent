@@ -5495,6 +5495,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "[hermes-code] fallback tool reduction: %d → %d tools (essential=%s)",
                     len(passthrough_tools), len(_fallback_tools), _fallback_essential_names,
                 )
+            # Preserve the full tool set so quality-aware logic can restore it
+            # for models with low text-only rates.
+            _passthrough_tools_full = list(passthrough_tools) if passthrough_tools else None
             # ── Tool-loop audit ───────────────────────────────────────────────
             # Observe-only: detects repeated identical tool calls and logs them.
             # Does NOT inject or mutate passthrough_messages.
@@ -5516,11 +5519,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream,
                 len(passthrough_tools) if passthrough_tools else 0,
             )
-
-            # Position counter for tool set selection.
-            # Position 0 = primary model → full tools from client.
-            # Positions 1+ = fallback models → reduced essential tools.
-            _passthrough_tool_switch_position = [0]
+            # Build passthrough provider chain from HERMES_CODE_MODEL and HERMES_CODE_FALLBACK_*
             # Build passthrough provider chain from HERMES_CODE_MODEL and HERMES_CODE_FALLBACK_*
             # Put user's requested model FIRST, then HERMES_CODE_MODEL as primary, then fallbacks
             _passthrough_models: List[str] = []
@@ -5663,13 +5662,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     if "/" not in provider_model:
                         continue
 
-                    # ── Tool set selection ──
-                    # Primary model (position 0) gets full client tool set.
-                    # Fallback models (positions 1+) get only essential tools.
-                    # Swap passthrough_tools in-place so all references just work.
-                    _passthrough_tool_switch_position[0] += 1
-                    if _passthrough_tool_switch_position[0] > 1 and _fallback_tools is not passthrough_tools:
-                        passthrough_tools = _fallback_tools
+                    # ── Tool set selection (quality-aware) ──
+                    # Models with a high text-only rate (> 30%) get reduced essential tools
+                    # (7 of 24) because they produce text instead of tool_calls with full tools.
+                    # Models with low text-only rate (≤ 30%) get the full client tool set.
+                    # Unknown models (< 3 calls) get the full set — we have no data to decide.
+                    if passthrough_tools and _fallback_tools is not passthrough_tools:
+                        from agent.model_quality_db import get_text_only_rate
+                        _f_prov = provider_model.split("/")[0] if "/" in provider_model else ""
+                        _f_rate = get_text_only_rate(_f_prov, provider_model)
+                        if _f_rate > 0.30:
+                            passthrough_tools = _fallback_tools
+                            logger.warning(
+                                "[hermes-code] %s: text-only rate %.0f%% → reduced to %d essential tools",
+                                provider_model, _f_rate * 100, len(_fallback_tools),
+                            )
+                        elif passthrough_tools is _fallback_tools:
+                            # Previous model swapped to fallback — restore full tools
+                            passthrough_tools = _passthrough_tools_full
+                            logger.debug(
+                                "[hermes-code] %s: text-only rate %.0f%% → restored full %d tools",
+                                provider_model, _f_rate * 100, len(passthrough_tools),
+                            )
 
                     # Check cooldown before attempting this provider
                     _prov_prefix = provider_model.split("/")[0] if "/" in provider_model else ""

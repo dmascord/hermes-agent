@@ -320,6 +320,22 @@ def get_quality_score(provider: str, model: str, base_url: str = "") -> float:
         ).fetchone()
         return row["quality_score"] if row else 50.0
 
+def get_text_only_rate(provider: str, model: str, base_url: str = "") -> float:
+    """Return the text-only rate (0.0-1.0) for a model, or 0.0 if unknown.
+
+    A low rate means the model reliably produces tool calls when tools are
+    provided. A high rate means the model frequently returns text instead.
+    """
+    key = _make_key(provider, model, base_url)
+    with _LOCK:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT text_only_calls, total_calls FROM model_metrics WHERE key=?", (key,)
+        ).fetchone()
+        if not row or (row["total_calls"] or 0) < 3:
+            return 0.0  # Unknown / insufficient data — assume good
+        return (row["text_only_calls"] or 0) / (row["total_calls"] or 1)
+
 
 def get_all_quality_scores() -> Dict[str, Dict]:
     """Return all model metrics as a dict keyed by model key."""
