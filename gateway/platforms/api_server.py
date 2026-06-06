@@ -6701,17 +6701,40 @@ class APIServerAdapter(BasePlatformAdapter):
                         _is_rate_limit = _status_code == 429 or "429" in _exc_str
                         _is_auth_error = _status_code == 401 or "401" in _exc_str or "unauthorized" in _exc_str or "authentication" in _exc_str
                         if _is_rate_limit:
-                            try:
-                                from agent.model_cooldown_db import mark_model_cooldown
-                                mark_model_cooldown(
-                                    provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
-                                    model=provider_model,
-                                    cooldown_seconds=_cooldown_seconds_for_429(exc),
-                                    reason="hermes_code_stream_429",
-                                )
-                                logger.info("[hermes-code] stream %s cooled down for %.0fs after 429", provider_model, _cooldown_seconds_for_429(exc))
-                            except Exception:
-                                pass
+                            _cooldown_secs = _cooldown_seconds_for_429(exc)
+                            _prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
+                            # Check if this is a provider-level quota (weekly/daily limit).
+                            # If so, cooldown ALL models from this provider, not just the one that failed.
+                            _is_provider_quota = any(kw in _exc_str for kw in ["weekly", "daily", "usage limit", "go_usagelimit", "practical_brown"])
+                            if _is_provider_quota:
+                                # Provider-level quota — cooldown all models from this provider.
+                                try:
+                                    from agent.model_cooldown_db import mark_model_cooldown
+                                    for _i in range(1, 50):
+                                        _model = os.environ.get(f"HERMES_CODE_FALLBACK_{_i}", "")
+                                        if _model and _model.startswith(_prov + "/"):
+                                            mark_model_cooldown(
+                                                provider=_prov,
+                                                model=_model,
+                                                cooldown_seconds=_cooldown_secs,
+                                                reason="hermes_code_stream_429_provider_quota",
+                                            )
+                                    logger.info("[hermes-code] provider-level quota detected for %s — all %s models cooled down for %.0fs", provider_model, _prov, _cooldown_secs)
+                                except Exception:
+                                    pass
+                            else:
+                                # Model-specific 429 — cooldown just this model.
+                                try:
+                                    from agent.model_cooldown_db import mark_model_cooldown
+                                    mark_model_cooldown(
+                                        provider=_prov,
+                                        model=provider_model,
+                                        cooldown_seconds=_cooldown_secs,
+                                        reason="hermes_code_stream_429",
+                                    )
+                                    logger.info("[hermes-code] stream %s cooled down for %.0fs after 429", provider_model, _cooldown_secs)
+                                except Exception:
+                                    pass
                         elif _status_code == 400:
                             # 400 errors (bad request) — reduce to 120s cooldown.
                             try:
