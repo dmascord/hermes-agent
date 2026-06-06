@@ -96,3 +96,23 @@ Models above 30% get quality-aware essential tool reduction (7 tools) via `HERME
 - All new providers (arliai, synthetic, ollama-cloud) verified working with tools
 - Provider plugin: arliai ✓, ollama-cloud ✓, synthetic (no plugin needed, uses env convention)
 - Gateway health: OK
+
+## Gemini Rate Limit Discovery (2026-06-06)
+
+Google Gemini free tier limits are **per model**:
+
+| Model | RPD Limit | Context | Status |
+|-------|-----------|---------|--------|
+| `gemini-3.1-flash-preview` | **unlimited (0/0)** | 1M | ✅ Primary gemini |
+| `gemini-3.1-flash-lite-preview` | **500/day** | 1M | ✅ Added to chain |
+| `gemini-2.5-flash` | 20/day | 1M | ⚠️ Limited — in large context only |
+| `gemini-3.5-flash-preview` | 20/day | 1M | ⚠️ Limited |
+| `gemini-3-flash-preview` | 20/day | 1M | ⚠️ Limited |
+
+Replaced `gemini-2.5-flash` (20 RPD) with `gemini-3.1-flash-preview` (unlimited) in:
+- Code chain position 17
+- Audio model + audio fallback 1
+- Swarm fallback 5
+- Large context fallback 2
+
+Added `gemini-3.1-flash-lite-preview` (500 RPD) to code chain position 29.
