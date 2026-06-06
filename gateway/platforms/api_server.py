@@ -5842,14 +5842,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 len(content_out) if content_out else 0,
                             )
                             if passthrough_tools and not tool_calls_out:
-                                _rc_snippet = reasoning_content_out[:300] if reasoning_content_out else ""
                                 logger.warning(
-                                    "[hermes-code] DIAGNOSTIC %s text-only: tools=%d tool_calls=%d content_len=%d rc_len=%d content=%.200s rc=%.100s",
-                                    provider_model, len(passthrough_tools), len(tool_calls_out),
+                                    "[hermes-code] DIAGNOSTIC %s text-only: tools=%d tool_calls=0 content_len=%d rc_len=%d content=%.200s rc=%.100s",
+                                    provider_model, len(passthrough_tools),
                                     len(content_out) if content_out else 0,
                                     len(reasoning_content_out) if reasoning_content_out else 0,
                                     content_out[:200] if content_out else "(empty)",
-                                    _rc_snippet[:100],
+                                    (reasoning_content_out or "")[:100],
                                 )
                             try:
                                 from agent.model_cooldown_db import mark_provider_success
@@ -6580,6 +6579,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     reason="hermes_code_stream_400",
                                 )
                                 logger.warning("[hermes-code] stream %s cooled down for 3600s after 400", provider_model)
+
                             except Exception:
                                 pass
                         elif _is_auth_error:
