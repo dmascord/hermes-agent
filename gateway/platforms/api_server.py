@@ -6293,6 +6293,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "raising _CodexPassthroughSkip to try next provider",
                                     provider_model,
                                 )
+                                # Diagnostic: show what was actually returned
+                                _rc_snippet = reasoning_content_out[:300] if reasoning_content_out else ""
+                                logger.warning(
+                                    "[hermes-code] DIAGNOSTIC %s text-only: tools=%d tool_calls=0 content_len=%d rc_len=%d content=%.200s rc=%.100s",
+                                    provider_model, len(passthrough_tools),
+                                    len(content_out) if content_out else 0,
+                                    len(reasoning_content_out) if reasoning_content_out else 0,
+                                    content_out[:200] if content_out else "(empty)",
+                                    _rc_snippet[:100],
+                                )
                                 # Short cooldown for text-only — model isn't broken
                                 # (it returned valid text), but for THIS request we
                                 # needed a tool call. Skip it for ~2 min.
@@ -7087,7 +7097,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "raising _CodexPassthroughSkip to try next provider",
                                 provider_model,
                             )
+                            # Diagnostic: show what was actually returned
+                            _rc_ns = reasoning_content[:300] if reasoning_content else ""
+                            logger.warning(
+                                "[hermes-code] DIAGNOSTIC %s (non-streaming) text-only: tools=%d tool_calls=0 content_len=%d rc_len=%d content=%.200s rc=%.100s",
+                                provider_model, len(passthrough_tools),
+                                len(content) if content else 0,
+                                len(reasoning_content) if reasoning_content else 0,
+                                content[:200] if content else "(empty)",
+                                _rc_ns[:100],
+                            )
                             # Short cooldown for text-only — model isn't broken
+                            # (it returned valid text), but for THIS request we
+                            # needed a tool call. Skip it for ~2 min.
                             # (it returned valid text), but for THIS request we
                             # needed a tool call. Skip it for ~2 min.
                             try:
