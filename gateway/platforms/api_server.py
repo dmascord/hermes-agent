@@ -6238,6 +6238,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # function_call parts in assistant messages. Without it, Gemini
                             # 3.1+ returns 400. Inject a sentinel for all function calls.
                             if "generativelanguage.googleapis.com" in (base_url or ""):
+                                _injected = 0
                                 for _msg in _msgs_to_send:
                                     if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
                                         for _tc in _msg["tool_calls"]:
@@ -6245,6 +6246,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 # thoughtSignature goes at functionCall level, not inside function object.
                                                 if "thoughtSignature" not in _tc:
                                                     _tc["thoughtSignature"] = "skip_thought_signature_validator"
+                                                    _injected += 1
+                                logger.warning("[hermes-code] Google thought_signature: injected=%d into %d messages for %s", _injected, len(_msgs_to_send), resolved_model)
 
                             # ── arliai tool_call_id sanitization ────────────────────
                             # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
