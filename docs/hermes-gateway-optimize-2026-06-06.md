@@ -47,11 +47,13 @@ Created `plugins/model-providers/arliai/__init__.py` — registers 66 open-weigh
 
 ### Swarm Chain (22 unique models)
 
-Removed 3 duplicates, replaced 3 stale free models, added 3 arliai models:
+Removed 3 duplicates, replaced 3 stale free models, replaced broken OpenAI Codex models with working minimax/cerebras:
+- `openai/gpt-5.3-codex` → `minimax/MiniMax-M3` (broken 401)
+- `openai/gpt-5.2-codex` → `minimax/MiniMax-M2.7` (broken 401)
+- `openai/gpt-5.4` → `cerebras/gpt-oss-120b` (broken 401)
 - `openrouter/google/gemma-3-5b-eu:free` → `openrouter/google/gemma-4-26b-a4b-it:free`
 - `openrouter/meta-llama/llama-3.1-8b-instruct:free` → `openrouter/google/gemma-4-31b-it:free`
 - `openrouter/mistralai/mistral-7b-instruct:free` → `openrouter/poolside/laguna-xs.2:free`
-
 ### Large Context Chain (5 models)
 
 Reordered by context window:
