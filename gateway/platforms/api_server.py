@@ -5841,6 +5841,29 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _args_preview,
                                 len(content_out) if content_out else 0,
                             )
+                            if passthrough_tools and not tool_calls_out:
+                                # Write full content to file for analysis
+                                try:
+                                    import pathlib
+                                    _diag_file = pathlib.Path("/tmp/text_only_diag.log")
+                                    _diag_file.parent.mkdir(parents=True, exist_ok=True)
+                                    with open(_diag_file, "a") as _f:
+                                        _f.write(f"--- {provider_model} ---\n")
+                                        _f.write(f"tools_sent: {len(passthrough_tools)}\n")
+                                        _f.write(f"tool_names: {[t.get('function',{}).get('name','?') for t in passthrough_tools[:10]]}\n")
+                                        _f.write(f"content: {(content_out or '(empty)')[:1000]}\n")
+                                        _f.write(f"rc: {(reasoning_content_out or '(empty)')[:500]}\n")
+                                        _f.write(f"last_role: {passthrough_messages[-1].get('role', '?') if passthrough_messages else '?'}\n")
+                                        _f.write(f"msg_count: {len(passthrough_messages)}\n")
+                                        _f.write(f"\n")
+                                except Exception:
+                                    pass
+                                logger.warning(
+                                    "[hermes-code] DIAGNOSTIC %s text-only: tools=%d tool_calls=0 content_len=%d rc_len=%d",
+                                    provider_model, len(passthrough_tools),
+                                    len(content_out) if content_out else 0,
+                                    len(reasoning_content_out) if reasoning_content_out else 0,
+                                )
                             try:
                                 from agent.model_cooldown_db import mark_provider_success
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
