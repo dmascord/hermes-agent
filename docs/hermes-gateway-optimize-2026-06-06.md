@@ -74,8 +74,8 @@ Scout chain had a gap at position 3, now filled:
 
 ### Cooldown Cleanup
 
-Cleared 4 excessive ollama cooldowns (167h / 7-day week limit) — models verified working.
-Cooldowns correctly use passthrough key format (provider\x1fmodel\x1f\x1f), matching both read and write paths.
+Cleared excessive ollama cooldowns (167h / 7-day week limit) — models verified working.
+Cooldowns use passthrough key format (provider\x1fmodel\x1f\x1f), matching both read and write paths.
 
 ## Known Constraints
 
