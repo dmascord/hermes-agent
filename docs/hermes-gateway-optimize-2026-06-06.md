@@ -16,7 +16,8 @@ Created `plugins/model-providers/arliai/__init__.py` — registers 66 open-weigh
 
 Reordered by measured quality data (text-only rates), added 3 new providers (synthetic, ollama-cloud, arliai), moved gemini-2.5-flash to lower priority (20 req/day free tier limit).
 
-**Provider breakdown**: cerebras (1), opencode-go (5), ollama (4), arliai (4), minimax (3), synthetic (3), nous (2), ollama-cloud (2), google (2), github-copilot-enterprise (1), opencode-zen (1), zai (1), groq (1)
+**Provider breakdown**: cerebras (1), cohere (1), opencode-go (5), ollama (4), arliai (4), minimax (3), synthetic (3), nous (2), ollama-cloud (2), google (2), github-copilot-enterprise (1), opencode-zen (1), zai (1), groq (1)
+|
 | # | Model | Provider | Notes |
 |---|-------|----------|-------|
 | 1 | `github-copilot-enterprise/gpt-5.4-mini` | copilot | PRIMARY |
@@ -30,8 +31,8 @@ Reordered by measured quality data (text-only rates), added 3 new providers (syn
 | 9 | `ollama/deepseek-v4-flash` | ollama | Low text-only (8.3%) |
 | 10 | `zai/glm-4.7` | zai | 20% text-only |
 | 11 | `cerebras/gpt-oss-120b` | cerebras | **NEW** — 120B params, 1.5s latency, tools OK |
-| 12 | `opencode-go/qwen3.6-plus` | opencode-go | 100% score |
-| 13 | `groq/llama-3.3-70b-versatile` | groq | Fast, reliable |
+| 12 | `cohere/command-r-plus-08-2024` | cohere | **NEW** — 2.7s latency, verified tools OK |
+| 13 | `opencode-go/qwen3.6-plus` | opencode-go | 100% score |
 | 14 | `opencode-go/kimi-k2.6` | opencode-go | 21% text-only |
 | 15 | `nous/stepfun/step-3.7-flash:free` | nous | Free tier |
 | 16 | `ollama/qwen3-coder-next` | ollama | 31% text-only |
