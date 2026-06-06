@@ -5476,6 +5476,25 @@ class APIServerAdapter(BasePlatformAdapter):
             # External providers reject unknown fields — strip before sending to any API.
             if passthrough_tools:
                 passthrough_tools = _strip_from_client_tools(passthrough_tools)
+            # ── Fallback tool set ──────────────────────────────────────────────
+            # 24+ tool definitions overwhelm smaller/cheaper fallback models
+            # (kimi-k2-thinking: 94% text-only, glm-5: 62%, etc.).  The primary
+            # model gets the full tool set; fallback models get only essential tools.
+            _fallback_essential_names = {
+                n.strip().lower()
+                for n in os.getenv("HERMES_FALLBACK_ESSENTIAL_TOOLS", "bash,read,edit,find,search,write,search_tool_bm25").split(",")
+                if n.strip()
+            }
+            _fallback_tools = passthrough_tools
+            if passthrough_tools and len(passthrough_tools) > len(_fallback_essential_names):
+                _fallback_tools = [
+                    t for t in passthrough_tools
+                    if t.get("function", {}).get("name", "").lower() in _fallback_essential_names
+                ]
+                logger.warning(
+                    "[hermes-code] fallback tool reduction: %d → %d tools (essential=%s)",
+                    len(passthrough_tools), len(_fallback_tools), _fallback_essential_names,
+                )
             # ── Tool-loop audit ───────────────────────────────────────────────
             # Observe-only: detects repeated identical tool calls and logs them.
             # Does NOT inject or mutate passthrough_messages.
@@ -5497,6 +5516,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream,
                 len(passthrough_tools) if passthrough_tools else 0,
             )
+
+            # Position counter for tool set selection.
+            # Position 0 = primary model → full tools from client.
+            # Positions 1+ = fallback models → reduced essential tools.
+            _passthrough_tool_switch_position = [0]
             # Build passthrough provider chain from HERMES_CODE_MODEL and HERMES_CODE_FALLBACK_*
             # Put user's requested model FIRST, then HERMES_CODE_MODEL as primary, then fallbacks
             _passthrough_models: List[str] = []
@@ -5638,6 +5662,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 for provider_model in _passthrough_models:
                     if "/" not in provider_model:
                         continue
+
+                    # ── Tool set selection ──
+                    # Primary model (position 0) gets full client tool set.
+                    # Fallback models (positions 1+) get only essential tools.
+                    # Swap passthrough_tools in-place so all references just work.
+                    _passthrough_tool_switch_position[0] += 1
+                    if _passthrough_tool_switch_position[0] > 1 and _fallback_tools is not passthrough_tools:
+                        passthrough_tools = _fallback_tools
 
                     # Check cooldown before attempting this provider
                     _prov_prefix = provider_model.split("/")[0] if "/" in provider_model else ""
