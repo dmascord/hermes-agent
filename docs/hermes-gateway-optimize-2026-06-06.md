@@ -2,8 +2,8 @@
 
 ## Deployment
 
-- **Image**: `swarm-alpine-20260606131928` (commit `7be8f59c1`)
-- **Pod**: `hermes-569545b679-vkjp8` on `wyrm` (post-fix restart)
+- **Image**: `swarm-alpine-20260606192207` (commit `9ac28bb44`, cooldown cap fix deployed)
+- **Pod**: `hermes-785d5948c5-bdmbx` on `wyrm`
 - **Health**: OK
 
 ## Changes Applied
