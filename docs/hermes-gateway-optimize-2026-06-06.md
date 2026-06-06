@@ -63,6 +63,20 @@ Reordered by context window, replaced broken codex/openrouter models:
 4. `ollama/deepseek-v4-flash` (400K ctx) — replaced broken openai/gpt-5.2-codex
 5. `minimax/MiniMax-M3` (128K ctx) — replaced broken openrouter/qwen3-coder:free
 
+### Scout Chain (5 models)
+
+Scout chain had a gap at position 3, now filled:
+1. `ollama/deepseek-v4-flash` — scout model
+2. `minimax/MiniMax-M2.7` — scout fallback 1
+3. `ollama/qwen3-coder-next` — scout fallback 2
+4. `zai/glm-4.7` — scout fallback 3 (was missing, now filled)
+5. `opencode-zen/gpt-5-nano` — scout fallback 4
+
+### Cooldown Cleanup
+
+Cleared 4 excessive ollama cooldowns (167h / 7-day week limit) — models verified working.
+Cooldowns correctly use passthrough key format (provider\x1fmodel\x1f\x1f), matching both read and write paths.
+
 ## Known Constraints
 
 ### Google Gemini Free Tier (20 req/day)
