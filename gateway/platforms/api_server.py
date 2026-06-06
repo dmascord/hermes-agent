@@ -5842,7 +5842,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             messages=passthrough_messages,
                                             max_tokens=16384,
                                             tools=passthrough_tools,
-                                            timeout=300,
+                                            timeout=30,
                                         ),
                                     )
 
@@ -6304,7 +6304,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     base_url=base_url,
                                     api_key=api_key,
                                     max_tokens=16384,
-                                    timeout=300,
+                                    timeout=30,
                                     tools=passthrough_tools,
                                 ),
                             )
