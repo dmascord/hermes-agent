@@ -6279,7 +6279,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         logger.debug("[hermes-code] DEEPHEX: direct call failed: %s, falling through to call_llm", _dex)
                                         _skip_normal_call = False
                         # ── Enforce parallel stream limit ─────────────────────────
-                        _acquired_stream = False
+                        _acquired_stream = False  # Defined before try so it's always accessible in exception handlers
                         try:
                             from agent.provider_parallel_limiter import acquire_stream, release_stream
                             if acquire_stream(prov, wait=True, timeout=30.0):
@@ -6357,7 +6357,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             if not tool_calls_out:
                                 logger.warning(
                                     "[hermes-code] %s returned text-only (no tool calls) despite tools being provided, "
-                                    "raising _CodexPassthroughSkip to try next provider",
+                                    "returning text and marking as bad tool-caller",
                                     provider_model,
                                 )
                                 # Diagnostic: show what was actually returned
