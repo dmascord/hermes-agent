@@ -5841,15 +5841,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _args_preview,
                                 len(content_out) if content_out else 0,
                             )
-                            if passthrough_tools and not tool_calls_out:
-                                logger.warning(
-                                    "[hermes-code] DIAGNOSTIC %s text-only: tools=%d tool_calls=0 content_len=%d rc_len=%d content=%.200s rc=%.100s",
-                                    provider_model, len(passthrough_tools),
-                                    len(content_out) if content_out else 0,
-                                    len(reasoning_content_out) if reasoning_content_out else 0,
-                                    content_out[:200] if content_out else "(empty)",
-                                    (reasoning_content_out or "")[:100],
-                                )
                             try:
                                 from agent.model_cooldown_db import mark_provider_success
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
@@ -6632,6 +6623,10 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[%d] streaming passthrough exhausted all providers, trying non-streaming", _req_id)
             # Non-streaming passthrough
             _pt_call_count[0] = 0  # reset counter for non-streaming loop
+            logger.warning("[hermes-code] NS-ENTRY tools=%d tool_names=%s",
+                len(passthrough_tools) if passthrough_tools else 0,
+                [t.get("function", {}).get("name", "?") for t in (passthrough_tools or [])[:5]],
+            )
             for provider_model in _passthrough_models:
                 if "/" not in provider_model:
                     continue
