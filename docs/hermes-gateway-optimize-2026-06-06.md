@@ -3,7 +3,7 @@
 ## Deployment
 
 - **Image**: `swarm-alpine-20260606131928` (commit `7be8f59c1`)
-- **Pod**: `hermes-8479c55fbc-7hkts` on `wyrm`
+- **Pod**: `hermes-569545b679-vkjp8` on `wyrm` (post-fix restart)
 - **Health**: OK
 
 ## Changes Applied
@@ -17,7 +17,6 @@ Created `plugins/model-providers/arliai/__init__.py` — registers 66 open-weigh
 Reordered by measured quality data (text-only rates), added 3 new providers (synthetic, ollama-cloud, arliai), moved gemini-2.5-flash to lower priority (20 req/day free tier limit).
 
 **Provider breakdown**: opencode-go (5), ollama (4), arliai (4), minimax (3), synthetic (3), nous (2), ollama-cloud (2), github-copilot-enterprise (1), opencode-zen (1), zai (1), groq (1), google (1)
-
 | # | Model | Provider | Notes |
 |---|-------|----------|-------|
 | 1 | `github-copilot-enterprise/gpt-5.4-mini` | copilot | PRIMARY |
@@ -36,7 +35,7 @@ Reordered by measured quality data (text-only rates), added 3 new providers (syn
 | 14 | `nous/stepfun/step-3.7-flash:free` | nous | Free tier |
 | 15 | `ollama/qwen3-coder-next` | ollama | 31% text-only |
 | 16 | `ollama/glm-5.1` | ollama | 23% text-only |
-| 17 | `google/gemini-2.5-flash` | google | ⚠️ 20 req/day free tier |
+| 17 | `google/gemini-3.1-flash-preview` | google | ✅ UNLIMITED (0/0 RPD) — replaced 2.5-flash |
 | 18 | `nous/nvidia/nemotron-3-ultra:free` | nous | Free tier |
 | 19 | `ollama/kimi-k2-thinking` | ollama | Last resort (75% text-only) |
 | 20 | `arliai/GLM-4.7` | arliai | **NEW** — verified tools OK |
@@ -48,6 +47,7 @@ Reordered by measured quality data (text-only rates), added 3 new providers (syn
 | 26 | `arliai/Mistral-Medium-3.5-128B` | arliai | **NEW** — 128B model |
 | 27 | `arliai/Qwen3.5-27B-Anko` | arliai | **NEW** — Qwen-based |
 | 28 | `arliai/Gemma-4-31B-Claude-4.6-Opus-Reasoning-Distilled` | arliai | **NEW** — Reasoning distilled |
+| 29 | `google/gemini-3.1-flash-lite-preview` | google | **NEW** — 500 RPD |
 
 ### Swarm Chain (22 unique models)
 
@@ -60,7 +60,7 @@ Removed 3 duplicates, replaced 3 stale free models, added 3 arliai models:
 
 Reordered by context window:
 1. `ollama-cloud/deepseek-v4-flash` (1M ctx) — **NEW**
-2. `google/gemini-2.5-flash` (1M ctx)
+2. `google/gemini-3.1-flash-preview` (1M ctx) — replaced limited gemini-2.5-flash
 3. `openai/gpt-5.3-codex` (400K ctx)
 4. `openai/gpt-5.2-codex` (400K ctx)
 5. `openrouter/qwen/qwen3-coder:free` (262K ctx)
