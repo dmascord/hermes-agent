@@ -6256,17 +6256,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
                             # ── Google thought_signature injection ──────────────────
                             # Google's OpenAI-compatible API requires thoughtSignature on
-                            # function_call parts in assistant messages. Without it, Gemini
-                            # 3.1+ returns 400. Inject a sentinel for all function calls.
+                            # functionCall parts in assistant messages. Without it, Gemini
+                            # 3.1+ returns 400. The OpenAI format uses 'function' key;
+                            # Google's conversion layer passes through fields from the
+                            # 'function' object into 'functionCall'. Inject thoughtSignature
+                            # both inside 'function' (for the conversion layer) and at the
+                            # top level of the tool_call dict (belt-and-suspenders).
                             if "generativelanguage.googleapis.com" in (base_url or ""):
                                 _injected = 0
                                 for _msg in _msgs_to_send:
                                     if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
                                         for _tc in _msg["tool_calls"]:
                                             if isinstance(_tc, dict) and _tc.get("type") == "function":
-                                                # thoughtSignature goes at functionCall level, not inside function object.
-                                                if "thoughtSignature" not in _tc:
-                                                    _tc["thoughtSignature"] = "skip_thought_signature_validator"
+                                                _fn = _tc.get("function")
+                                                if _fn and isinstance(_fn, dict):
+                                                    # Inside function dict — conversion layer may pass through to functionCall
+                                                    if "thoughtSignature" not in _fn:
+                                                        _fn["thoughtSignature"] = "skip_thought_signature_validator"
+                                                    # Top level — in case Google checks it there
+                                                    if "thoughtSignature" not in _tc:
+                                                        _tc["thoughtSignature"] = "skip_thought_signature_validator"
                                                     _injected += 1
                                 logger.warning("[hermes-code] Google thought_signature: injected=%d into %d messages for %s", _injected, len(_msgs_to_send), resolved_model)
 
