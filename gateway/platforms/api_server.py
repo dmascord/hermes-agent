@@ -28,12 +28,22 @@ import ipaddress
 import json
 import logging
 import os
-# Add timestamp formatting to root logger (Python's lastResort has none).
+# Add timestamp formatting to both root and this module's logger.
 _fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-_root_sh = logging.StreamHandler()
-_root_sh.setFormatter(_fmt)
-logging.root.addHandler(_root_sh)
-logging.root.setLevel(logging.INFO)
+if not logging.root.handlers:
+    _root_sh = logging.StreamHandler()
+    _root_sh.setFormatter(_fmt)
+    logging.root.addHandler(_root_sh)
+    logging.root.setLevel(logging.INFO)
+# Also ensure this module's logger uses timestamps
+_gw_logger = logging.getLogger("gateway.platforms.api_server")
+if not _gw_logger.handlers:
+    _gw_sh = logging.StreamHandler()
+    _gw_sh.setFormatter(_fmt)
+    _gw_logger.addHandler(_gw_sh)
+else:
+    for _h in _gw_logger.handlers:
+        _h.setFormatter(_fmt)
 import socket as _socket
 import re
 import sqlite3
