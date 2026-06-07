@@ -1602,6 +1602,21 @@ def _call_codex_passthrough(
 
     effective_base = (base_url or "https://chatgpt.com/backend-api/codex").rstrip("/")
 
+    # Build a keepalive httpx client to prevent the SITA NGFW or upstream
+    # from closing idle connections before the first SSE event arrives.
+    import socket
+    import httpx
+    _sock_opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        _sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30))
+        _sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10))
+        _sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3))
+    elif hasattr(socket, "TCP_KEEPALIVE"):
+        _sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30))
+    _keepalive_httpx = httpx.Client(
+        transport=httpx.HTTPTransport(socket_options=_sock_opts),
+    )
+
     # Extract system prompt (instructions) from messages
     instructions = ""
     input_messages = messages
@@ -1617,7 +1632,8 @@ def _call_codex_passthrough(
         f"opencode/0.1.131 ({platform.system()} {platform.release()}; {platform.machine()})"
     )
 
-    client = OpenAI(api_key=api_key, base_url=effective_base, default_headers=headers, timeout=timeout)
+    client = OpenAI(api_key=api_key, base_url=effective_base, default_headers=headers,
+                    timeout=timeout, http_client=_keepalive_httpx)
 
     responses_input = _chat_messages_to_responses_input(input_messages)
     responses_tools = _responses_tools(tools) if tools else None

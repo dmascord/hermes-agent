@@ -3582,6 +3582,45 @@ def _build_keepalive_http_client() -> Any:
         return None
 
 
+def _inject_keepalive_transport(client: Any) -> None:
+    """Inject TCP keepalive transport into an OpenAI-like client.
+
+    The OpenAI SDK stores its httpx client as ``client._client``, which is a
+    SyncHttpxClientWrapper wrapping an httpx.Client.  We replace the wrapper's
+    internal transport with a keepalive-enabled version so all requests
+    (including streaming) use TCP keepalive probes.
+
+    Works with plain ``OpenAI`` clients and with wrapper classes that expose
+    ``._client`` (e.g. CodexAuxiliaryClient, AnthropicAuxiliaryClient).
+    """
+    try:
+        import httpx as _httpx
+        import socket as _socket
+
+        _sock_opts = [
+            (_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1),
+        ]
+        if hasattr(_socket, "TCP_KEEPIDLE"):
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
+        elif hasattr(_socket, "TCP_KEEPALIVE"):
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+
+        keepalive_transport = _httpx.HTTPTransport(socket_options=_sock_opts)
+
+        # Drill through wrapper objects to find the underlying OpenAI client.
+        _underlying = client
+        while hasattr(_underlying, "_client"):
+            _underlying = _underlying._client
+
+        # SyncHttpxClientWrapper exposes _transport; replace it.
+        if hasattr(_underlying, "_transport"):
+            _underlying._transport = keepalive_transport
+    except Exception:
+        pass  # Keepalive injection is best-effort; don't break request handling.
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -3799,12 +3838,11 @@ def call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
-    # Inject TCP keepalive so idle connections are probed and kept alive.
-    # This prevents "timed out while waiting for the first event" when
-    # the SITA NGFW or upstream provider closes an idle connection.
-    _keepalive_client = _build_keepalive_http_client()
-    if _keepalive_client is not None:
-        kwargs["http_client"] = _keepalive_client
+    # Inject TCP keepalive into the client's transport so idle connections
+    # are probed and kept alive. This prevents "timed out while waiting for
+    # the first event" when the SITA NGFW or upstream provider closes an
+    # idle connection before the first SSE event arrives.
+    _inject_keepalive_transport(client)
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
