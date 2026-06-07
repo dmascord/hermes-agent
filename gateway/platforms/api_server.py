@@ -28,6 +28,12 @@ import ipaddress
 import json
 import logging
 import os
+# Ensure all log messages have timestamps in docker logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 import socket as _socket
 import re
 import sqlite3
@@ -6406,9 +6412,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _skip_normal_call = False
                         # ── Enforce parallel stream limit ─────────────────────────
                         _acquired_stream = False  # Defined before try so it's always accessible in exception handlers
+                        _stream_start = _time.time()
+                        logger.info("[hermes-code] stream: attempting provider=%s model=%s base_url=%s", prov, resolved_model, base_url)
                         try:
                             from agent.provider_parallel_limiter import acquire_stream, release_stream
-                            if acquire_stream(prov, wait=True, timeout=30.0):
+                            logger.debug("[hermes-code] stream: acquiring parallel slot for %s (wait=30s)", prov)
+                            _stream_acquired = acquire_stream(prov, wait=True, timeout=30.0)
+                            _stream_acquire_time = _time.time() - _stream_start
+                            logger.info("[hermes-code] stream: acquire_stream=%s for %s in %.1fs", _stream_acquired, prov, _stream_acquire_time)
+                            if _stream_acquired:
                                 _acquired_stream = True
                             else:
                                 logger.warning(
@@ -6417,23 +6429,34 @@ class APIServerAdapter(BasePlatformAdapter):
                                 )
                                 passthrough_error = Exception(f"{provider_model}: concurrent stream limit reached")
                                 continue
-                        except Exception:
-                            pass
+                        except Exception as _stream_exc:
+                            logger.warning("[hermes-code] stream: acquire_stream exception for %s: %s", prov, _stream_exc)
                         if not _skip_normal_call:
-                            response_obj = await _s_loop.run_in_executor(
-                                None,
-                                lambda: call_llm(
-                                    task="chat",
-                                    messages=_msgs_to_send,
-                                    provider=prov,
-                                    model=resolved_model,
-                                    base_url=base_url,
-                                    api_key=api_key,
-                                    max_tokens=16384,
-                                    timeout=30,
-                                    tools=passthrough_tools,
-                                ),
-                            )
+                            _call_start = _time.time()
+                            logger.info("[hermes-code] stream: calling call_llm for %s timeout=30s", prov)
+                            try:
+                                response_obj = await _s_loop.run_in_executor(
+                                    None,
+                                    lambda: call_llm(
+                                        task="chat",
+                                        messages=_msgs_to_send,
+                                        provider=prov,
+                                        model=resolved_model,
+                                        base_url=base_url,
+                                        api_key=api_key,
+                                        max_tokens=16384,
+                                        timeout=30,
+                                        tools=passthrough_tools,
+                                    ),
+                                )
+                                _call_duration = _time.time() - _call_start
+                                _total_duration = _time.time() - _stream_start
+                                logger.info("[hermes-code] stream: SUCCESS %s in %.1fs (total=%.1fs)", prov, _call_duration, _total_duration)
+                            except Exception as _call_exc:
+                                _call_duration = _time.time() - _call_start
+                                _total_duration = _time.time() - _stream_start
+                                logger.warning("[hermes-code] stream: FAILED %s after %.1fs (total=%.1fs): %s", prov, _call_duration, _total_duration, _call_exc)
+                                raise _call_exc
                         try:
                             from agent.model_cooldown_db import mark_provider_success
                             mark_provider_success(prov, resolved_model, base_url=base_url or "")
