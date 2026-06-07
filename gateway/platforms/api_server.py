@@ -3039,6 +3039,7 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
         # depending on the model (gpt-5.4 -> codex_responses, gpt-4o-mini -> chat_completions)
         if provider_prefix in _RUNTIME_KWARGS_CACHE and provider_prefix not in (
             "opencode-zen", "opencode-go", "openai", "github-copilot-enterprise",
+            "zai", "minimax",
         ):
             cached_at = _RUNTIME_KWARGS_CACHE_AT.get(provider_prefix, 0)
             if time.time() - cached_at < _RUNTIME_KWARGS_CACHE_TTL:
@@ -3343,6 +3344,7 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
     # after github-copilot/gpt-5-mini) skip the expensive resolution.
     if provider_prefix and runtime_kwargs.get("api_key") and provider_prefix not in (
         "opencode-zen", "opencode-go", "openai", "github-copilot-enterprise",
+        "zai", "minimax",
     ):
         _RUNTIME_KWARGS_CACHE[provider_prefix] = dict(runtime_kwargs)
         _RUNTIME_KWARGS_CACHE_AT[provider_prefix] = time.time()
