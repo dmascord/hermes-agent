@@ -5643,25 +5643,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     if fb and fb not in _passthrough_models:
                         _passthrough_models.append(fb)
             # ── Quality-based reordering ─────────────────────────────────────────
-            # Re-sort fallback models by live quality score (best first).
-            # The first model (from _select_hermes_code_model or user request)
-            # stays pinned — only fallbacks are reordered by quality.
+            # Sort ALL models in the chain by live quality score (best first).
+            # This replaces round-robin ordering with quality-proved ordering —
+            # fast/reliable providers rise to the top, slow/failing ones sink.
             if len(_passthrough_models) > 1:
                 try:
                     from agent.model_quality_db import get_quality_score
-                    _first_model = _passthrough_models[0]
-                    _fallbacks = _passthrough_models[1:]
-                    # Sort by quality score descending (best first)
-                    _fallbacks.sort(
+                    # Sort entire chain by quality score descending (best first)
+                    _passthrough_models.sort(
                         key=lambda m: get_quality_score(
                             m.split("/", 1)[0] if "/" in m else "",
                             m.split("/", 1)[1] if "/" in m else m,
                         ),
                         reverse=True,
                     )
-                    _passthrough_models = [_first_model] + _fallbacks
                     logger.debug(
-                        "[hermes-code] quality-sorted fallback chain: top5=%s",
+                        "[hermes-code] quality-sorted chain: top5=%s",
                         [f"{m.split('/',1)[-1] if '/' in m else m}:{get_quality_score(m.split('/',1)[0], m.split('/',1)[1] if '/' in m else m):.0f}" for m in _passthrough_models[:5]],
                     )
                 except Exception:
