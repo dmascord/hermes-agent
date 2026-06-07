@@ -6468,6 +6468,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _call_duration = _time.time() - _call_start
                                 _total_duration = _time.time() - _stream_start
                                 logger.warning("[hermes-code] stream: FAILED %s after %.1fs (total=%.1fs): %s", prov, _call_duration, _total_duration, _call_exc)
+                                # Store latency on exception so outer handler can penalise slow providers
+                                _call_exc._hermes_latency_ms = _call_duration * 1000
                                 raise _call_exc
                         try:
                             from agent.model_cooldown_db import mark_provider_success
@@ -6777,7 +6779,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             try:
                                 from agent.model_quality_db import record_failure
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
-                                record_failure(_cb_prov, provider_model, base_url=base_url or "", error_message=str(exc)[:200])
+                                _latency_ms = getattr(exc, "_hermes_latency_ms", 0.0)
+                                record_failure(_cb_prov, provider_model, base_url=base_url or "", latency_ms=_latency_ms, error_message=str(exc)[:200])
                             except Exception:
                                 pass
                         _invalidate_selectable_pool_cache()
