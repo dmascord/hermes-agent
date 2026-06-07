@@ -12,6 +12,7 @@ minimax = ProviderProfile(
     aliases=("mini-max",),
     api_mode="anthropic_messages",
     env_vars=("MINIMAX_API_KEY",),
+    base_url_env_var="MINIMAX_BASE_URL",
     base_url="https://api.minimax.io/anthropic",
     auth_type="api_key",
     default_aux_model="MiniMax-M2.7",
