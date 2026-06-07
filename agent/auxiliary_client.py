@@ -3548,6 +3548,39 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
     return converted
 
 
+# ---------------------------------------------------------------------------
+# TCP keepalive — enables probing of dead connections before they expire,
+# preventing "timed out while waiting for the first event" errors when
+# the SITA NGFW or upstream provider closes an idle keepalive connection.
+# ---------------------------------------------------------------------------
+
+def _build_keepalive_http_client() -> Any:
+    """Build an httpx.Client with TCP keepalive socket options.
+
+    This prevents upstream providers or intermediate firewalls (e.g. SITA NGFW)
+    from closing idle streaming connections before the first event arrives.
+    The socket options mirror those used in run_agent.py for the AIAgent loop.
+    """
+    try:
+        import httpx as _httpx
+        import socket as _socket
+
+        _sock_opts = [
+            (_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1),
+        ]
+        if hasattr(_socket, "TCP_KEEPIDLE"):
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
+        elif hasattr(_socket, "TCP_KEEPALIVE"):
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+
+        return _httpx.Client(
+            transport=_httpx.HTTPTransport(socket_options=_sock_opts),
+        )
+    except Exception:
+        return None
+
 
 def _build_call_kwargs(
     provider: str,
@@ -3765,6 +3798,13 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # Inject TCP keepalive so idle connections are probed and kept alive.
+    # This prevents "timed out while waiting for the first event" when
+    # the SITA NGFW or upstream provider closes an idle connection.
+    _keepalive_client = _build_keepalive_http_client()
+    if _keepalive_client is not None:
+        kwargs["http_client"] = _keepalive_client
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
