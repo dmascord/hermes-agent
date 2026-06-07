@@ -5910,21 +5910,26 @@ class APIServerAdapter(BasePlatformAdapter):
                                 tool_calls_out = []
                                 for tc in tool_calls_raw:
                                     if hasattr(tc, "model_dump"):
-                                        tool_calls_out.append(tc.model_dump())
+                                        _tc_dict = tc.model_dump()
                                     elif hasattr(tc, "dict"):
-                                        tool_calls_out.append(tc.dict())
+                                        _tc_dict = tc.dict()
                                     elif isinstance(tc, dict):
-                                        tool_calls_out.append(tc)
+                                        _tc_dict = tc
                                     else:
                                         _func = getattr(tc, "function", None)
-                                        tool_calls_out.append({
+                                        _tc_dict = {
                                             "id": str(getattr(tc, "id", "")),
                                             "type": "function",
                                             "function": {
                                                 "name": str(getattr(_func, "name", getattr(tc, "name", ""))),
                                                 "arguments": str(getattr(_func, "arguments", getattr(tc, "arguments", "{}"))),
                                             },
-                                        })
+                                        }
+                                    # Preserve extra_content (contains google.thought_signature for Gemini)
+                                    _ec = getattr(tc, "extra_content", None) or (tc.get("extra_content") if isinstance(tc, dict) else None)
+                                    if _ec:
+                                        _tc_dict["extra_content"] = _ec
+                                    tool_calls_out.append(_tc_dict)
                                 tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
                                 usage_obj = getattr(response_obj, "usage", None)
                                 response_text = content_out
@@ -6257,27 +6262,26 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ── Google thought_signature injection ──────────────────
                             # Google's OpenAI-compatible API requires thoughtSignature on
                             # functionCall parts in assistant messages. Without it, Gemini
-                            # 3.1+ returns 400. The OpenAI format uses 'function' key;
-                            # Google's conversion layer passes through fields from the
-                            # 'function' object into 'functionCall'. Inject thoughtSignature
-                            # both inside 'function' (for the conversion layer) and at the
-                            # top level of the tool_call dict (belt-and-suspenders).
+                            # 3.1+ returns 400. The API returns thought_signature in:
+                            #   extra_content.google.thought_signature
+                            # We must preserve this and pass it back in subsequent turns.
+                            # The OpenAI-compatible endpoint accepts extra_content, so we
+                            # inject it at the top level of each tool_call dict.
                             if "generativelanguage.googleapis.com" in (base_url or ""):
                                 _injected = 0
                                 for _msg in _msgs_to_send:
                                     if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
                                         for _tc in _msg["tool_calls"]:
                                             if isinstance(_tc, dict) and _tc.get("type") == "function":
-                                                _fn = _tc.get("function")
-                                                if _fn and isinstance(_fn, dict):
-                                                    # Inside function dict — conversion layer may pass through to functionCall
-                                                    if "thoughtSignature" not in _fn:
-                                                        _fn["thoughtSignature"] = "skip_thought_signature_validator"
-                                                    # Top level — in case Google checks it there
-                                                    if "thoughtSignature" not in _tc:
-                                                        _tc["thoughtSignature"] = "skip_thought_signature_validator"
+                                                # Check if extra_content.google.thought_signature exists
+                                                _ec = _tc.get("extra_content", {})
+                                                _google = _ec.get("google", {}) if isinstance(_ec, dict) else {}
+                                                _ts = _google.get("thought_signature") if isinstance(_google, dict) else None
+                                                if _ts:
+                                                    _tc["extra_content"] = {"google": {"thought_signature": _ts}}
                                                     _injected += 1
-                                logger.warning("[hermes-code] Google thought_signature: injected=%d into %d messages for %s", _injected, len(_msgs_to_send), resolved_model)
+                                if _injected:
+                                    logger.warning("[hermes-code] Google thought_signature: injected=%d into %d messages for %s", _injected, len(_msgs_to_send), resolved_model)
 
                             # ── arliai tool_call_id sanitization ────────────────────
                             # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
