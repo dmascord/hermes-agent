@@ -3299,7 +3299,7 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                     runtime_kwargs["api_key"] = ""
                     runtime_kwargs["provider"] = "openrouter"
         elif provider_prefix == "zai":
-            runtime_kwargs["base_url"] = "https://api.z.ai/api/coding/paas/v4"
+            runtime_kwargs["base_url"] = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
             runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
             runtime_kwargs["provider"] = "zai"
         elif provider_prefix == "xiaomi":
