@@ -28,12 +28,16 @@ import ipaddress
 import json
 import logging
 import os
-# Ensure all log messages have timestamps in docker logs
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# Add timestamps to all existing log handlers that don't have formatters.
+_fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+for _h in logging.root.handlers:
+    if not _h.formatter:
+        _h.setFormatter(_fmt)
+if not logging.root.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(_fmt)
+    logging.root.addHandler(_h)
+    logging.root.setLevel(logging.INFO)
 import socket as _socket
 import re
 import sqlite3
