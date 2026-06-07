@@ -5501,17 +5501,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 return False
 
             def _strip_from_client_tools(tools: Any) -> Any:
-                """Remove _from_client marker added during request parsing.
+                """Remove internal markers and unsupported fields from tool definitions.
                 
-                This marker is added for internal tracking but MUST NOT be sent to
-                external providers (e.g. google/gemini-2.5-flash rejects unknown fields).
+                _from_client is added during request parsing for internal tracking.
+                strict is an OpenAI 4.x feature not supported by Google and other providers.
+                These MUST NOT be sent to external APIs.
                 """
                 if not isinstance(tools, list):
                     return tools
                 result = []
                 for tool in tools:
                     if isinstance(tool, dict):
-                        cleaned = {k: v for k, v in tool.items() if k != "_from_client"}
+                        cleaned = {
+                            k: v for k, v in tool.items()
+                            if k not in ("_from_client", "strict")
+                        }
+                        # Also strip strict from nested function.parameters
+                        fn = cleaned.get("function")
+                        if isinstance(fn, dict):
+                            fn_cleaned = {k: v for k, v in fn.items() if k != "strict"}
+                            cleaned["function"] = fn_cleaned
                         result.append(cleaned)
                     else:
                         result.append(tool)
