@@ -64,11 +64,19 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     import time as _time
 
     # 1. Honour Retry-After header if the underlying HTTP response is attached.
+    # Check error body first to determine if this is a weekly/daily quota.
+    body = str(exc).lower()
+    _is_quota_limit = any(kw in body for kw in ["weekly", "daily", "usage limit", "limitname"])
+    _max = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
     try:
         retry_after = exc.response.headers.get("Retry-After") or exc.response.headers.get("retry-after")  # type: ignore[union-attr]
         if retry_after:
-            _max = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
             _val = max(60.0, float(retry_after))
+            # For weekly/daily quotas, respect the full Retry-After value (providers like
+            # opencode-go return the exact reset time in this header). Only cap generic
+            # rate limits which have small Retry-After values (typically < 3600s).
+            if _is_quota_limit:
+                return _val
             return _val if _max <= 0 else min(_val, _max)
     except Exception:
         pass
@@ -82,9 +90,6 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     except Exception:
         pass
 
-    # 3. Parse the error body for quota-exhaustion keywords and actual reset time.
-    body = str(exc).lower()
-    _max_cap = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
 
     # Look for "reset in X" or "X remaining" patterns in the error body.
     # Common formats: "reset in 5 days", "5 days remaining", "retry in 24 hours"
@@ -95,7 +100,7 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
         _multipliers = {"second": 1, "minute": 60, "hour": 3600, "day": 86400, "week": 604800}
         _raw = _amount * _multipliers.get(_unit, 3600)
         # Only cap hourly limits — weekly/daily limits should be respected.
-        return _raw if _max_cap <= 0 else min(_raw, _max_cap)
+        return _raw if _max <= 0 else min(_raw, _max)
 
     if "weekly" in body or "week" in body:
         # Weekly limit — respect the full window, don't cap it.
@@ -108,7 +113,7 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     if _hour_match:
         _raw = max(3600.0, int(_hour_match.group(1)) * 3600.0)
         # Only cap hourly limits — they might be overly aggressive.
-        return _raw if _max_cap <= 0 else min(_raw, _max_cap)
+        return _raw if _max <= 0 else min(_raw, _max)
     if "hour" in body:
         return 3600.0
 
