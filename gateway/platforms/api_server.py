@@ -6244,9 +6244,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         prov = runtime_kwargs.get("provider", "")
                         api_key = runtime_kwargs.get("api_key", "")
                         base_url = runtime_kwargs.get("base_url", "") or None
-                        # TEMP DEBUG: log the actual kwargs for minimax/zai
-                        if provider_model.startswith("minimax") or provider_model.startswith("zai"):
-                            logger.warning("[DEBUG] provider_model=%s base_url=%s runtime_kwargs=%s", provider_model, base_url, runtime_kwargs)
                         if not api_key:
                             continue
                         _s_loop = asyncio.get_running_loop()
