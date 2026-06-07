@@ -28,16 +28,12 @@ import ipaddress
 import json
 import logging
 import os
-# Add timestamps to all existing log handlers that don't have formatters.
+# Add timestamp formatting to root logger (Python's lastResort has none).
 _fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-for _h in logging.root.handlers:
-    if not _h.formatter:
-        _h.setFormatter(_fmt)
-if not logging.root.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(_fmt)
-    logging.root.addHandler(_h)
-    logging.root.setLevel(logging.INFO)
+_root_sh = logging.StreamHandler()
+_root_sh.setFormatter(_fmt)
+logging.root.addHandler(_root_sh)
+logging.root.setLevel(logging.INFO)
 import socket as _socket
 import re
 import sqlite3
