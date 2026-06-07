@@ -1507,6 +1507,10 @@ def _extract_openai_tool_calls(raw_tool_calls: Any) -> List[Dict[str, Any]]:
         if isinstance(call_id, str) and call_id.strip():
             item["id"] = call_id.strip()
             item["call_id"] = call_id.strip()
+        # Preserve extra_content (contains google.thought_signature for Gemini)
+        _ec = tc.get("extra_content")
+        if _ec:
+            item["extra_content"] = _ec
         normalized.append(item)
     return normalized
 
