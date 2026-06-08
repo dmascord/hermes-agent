@@ -44,11 +44,13 @@ def _resolve_command() -> str:
 
 
 def _resolve_args() -> list[str]:
-    """Default CLI args. Override via HERMES_CLAUDE_CODE_ARGS env var."""
+    """Default CLI args. Override via HERMES_CLAUDE_CODE_ARGS env var.
+
+    Claude's CLI requires --verbose when using --output-format=stream-json.
+    """
     raw = os.getenv("HERMES_CLAUDE_CODE_ARGS", "").strip()
     if not raw:
-        # Use stream-json for structured API-like output
-        return ["-p", "--output-format", "stream-json"]
+        return ["-p", "--output-format", "stream-json", "--verbose"]
     return shlex.split(raw)
 
 
