@@ -3070,6 +3070,24 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                     f"Anthropic API key required for model {model}. "
                     "Set ANTHROPIC_API_KEY environment variable."
                 )
+        elif provider_prefix == "claude-code-cli":
+            # External process provider — Claude Code CLI subprocess.
+            # The actual subprocess invocation happens in the non-streaming
+            # passthrough path. Here we just mark the provider so the
+            # dispatch can take the ClaudeCodeClient route.
+            try:
+                from hermes_cli.auth import resolve_external_process_provider_credentials
+                _cc_creds = resolve_external_process_provider_credentials("claude-code-cli")
+                runtime_kwargs["base_url"] = _cc_creds.get("base_url", "claude://codex")
+                runtime_kwargs["api_key"] = _cc_creds.get("api_key", "claude-code-cli")
+                runtime_kwargs["provider"] = "claude-code-cli"
+            except Exception as _cc_exc:
+                logging.getLogger(__name__).warning(
+                    "[hermes-code] claude-code-cli credential resolution failed: %s", _cc_exc,
+                )
+                runtime_kwargs["base_url"] = "claude://codex"
+                runtime_kwargs["api_key"] = "claude-code-cli"
+                runtime_kwargs["provider"] = "claude-code-cli"
         elif provider_prefix == "openai":
             openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
             openai_base = os.getenv("OPENAI_BASE_URL", "").strip()
