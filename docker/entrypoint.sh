@@ -146,6 +146,22 @@ case "${HERMES_DASHBOARD:-}" in
         ;;
 esac
 
+# Restore Claude Code CLI credentials from PVC backup if available.
+# The PVC mount persists across pod restarts, but /root/.claude is ephemeral.
+# We store a backup at $HERMES_HOME/.claude_backup/ and restore on each start.
+if [ -d "${HERMES_HOME}/.claude_backup" ]; then
+    mkdir -p /root/.claude
+    if [ -f "${HERMES_HOME}/.claude_backup/.credentials.json" ]; then
+        cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" /root/.claude/.credentials.json
+        chmod 600 /root/.claude/.credentials.json
+    fi
+    if [ -f "${HERMES_HOME}/.claude_backup/claude.json" ]; then
+        cp -f "${HERMES_HOME}/.claude_backup/claude.json" /root/.claude.json
+        chmod 600 /root/.claude.json
+    fi
+    echo "Restored Claude Code CLI credentials from PVC backup"
+fi
+
 # Final exec: two supported invocation patterns.
 #
 #   docker run <image>                 -> exec `hermes` with no args (legacy default)
