@@ -94,48 +94,71 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _format_messages_as_prompt(
+def _format_messages_as_ndjson(
     messages: list[dict[str, Any]],
     model: str | None = None,
 ) -> str:
-    """Format messages as a prompt for Claude Code print mode."""
-    sections: list[str] = [
-        "You are being used as the active coding agent backend for Hermes.",
-        "Use your coding capabilities to complete tasks.",
-        "Provide a clear, actionable response.",
-    ]
+    """Convert OpenAI-style messages to Claude CLI NDJSON streaming input.
 
-    transcript: list[str] = []
+    The CLI accepts one JSON object per line on stdin when invoked with
+    `--input-format stream-json`. Each line is a single `user` turn,
+    using the same shape as the Agent SDK streaming input:
+
+        {"type": "user", "message": {"role": "user", "content": "..."}}
+
+    We coalesce the OpenAI-style transcript (system, user, assistant,
+    tool) into a single user turn for print mode, since the CLI in
+    print mode runs one conversation and exits.
+    """
+    system_parts: list[str] = []
+    user_parts: list[dict[str, Any]] = []
+    history_parts: list[str] = []
+
     for message in messages:
         if not isinstance(message, dict):
             continue
-
         role = str(message.get("role") or "unknown").strip().lower()
-        if role not in {"system", "user", "assistant"}:
-            role = "context"
-
         content = message.get("content")
-        if not content:
+        if content is None or content == "":
             continue
-
-        # Handle tool results
+        if role == "system":
+            system_parts.append(str(content))
+            continue
         if role == "tool":
-            content = f"Tool result: {content}"
+            history_parts.append(f"[Tool result]\n{content}")
+            continue
+        if role == "user":
+            # Promote the last user message into the live user turn; keep
+            # earlier ones in the history so the model sees full context.
+            user_parts = [{"type": "text", "text": str(content)}]
+            continue
+        if role == "assistant":
+            history_parts.append(f"[Assistant]\n{content}")
+            continue
+        history_parts.append(f"[{role.title()}]\n{content}")
 
-        label = {
-            "system": "System",
-            "user": "User",
-            "assistant": "Assistant",
-            "context": "Context",
-        }.get(role, role.title())
+    if system_parts or history_parts:
+        prefix = []
+        if system_parts:
+            prefix.append("\n\n".join(system_parts))
+        if history_parts:
+            prefix.append("Conversation so far:\n\n" + "\n\n".join(history_parts))
+        if user_parts:
+            user_parts.insert(0, {"type": "text", "text": "\n\n".join(prefix)})
+        else:
+            user_parts = [{"type": "text", "text": "\n\n".join(prefix)}]
 
-        transcript.append(f"{label}: {content}")
+    if not user_parts:
+        user_parts = [{"type": "text", "text": "Hello"}]
 
-    if transcript:
-        sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
-
-    sections.append("Complete the user's request.")
-    return "\n\n".join(section.strip() for section in sections if section and section.strip())
+    payload = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": user_parts if len(user_parts) > 1 else user_parts[0]["text"],
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False) + "\n"
 
 
 def _parse_stream_json_output(output: str) -> dict[str, Any]:
@@ -245,20 +268,33 @@ class ClaudeCodeClient:
         # Map model hint to Claude Code model
         model_flag = MODEL_MAP.get(model or "sonnet", "claude-sonnet-4-6")
 
-        prompt_text = _format_messages_as_prompt(messages or [], model=model)
+        # Build NDJSON payload for --input-format stream-json
+        ndjson_payload = _format_messages_as_ndjson(messages or [], model=model)
 
-        # Build command args
-        cmd_args = [self._claude_command] + self._claude_args + [prompt_text]
+        # Build command args.  We use NDJSON streaming input rather than
+        # a positional prompt, and rely on stream-json for the output.
+        # Don't include the prompt as a positional arg.
+        cmd_args = [self._claude_command] + list(self._claude_args)
 
-        # Add model flag if not already in args
-        if not any("--model" in arg for arg in cmd_args):
-            cmd_args.insert(1, "--model")
-            cmd_args.insert(2, model_flag)
+        # Add --input-format stream-json (required for stdin NDJSON)
+        if not any(a == "--input-format" or a.startswith("--input-format=") for a in cmd_args):
+            cmd_args.extend(["--input-format", "stream-json"])
+
+        # Add --output-format stream-json
+        if not any(a == "--output-format" or a.startswith("--output-format=") for a in cmd_args):
+            cmd_args.extend(["--output-format", "stream-json"])
+
+        # --verbose is required when using --output-format=stream-json
+        if not any(a == "--verbose" for a in cmd_args):
+            cmd_args.append("--verbose")
+
+        # Add model flag
+        if not any(a == "--model" or a.startswith("--model=") for a in cmd_args):
+            cmd_args.extend(["--model", model_flag])
 
         # Add max turns if tools are provided
-        if tools and not any("--max-turns" in arg for arg in cmd_args):
-            cmd_args.insert(1, "--max-turns")
-            cmd_args.insert(2, "10")
+        if tools and not any(a == "--max-turns" or a.startswith("--max-turns=") for a in cmd_args):
+            cmd_args.extend(["--max-turns", "10"])
 
         # Add allowed tools if tools are provided
         if tools:
@@ -268,10 +304,8 @@ class ClaudeCodeClient:
                     fn = t.get("function", {})
                     if isinstance(fn, dict) and fn.get("name"):
                         tool_names.append(fn["name"])
-            if tool_names:
-                if not any("--allowedTools" in arg for arg in cmd_args):
-                    cmd_args.insert(1, "--allowedTools")
-                    cmd_args.insert(2, ",".join(tool_names))
+            if tool_names and not any(a == "--allowedTools" or a.startswith("--allowedTools=") for a in cmd_args):
+                cmd_args.extend(["--allowedTools", ",".join(tool_names)])
 
         # Timeout handling
         effective_timeout = _DEFAULT_TIMEOUT_SECONDS
@@ -281,6 +315,7 @@ class ClaudeCodeClient:
 
         response_text = self._run_prompt(
             cmd_args,
+            stdin_payload=ndjson_payload,
             timeout_seconds=effective_timeout,
         )
 
@@ -341,6 +376,7 @@ class ClaudeCodeClient:
         self,
         cmd_args: list[str],
         *,
+        stdin_payload: str = "",
         timeout_seconds: float,
     ) -> str:
         """Run Claude Code with the given args and return the output."""
@@ -369,9 +405,19 @@ class ClaudeCodeClient:
             self._active_process = proc
 
         try:
-            # Claude Code in print mode reads from stdin if no prompt is given
+            # Write the NDJSON payload to stdin and close it so the CLI
+            # starts processing. We send all bytes up front, then close
+            # — the CLI in print mode will run one conversation and exit.
             if proc.stdin:
-                proc.stdin.close()
+                if stdin_payload:
+                    try:
+                        proc.stdin.write(stdin_payload)
+                    except BrokenPipeError:
+                        pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
 
             # Read output with timeout
             output_lines: list[str] = []
