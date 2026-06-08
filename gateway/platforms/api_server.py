@@ -6520,6 +6520,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         # Initialize _skip_normal_call so it's always defined regardless
                         # of which provider branch is taken (copilot/claude/gemini/else).
                         _skip_normal_call = False
+                        # Initialize _msgs_to_send with a default (passthrough_messages)
+                        # so it's always defined for the call_llm fallback path, even if
+                        # the provider branch (openai-codex/claude-code-cli) doesn't set it.
+                        _msgs_to_send = passthrough_messages
+                        # Initialize _acquired_stream for the same reason — the
+                        # provider-specific branches (openai-codex/claude-code-cli) don't
+                        # go through the parallel stream limiter, so this stays False.
+                        _acquired_stream = False
                         if _needs_audio and prov == "google":
                             def _gemini_audio_call():
                                 from agent.gemini_native_adapter import GeminiNativeClient
