@@ -26,12 +26,13 @@ _DEFAULT_TIMEOUT_SECONDS = 300.0  # 5 minutes for print mode
 
 # Model mapping: hermes model hint → Claude Code --model flag
 MODEL_MAP = {
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4.6",
-    "haiku": "claude-haiku-4-5-20250520",
-    "claude-sonnet-4-6": "claude-sonnet-4-6",
-    "claude-opus-4.6": "claude-opus-4.6",
-    "claude-haiku-4-5-20250520": "claude-haiku-4-5-20250520",
+    # Use Claude CLI's own model aliases; these work reliably in print mode.
+    "sonnet": "sonnet",
+    "opus": "opus",
+    "haiku": "haiku",
+    "claude-sonnet-4-6": "sonnet",
+    "claude-opus-4.6": "opus",
+    "claude-haiku-4-5-20250520": "haiku",
 }
 
 
@@ -312,6 +313,14 @@ class ClaudeCodeClient:
         if max_tokens:
             # Rough estimate: 4 tokens per token, plus overhead
             effective_timeout = max(effective_timeout, max_tokens / 2.0)
+
+        # DEBUG: keep an exact copy of the command line in logs when needed.
+        # (Safe: args contain no secrets; auth is via restored CLI credentials.)
+        try:
+            import logging
+            logging.getLogger(__name__).info("[claude-code-client] cmd_args=%s", cmd_args)
+        except Exception:
+            pass
 
         response_text = self._run_prompt(
             cmd_args,
