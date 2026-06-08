@@ -5887,7 +5887,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
         api_key = "copilot-acp"
         check_scheme = "acp+tcp://"
-    elif provider_id == "claude-code":
+    elif provider_id == "claude-code-cli":
         command = (
             os.getenv("HERMES_CLAUDE_CODE_COMMAND", "").strip()
             or os.getenv("CLAUDE_CODE_CLI_PATH", "").strip()
@@ -5895,7 +5895,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         )
         raw_args = os.getenv("HERMES_CLAUDE_CODE_ARGS", "").strip()
         args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "json"]
-        api_key = "claude-code"
+        api_key = "claude-code-cli"
         check_scheme = "claude://"
     else:
         raise AuthError(
@@ -5913,7 +5913,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
                 provider=provider_id,
                 code="missing_copilot_cli",
             )
-        elif provider_id == "claude-code":
+        elif provider_id == "claude-code-cli":
             raise AuthError(
                 f"Could not find the Claude Code command '{command}'. "
                 "Install Claude Code CLI: npm install -g @anthropic-ai/claude-code",

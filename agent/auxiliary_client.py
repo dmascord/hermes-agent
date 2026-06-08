@@ -2691,17 +2691,17 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
-        if provider == "claude-code":
+        if provider == "claude-code-cli":
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
             command = str(creds.get("command", "")).strip() or None
             args = list(creds.get("args") or [])
             if not final_model:
-                # Default to sonnet for claude-code
+                # Default to sonnet for claude-code-cli
                 final_model = "claude-sonnet-4-6"
             if not api_key or not base_url:
                 logger.warning(
-                    "resolve_provider_client: claude-code requested but external "
+                    "resolve_provider_client: claude-code-cli requested but external "
                     "process credentials are incomplete"
                 )
                 return None, None
