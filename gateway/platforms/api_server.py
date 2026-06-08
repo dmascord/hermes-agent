@@ -7430,6 +7430,35 @@ class APIServerAdapter(BasePlatformAdapter):
                                 timeout=300,
                             ),
                         )
+                    elif prov == "claude-code-cli":
+                        # Claude Code CLI — external process provider (non-streaming variant).
+                        logger.info("[hermes-code][req=%s] claude-code-cli ns dispatch: prov=%s", _req_id, prov)
+                        try:
+                            from hermes_cli.auth import resolve_external_process_provider_credentials
+                            _cc_creds_ns = resolve_external_process_provider_credentials("claude-code-cli")
+                            from agent.claude_code_client import ClaudeCodeClient
+                            _cc_client_ns = ClaudeCodeClient(
+                                api_key=_cc_creds_ns.get("api_key", "claude-code-cli"),
+                                base_url=_cc_creds_ns.get("base_url", "claude://codex"),
+                                command=_cc_creds_ns.get("command"),
+                                args=_cc_creds_ns.get("args"),
+                            )
+                        except Exception as _cc_exc:
+                            logger.warning("[hermes-code][req=%s] claude-code-cli ns credential resolution failed: %s", _req_id, _cc_exc)
+                            _cc_client_ns = None
+                        if _cc_client_ns is not None:
+                            logger.info("[hermes-code][req=%s] claude-code-cli ns invoking subprocess for model=%s", _req_id, resolved_model)
+                            def _claude_code_call_ns(_c=_cc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                                return _c.chat.completions.create(
+                                    model=_m,
+                                    messages=_msgs,
+                                    tools=_tools,
+                                    timeout=300,
+                                )
+                            response_obj = await _ns_loop.run_in_executor(None, _claude_code_call_ns)
+                            logger.info("[hermes-code][req=%s] claude-code-cli ns subprocess returned: %s", _req_id, type(response_obj).__name__)
+                        else:
+                            continue
                     else:
                         _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                         _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
