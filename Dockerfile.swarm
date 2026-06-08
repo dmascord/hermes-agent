@@ -86,6 +86,7 @@ RUN uv sync --no-cache && uv pip install --no-cache aiohttp==3.13.3 anthropic==0
 # Only the root manifest is needed so that tools/browser_tool.py can resolve
 # agent-browser and @askjo/camofox-browser from node_modules/.bin/ .
 RUN npm install --prefer-offline --no-audit --no-fund && \
+    npm install -g @anthropic-ai/claude-code && \
     npm cache clean --force && \
     rm -rf /root/.cache/camoufox /tmp/camoufox-* && \
     # Remove build-deps: native addons are already compiled; toolchain is ~400 MB

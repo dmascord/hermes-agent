@@ -6282,6 +6282,35 @@ class APIServerAdapter(BasePlatformAdapter):
                                     timeout=300,
                                 ),
                             )
+                        elif prov == "claude-code-cli":
+                            # Claude Code CLI — external process provider.
+                            # Resolve credentials via the external_process path and
+                            # invoke the ClaudeCodeClient which runs `claude -p`.
+                            try:
+                                from hermes_cli.auth import resolve_external_process_provider_credentials
+                                _cc_creds = resolve_external_process_provider_credentials("claude-code-cli")
+                                from agent.claude_code_client import ClaudeCodeClient
+                                _cc_client = ClaudeCodeClient(
+                                    api_key=_cc_creds.get("api_key", "claude-code-cli"),
+                                    base_url=_cc_creds.get("base_url", "claude://codex"),
+                                    command=_cc_creds.get("command"),
+                                    args=_cc_creds.get("args"),
+                                )
+                            except Exception as _cc_exc:
+                                logger.warning("[hermes-code][req=%s] claude-code-cli credential resolution failed: %s", _req_id, _cc_exc)
+                                _cc_client = None
+                            if _cc_client is not None:
+                                def _claude_code_call(_c=_cc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                                    return _c.chat.completions.create(
+                                        model=_m,
+                                        messages=_msgs,
+                                        tools=_tools,
+                                        timeout=300,
+                                    )
+                                response_obj = await _s_loop.run_in_executor(None, _claude_code_call)
+                            else:
+                                # Fall through to next provider
+                                continue
                         else:
                             _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                             _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
