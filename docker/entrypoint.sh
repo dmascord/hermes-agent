@@ -56,25 +56,9 @@ if [ "$(id -u)" = "0" ]; then
     chown hermes:hermes "$HERMES_HOME/auth.json" 2>/dev/null || true
 
     # Restore Claude Code CLI credentials from PVC backup.
-    # The PVC mount persists across pod restarts, but both /root/.claude and
-    # the hermes subprocess HOME are ephemeral. Restore into BOTH locations:
-    #   1) /root/.claude for any root-level interactive debugging
-    #   2) $HERMES_HOME/home/.claude for subprocesses launched after dropping
-    #      privileges to the hermes user (this is the actual runtime path used
-    #      by ClaudeCodeClient).
+    # The PVC mount persists across pod restarts. Restore into the hermes-owned
+    # subprocess HOME so ClaudeCodeClient (running as hermes) can access them.
     if [ -d "${HERMES_HOME}/.claude_backup" ]; then
-        # Root copy
-        mkdir -p /root/.claude 2>/dev/null || true
-        if [ -f "${HERMES_HOME}/.claude_backup/.credentials.json" ]; then
-            cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" /root/.claude/.credentials.json 2>/dev/null || true
-            chmod 600 /root/.claude/.credentials.json 2>/dev/null || true
-        fi
-        if [ -f "${HERMES_HOME}/.claude_backup/claude.json" ]; then
-            cp -f "${HERMES_HOME}/.claude_backup/claude.json" /root/.claude.json 2>/dev/null || true
-            chmod 600 /root/.claude.json 2>/dev/null || true
-        fi
-
-        # Hermes subprocess HOME copy
         mkdir -p "${HERMES_HOME}/home/.claude" 2>/dev/null || true
         if [ -f "${HERMES_HOME}/.claude_backup/.credentials.json" ]; then
             cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true

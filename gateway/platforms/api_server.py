@@ -3392,6 +3392,19 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
 
     if "/" in normalized_model:
         normalized_model = normalized_model.split("/", 1)[1].strip()
+
+    # ── Model-name normalization ───────────────────────────────────────────
+    # Map known-bad or deprecated model names to their valid replacements.
+    # This catches client-side requests (hermes-code passthrough) for models
+    # that don't exist in the provider's API, avoiding spurious 404s.
+    _MODEL_NAME_NORMALIZE: Dict[str, str] = {
+        # Google Gemini: gemini-3.1-flash-preview does not exist in the API;
+        # gemini-3.1-flash-lite-preview is the correct free-tier fast model.
+        "gemini-3.1-flash-preview": "gemini-3.1-flash-lite-preview",
+    }
+    if normalized_model in _MODEL_NAME_NORMALIZE:
+        normalized_model = _MODEL_NAME_NORMALIZE[normalized_model]
+
     logging.getLogger(__name__).info(
         "[timing] _runtime_kwargs_for_model_id: %.3fs for model=%s",
         time.time() - _t_rk, model,
@@ -5752,7 +5765,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _cool = []
             try:
                 from agent.model_cooldown_db import model_cooldown_remaining
-                for idx in range(1, 33):
+                for idx in range(1, 36):
                     fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
                     if fb and fb not in _passthrough_models:
                         _prov = fb.split("/")[0] if "/" in fb else ""
@@ -5763,7 +5776,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _passthrough_models.append(fb)
             except Exception:
                 # Fallback: add all models without checking (original behaviour)
-                for idx in range(1, 33):
+                for idx in range(1, 36):
                     fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
                     if fb and fb not in _passthrough_models:
                         _passthrough_models.append(fb)
