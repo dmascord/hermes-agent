@@ -2940,6 +2940,34 @@ class GatewayRunner:
             )
         except Exception:
             pass
+        # Mirror the state into the API server adapter's in-memory field
+        # so the /ready endpoint (used by the Kubernetes readinessProbe)
+        # flips from 503 -> 200 the moment the gateway reaches a
+        # serving-traffic state.  Without this hook the /ready endpoint
+        # would stay 503 forever — the in-memory state defaults to
+        # "starting" at process start.  Failures here are non-fatal:
+        # the persisted status file still gets written above.
+        if gateway_state is not None:
+            try:
+                adapter = None
+                adapters = getattr(self, "adapters", None) or {}
+                # Adapters are keyed by Platform enum; resolve by enum
+                # so we don't depend on dict ordering or .values() name
+                # matching.
+                from gateway.platforms.base import Platform
+                api_platform = getattr(Platform, "API_SERVER", None)
+                if api_platform is not None and api_platform in adapters:
+                    adapter = adapters[api_platform]
+                else:
+                    # Fallback: scan for an adapter exposing set_gateway_state.
+                    for candidate in adapters.values():
+                        if hasattr(candidate, "set_gateway_state"):
+                            adapter = candidate
+                            break
+                if adapter is not None:
+                    adapter.set_gateway_state(gateway_state)
+            except Exception:
+                pass
 
     def _update_platform_runtime_status(
         self,

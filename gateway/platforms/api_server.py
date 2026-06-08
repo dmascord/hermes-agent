@@ -1180,6 +1180,29 @@ def _align_runtime_with_explicit_model(runtime_kwargs: Dict[str, Any], model: st
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
+
+# Gateway states for which the /ready endpoint returns 200.
+#
+# "running"   — main loop is up, platforms connected, ready to serve traffic
+# "degraded"  — main loop is up but some platforms failed to connect; the
+#               gateway is still useful (cron jobs, reconnect watcher,
+#               HTTP API all still work) so we keep the pod in the
+#               Service endpoint set rather than dropping traffic.
+#
+# States that return 503 (pod is not yet ready / no longer ready):
+#   "starting"        — fresh process, main loop not yet running
+#   "startup_failed"  — fatal startup conflict (e.g. port already bound);
+#                       the runner will exit, the pod will restart
+#   "draining"        — graceful shutdown in progress; existing requests
+#                       finish but no new traffic should be sent.  K8s
+#                       removes the pod from Service endpoints when
+#                       /ready returns 503, which is exactly what we
+#                       want for a rolling update or pod deletion.
+#   "stopped"         — clean shutdown completed
+#
+# Unknown / unset values also return 503 — defensive default in case a
+# future gateway version introduces a new state we haven't mapped yet.
+_READY_STATES = frozenset({"running", "degraded"})
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = int(os.getenv("HERMES_API_MAX_REQUEST_BYTES", str(32 * 1024 * 1024)))
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
@@ -4388,6 +4411,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # In-memory gateway state, used by the /ready endpoint to gate
+        # K8s Service endpoint membership.  Starts at "starting" so a
+        # freshly-spawned pod returns 503 from /ready until the runner
+        # explicitly transitions to "running" or "degraded".  See
+        # set_gateway_state() and the /ready handler.  We hold this in
+        # memory (not on the PVC-backed status file) so a brand-new
+        # pod never inherits the previous pod's "running" state during
+        # the window between process start and the first state write.
+        self._gateway_state: str = "starting"
 
     def _create_listen_socket(self, backlog: int = 2048) -> Optional[_socket.socket]:
         """Create an explicit listening socket for concrete IP binds.
@@ -4901,9 +4933,78 @@ class APIServerAdapter(BasePlatformAdapter):
     # HTTP Handlers
     # ------------------------------------------------------------------
 
+    def set_gateway_state(self, state: Optional[str]) -> None:
+        """Update the in-memory gateway state used by the /ready endpoint.
+
+        Called by ``GatewayRunner._update_runtime_status`` on every state
+        transition.  Valid states are the same ones that get persisted to
+        the runtime status file (``starting``, ``running``, ``degraded``,
+        ``startup_failed``, ``draining``, ``stopped``).  ``None`` is a
+        no-op so callers can forward ``gateway_state=None`` through
+        without a special case.
+
+        Thread-safety: this is intended to be called from the runner's
+        event loop.  We do not add a lock because aiohttp's request
+        handlers run on the same loop and the kubelet polls /ready at
+        most a few times per second — even a torn read would just
+        return 503 (state not in _READY_STATES) for one probe tick,
+        which kubelet tolerates.  If the gateway later moves to a
+        multi-threaded model, swap this for a ``threading.Lock`` or
+        an ``asyncio.Event``-based signal.
+        """
+        if state is None:
+            return
+        # Coerce unknown values to "starting" defensively — _handle_ready
+        # treats unknown states as not-ready, so we don't need to raise
+        # here, but normalise common variations.
+        if not isinstance(state, str) or not state:
+            state = "starting"
+        self._gateway_state = state
+
+    def get_gateway_state(self) -> str:
+        """Return the current in-memory gateway state (read-only view)."""
+        return self._gateway_state
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check."""
+        """GET /health — simple liveness check.
+
+        Returns 200 as long as the HTTP server is responding.  Does NOT
+        reflect gateway startup state — for that, see ``/ready``.  K8s
+        liveness probes use this endpoint: a 200 here means "process
+        alive, not deadlocked", which is the only thing the kubelet
+        should use to decide whether to kill the container.
+        """
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
+
+    async def _handle_ready(self, request: "web.Request") -> "web.Response":
+        """GET /ready — Kubernetes readiness probe target.
+
+        Returns 200 only when the gateway has fully initialized and can
+        serve traffic.  Returns 503 during startup, in fatal-startup
+        failure, or while draining/stopping.  The kubelet polls this
+        endpoint and only adds the pod to the Service endpoint set when
+        it returns 200, so traffic is never routed to a half-initialised
+        pod (which would otherwise happen with a single-replica
+        deployment using ``maxUnavailable: 0``).
+
+        State is held in process memory — see ``set_gateway_state()``.
+        The previous design read from a file on the PVC, which is
+        racy: a fresh pod would briefly see ``gateway_state: running``
+        written by the previous pod before the new pod overwrites it.
+        In-memory state starts at ``"starting"`` and is only flipped to
+        ``"running"`` (or ``"degraded"``) by the running gateway
+        itself, so the kubelet never sees a stale "ready" signal.
+        """
+        state = self._gateway_state
+        if state in _READY_STATES:
+            return web.json_response(
+                {"status": "ok", "gateway_state": state},
+                status=200,
+            )
+        return web.json_response(
+            {"status": "not_ready", "gateway_state": state},
+            status=503,
+        )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
@@ -10555,6 +10656,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
+            self._app.router.add_get("/ready", self._handle_ready)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/stats", self._handle_stats)
             self._app.router.add_get("/v1/health", self._handle_health)

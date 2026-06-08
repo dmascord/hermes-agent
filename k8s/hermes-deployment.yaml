@@ -1,0 +1,210 @@
+# Hermes Gateway — Kubernetes deployment manifest
+#
+# This manifest replaces the previously-imperative `kubectl set image` workflow
+# described in `AGENTS.md`.  The declarative form is intentional: every rollout
+# setting (probes, strategy, image) is versioned alongside the source code
+# that the image was built from, so a change to the rollout safety guarantees
+# can only land via a PR — not via a stray `kubectl edit` on the cluster.
+#
+# Rollout safety — read this before changing the strategy section.
+# ----------------------------------------------------------------
+# A single-replica gateway that comes up broken takes the service offline the
+# moment Kubernetes evicts the (still-working) old pod.  To prevent that, this
+# deployment uses:
+#
+#   * startupProbe  — gives a slow-starting container up to 5 minutes of grace
+#                     before livenessProbe even starts counting failures.  This
+#                     is the primary defense against init-time slowness.
+#   * readinessProbe (path: /ready) — only when the gateway has actually
+#                     finished initializing (state: running|degraded) does
+#                     Kubernetes add the pod to the Service endpoint set.
+#                     The /ready endpoint is process-local in-memory state,
+#                     not a file on the PVC, so a fresh pod never inherits
+#                     the previous pod's "running" signal during the
+#                     startup window.
+#   * preStop sleep — gives kube-proxy / Traefik time to remove the pod from
+#                     Service endpoints before SIGTERM lands and the runner
+#                     starts tearing down.
+#   * rollingUpdate { maxSurge: 1, maxUnavailable: 0 } — the old pod stays in
+#                     the Service endpoints until the new pod passes
+#                     /ready.  With replicas: 1 this means at most 2 pods
+#                     during a rollout, never 0.
+#
+# If you change `strategy` or the probe blocks, re-verify the rollout safety
+# properties with the test procedure at the bottom of `AGENTS.md`.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes
+  namespace: hermes
+  labels:
+    app: hermes
+  annotations:
+    # Annotation that documents which rolling-update policy this deployment
+    # enforces.  Surfaced by `kubectl describe deployment` for reviewers.
+    rollout.kubernetes.io/safe-strategy: "maxSurge=1,maxUnavailable=0"
+    # Indicates the new in-memory readiness signal is in use; safe to remove
+    # only if the /ready endpoint and APIServerAdapter.set_gateway_state()
+    # wiring are also removed.
+    rollout.kubernetes.io/readiness-signal: "in-memory-via-/ready"
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 600
+  strategy:
+    # maxSurge: 1 — tolerate one extra pod during rollout so the new pod has
+    #   somewhere to come up.
+    # maxUnavailable: 0 — do NOT take the old pod out of Service endpoints
+    #   until the new pod passes its readinessProbe.  This is the property
+    #   that prevents a broken new pod from taking the service down.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: hermes
+  template:
+    metadata:
+      labels:
+        app: hermes
+      annotations:
+        vso.secrets.hashicorp.com/restartedAt: "2026-06-04T14:49:40Z"
+    spec:
+      serviceAccount: hermes
+      serviceAccountName: hermes
+      # 60s (was 30s) — Hermes' main-loop shutdown is graceful but can take
+      # 10-30s while in-flight chat completions finish.  Bumping the grace
+      # period gives the runner time to flush active agents and to let the
+      # readiness probe -> 503 -> endpoint-removal chain settle before
+      # SIGKILL kicks in.
+      terminationGracePeriodSeconds: 60
+      # Pin to the control-plane node — Hermes uses the hostPath for the
+      # Codex auth backup that's still on visor (TODO: move entirely to the
+      # PVC).  Tolerations cover both the control-plane taint and the
+      # disk-pressure eviction window.
+      nodeSelector:
+        kubernetes.io/hostname: wyrm
+      tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+          operator: Exists
+        - effect: NoExecute
+          key: node-role.kubernetes.io/control-plane
+          operator: Exists
+        - effect: NoExecute
+          key: node.kubernetes.io/disk-pressure
+          operator: Exists
+        - effect: NoSchedule
+          key: node.kubernetes.io/disk-pressure
+          operator: Exists
+      containers:
+        - name: hermes
+          image: 10.0.0.231:5000/hermes-agent:cc-debug-20260608192803
+          imagePullPolicy: IfNotPresent
+          command: ["/sbin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh"]
+          args: ["gateway"]
+          ports:
+            - name: http
+              containerPort: 8642
+              protocol: TCP
+          env:
+            - name: COPILOT_MONTHLY_AIU_LIMIT
+              value: "3900"
+          envFrom:
+            - secretRef:
+                name: hermes-env-vault
+          # ── Resource limits ─────────────────────────────────────────────
+          # CPU limit 4 / request 500m.  Burstable QoS so the pod can burst
+          # above request during LLM-driven spikes.  Memory limit 8Gi.
+          resources:
+            limits:
+              cpu: "4"
+              memory: 8Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          # ── Probes ─────────────────────────────────────────────────────
+          #
+          # livenessProbe vs readinessProbe vs startupProbe:
+          #   liveness  — "is the process alive and not deadlocked?"  Failure
+          #               causes the kubelet to kill and restart the container.
+          #               Use a cheap endpoint that returns 200 as long as the
+          #               HTTP server is responding.
+          #   readiness — "should the pod be in the Service endpoint set?"
+          #               Failure causes the pod to be removed from
+          #               endpoints (no new traffic) but does NOT restart.
+          #               Use an endpoint that reflects actual gateway
+          #               readiness — /ready in our case.
+          #   startup   — "has the slow-starting container finished init?"
+          #               While the startup probe is in flight, liveness and
+          #               readiness probes are SUSPENDED.  This prevents the
+          #               kubelet from killing a slow-but-eventually-OK pod.
+          #
+          startupProbe:
+            # 5 min total grace: 60 attempts × 5s period.  Hermes' cold start
+            # (Python venv + plugin discovery + provider model-cache warm)
+            # usually takes 30-60s on the control-plane node; 5min gives 5x
+            # headroom for cache misses, slow PVC reads, etc.
+            httpGet:
+              path: /health
+              port: 8642
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+            successThreshold: 1
+          livenessProbe:
+            # Cheap, in-process; /health always returns 200 once the aiohttp
+            # server is up.  failureThreshold 3 × 30s period = 90s of
+            # confirmed failure before kill — long enough to ride out
+            # transient network blips, short enough to recover from a
+            # deadlocked event loop.
+            httpGet:
+              path: /health
+              port: 8642
+              scheme: HTTP
+            periodSeconds: 30
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            # /ready is the actual "am I serving traffic" signal.  Returns
+            # 200 only when GatewayRunner has transitioned to "running" or
+            # "degraded".  During startup, /ready returns 503, keeping the
+            # pod out of Service endpoints.  During graceful shutdown, the
+            # runner pushes "draining" to the adapter — /ready returns 503,
+            # kube-proxy / Traefik route around us, and in-flight requests
+            # finish before SIGTERM does damage.
+            httpGet:
+              path: /ready
+              port: 8642
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
+          # ── Graceful shutdown ──────────────────────────────────────────
+          lifecycle:
+            preStop:
+              # Sleep before SIGTERM lands so the kubelet can observe the
+              # readinessProbe -> 503 transition and remove the pod from
+              # Service endpoints before the runner starts tearing down.
+              # 5s is enough for kube-proxy / Traefik endpoint propagation
+              # in our cluster; bump to 10-15s if endpoint removal becomes
+              # a bottleneck on larger clusters.
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          volumeMounts:
+            - name: hermes-home
+              mountPath: /home/tusker/.hermes
+            - name: hermes-data
+              mountPath: /opt/data
+      volumes:
+        - name: hermes-home
+          persistentVolumeClaim:
+            claimName: hermes-home
+        - name: hermes-data
+          emptyDir: {}

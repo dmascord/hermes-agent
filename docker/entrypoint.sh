@@ -55,6 +55,56 @@ if [ "$(id -u)" = "0" ]; then
     # hermes runtime's ability to read/write it.
     chown hermes:hermes "$HERMES_HOME/auth.json" 2>/dev/null || true
 
+    # Restore Claude Code CLI credentials from PVC backup.
+    # The PVC mount persists across pod restarts, but /root/.claude is
+    # ephemeral (and the hermes user's $HOME is the PVC, so $HOME/.claude
+    # is also persisted).  Run this as root BEFORE dropping privileges
+    # so we can populate /root/.claude for any root-level tool, and also
+    # populate the hermes user's $HOME/.claude (= /opt/data/.claude) for
+    # tools invoked as the dropped user.  See issue: CrashLoopBackOff
+    # after the credential-restore commit moved this block below the
+    # gosu drop — the non-root `hermes` user can't write to /root, and
+    # `set -e` killed the container on mkdir failure.
+    if [ -d "${HERMES_HOME}/.claude_backup" ]; then
+        # /root/.claude — for tools that hardcode this path while running as root
+        mkdir -p /root/.claude
+        if [ -f "${HERMES_HOME}/.claude_backup/.credentials.json" ]; then
+            cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" /root/.claude/.credentials.json
+            chmod 600 /root/.claude/.credentials.json
+        fi
+        if [ -f "${HERMES_HOME}/.claude_backup/claude.json" ]; then
+            cp -f "${HERMES_HOME}/.claude_backup/claude.json" /root/.claude.json
+            chmod 600 /root/.claude.json
+        fi
+        # $HOME/.claude — for tools that resolve the user-home config dir.
+        # We resolve via getent passwd (avoids hardcoding /opt/data), and
+        # fall back to the literal path so this still works in stripped
+        # images where getent is missing.  Skip if hermes home is unknown.
+        _hermes_home=""
+        if command -v getent >/dev/null 2>&1; then
+            _hermes_home="$(getent passwd hermes 2>/dev/null | cut -d: -f6)"
+        fi
+        if [ -z "$_hermes_home" ]; then
+            _hermes_home="$HERMES_HOME"
+        fi
+        if [ -n "$_hermes_home" ] && [ "$_hermes_home" != "/" ]; then
+            mkdir -p "$_hermes_home/.claude"
+            chown hermes:hermes "$_hermes_home/.claude" 2>/dev/null || true
+            if [ -f "${HERMES_HOME}/.claude_backup/.credentials.json" ]; then
+                cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" \
+                    "$_hermes_home/.claude/.credentials.json"
+                chown hermes:hermes "$_hermes_home/.claude/.credentials.json" 2>/dev/null || true
+                chmod 600 "$_hermes_home/.claude/.credentials.json" 2>/dev/null || true
+            fi
+            if [ -f "${HERMES_HOME}/.claude_backup/claude.json" ]; then
+                cp -f "${HERMES_HOME}/.claude_backup/claude.json" "$_hermes_home/.claude.json"
+                chown hermes:hermes "$_hermes_home/.claude.json" 2>/dev/null || true
+                chmod 600 "$_hermes_home/.claude.json" 2>/dev/null || true
+            fi
+        fi
+        echo "Restored Claude Code CLI credentials from PVC backup"
+    fi
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi
@@ -145,22 +195,6 @@ case "${HERMES_DASHBOARD:-}" in
         ) &
         ;;
 esac
-
-# Restore Claude Code CLI credentials from PVC backup if available.
-# The PVC mount persists across pod restarts, but /root/.claude is ephemeral.
-# We store a backup at $HERMES_HOME/.claude_backup/ and restore on each start.
-if [ -d "${HERMES_HOME}/.claude_backup" ]; then
-    mkdir -p /root/.claude
-    if [ -f "${HERMES_HOME}/.claude_backup/.credentials.json" ]; then
-        cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" /root/.claude/.credentials.json
-        chmod 600 /root/.claude/.credentials.json
-    fi
-    if [ -f "${HERMES_HOME}/.claude_backup/claude.json" ]; then
-        cp -f "${HERMES_HOME}/.claude_backup/claude.json" /root/.claude.json
-        chmod 600 /root/.claude.json
-    fi
-    echo "Restored Claude Code CLI credentials from PVC backup"
-fi
 
 # Final exec: two supported invocation patterns.
 #
