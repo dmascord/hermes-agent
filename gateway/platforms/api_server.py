@@ -1991,10 +1991,110 @@ def _build_swarm_model_pool(*, estimated_tokens: int = 0, routing_hint: Optional
     }
 
 
-_HERMES_CODE_MAX_FALLBACKS = 32
+_HERMES_CODE_MAX_FALLBACKS = 35
 _HERMES_CODE_LARGE_CONTEXT_MIN = 512_000
 _HERMES_CODE_LARGE_CONTEXT_TRIGGER = 96_000
 _HERMES_CODE_ADVERTISED_CONTEXT_LIMIT = 256_000
+
+
+def _is_prompt_too_long_error(error_text: str) -> bool:
+    """Detect upstream "context/prompt too large" error strings."""
+    txt = str(error_text or "").lower()
+    return any(
+        marker in txt
+        for marker in (
+            "model_max_prompt_tokens_exceeded",
+            "prompt token count of",
+            "max prompt tokens",
+            "too many input tokens",
+            "context length exceeded",
+            "context overflow",
+        )
+    )
+
+
+def _copilot_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert Hermes/OpenAI tool-loop transcripts into Copilot-safe messages.
+
+    Copilot's OpenAI-compat surface rejects bare ``role="tool"`` messages and
+    is strict about the tool_calls / tool response pairing.  We collapse each
+    ``assistant tool_calls + tool result`` round-trip into a single synthetic
+    user message that preserves the call/result semantics, and drop dangling
+    assistant ``tool_calls`` so we don't trigger Copilot's
+    "tool_call_ids did not have response messages" 400.
+    """
+    result: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(msgs):
+        m = msgs[i] if isinstance(msgs[i], dict) else {}
+        role = m.get("role")
+        if role == "assistant" and isinstance(m.get("tool_calls"), list) and m.get("tool_calls"):
+            tool_calls = m.get("tool_calls") or []
+            tool_results: List[Dict[str, Any]] = []
+            j = i + 1
+            while j < len(msgs):
+                nxt = msgs[j] if isinstance(msgs[j], dict) else {}
+                if nxt.get("role") != "tool":
+                    break
+                tool_results.append(nxt)
+                j += 1
+            parts: List[str] = []
+            assistant_text = str(m.get("content") or "").strip()
+            if assistant_text:
+                parts.append(f"Assistant context before tool use:\n{assistant_text}")
+            parts.append("Prior tool interaction summary:")
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = str(tc.get("id") or tc.get("tool_call_id") or "")
+                fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                fn_name = str(fn.get("name") or "")
+                fn_args = str(fn.get("arguments") or "{}")
+                matched = next(
+                    (tr for tr in tool_results if str(tr.get("tool_call_id") or "") == tc_id),
+                    None,
+                )
+                tr_content = str((matched or {}).get("content") or "")
+                parts.append(
+                    f"- tool={fn_name} tool_call_id={tc_id}\narguments={fn_args}\nresult={tr_content}"
+                )
+            result.append({"role": "user", "content": "\n\n".join(parts)})
+            i = j
+            continue
+        if role == "tool":
+            result.append({
+                "role": "user",
+                "content": f"Tool result:\n{m.get('content', '(tool result)')}",
+            })
+            i += 1
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            clean = dict(m)
+            clean.pop("tool_calls", None)
+            result.append(clean)
+            i += 1
+            continue
+        result.append(m)
+        i += 1
+    return result
+
+
+def _hermes_code_skip_toxic_fallback(provider_model: str) -> bool:
+    """Return True if a fallback entry has accumulated extreme recent failures.
+
+    Some models (e.g. ``opencode-go/deepseek-v4-pro``) are repeatedly broken and
+    re-entering the cooldown DB at 300s per trip would still let the swarm hit
+    them every ~5 minutes.  After three recent failures we hard-skip them for
+    the rest of the process lifetime.
+    """
+    raw = str(provider_model or "").strip().lower()
+    if raw != "opencode-go/deepseek-v4-pro":
+        return False
+    try:
+        from agent.model_cooldown_db import provider_failure_count
+        return provider_failure_count("opencode-go", "opencode-go/deepseek-v4-pro") >= 3
+    except Exception:
+        return False
 
 
 def _build_hermes_code_model_pool() -> List[str]:
@@ -5914,6 +6014,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
+                    # Skip toxic fallback models with extreme failure history
+                    if _hermes_code_skip_toxic_fallback(provider_model):
+                        logger.warning(
+                            "[hermes-code] %s: hard-skipping toxic fallback (recent failure history)",
+                            provider_model,
+                        )
+                        continue
+
                     # Skip models whose context window cannot safely hold the estimated
                     # request tokens. This prevents costly "prompt too long" round-trips
                     # that waste API quota and trigger circuit breakers unnecessarily.
@@ -6026,21 +6134,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                 # OpenAI-compatible API (chat_completions or codex_responses)
                                 from openai import OpenAI
                                 from hermes_cli.copilot_auth import copilot_request_headers
-
-                                # Copilot API rejects role="tool" — convert to user messages.
-                                # DeepSeek/Gemini expect proper tool-role messages, so we do
-                                # this conversion only here in the Copilot-specific path.
-                                def _copilot_messages(msgs):
-                                    result = []
-                                    for m in msgs:
-                                        if m.get("role") == "tool":
-                                            result.append({
-                                                "role": "user",
-                                                "content": m.get("content", "(tool result)")
-                                            })
-                                        else:
-                                            result.append(m)
-                                    return result
 
                                 _s_loop = asyncio.get_running_loop()
                                 headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
@@ -6279,10 +6372,20 @@ class APIServerAdapter(BasePlatformAdapter):
                                 logger.info("[hermes-code] client disconnected mid-stream (copilot %s), not penalising provider", provider_model)
                                 passthrough_error = exc
                                 break
+                            # Prompt too long — bail out of the chain. The client must
+                            # compact its transcript; further attempts against larger-context
+                            # models will fail the same way and just burn latency.
+                            if _is_prompt_too_long_error(_exc_str):
+                                logger.warning(
+                                    "[hermes-code] prompt too long for %s (~%d tokens), stopping chain to avoid churn",
+                                    provider_model, _approx_tokens,
+                                )
+                                passthrough_error = exc
+                                break
                             # Don't penalise providers for context-overflow errors — these are
                             # routing/selection issues (resolved by the pre-filter above), not
                             # model or API failures that warrant circuit-breaking.
-                            _is_ctx_overflow = _is_context_overflow_error(_exc_str)
+                            _is_ctx_overflow = _is_context_overflow_error(_exc_str) or _is_prompt_too_long_error(_exc_str)
                             if not _is_ctx_overflow:
                                 try:
                                     from agent.model_cooldown_db import mark_provider_failure
@@ -6346,20 +6449,21 @@ class APIServerAdapter(BasePlatformAdapter):
                                     except Exception:
                                         pass
                             elif _status_code == 400:
-                                # 400 errors (bad request).
-                                # thought_signature missing (Gemini 3.1) is an API compat issue — won't fix on retry.
-                                # Other 400s are also permanent for this request format.
-                                try:
-                                    from agent.model_cooldown_db import mark_model_cooldown
-                                    mark_model_cooldown(
-                                        provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
-                                        model=provider_model,
-                                        cooldown_seconds=120.0,
-                                        reason="hermes_code_stream_400",
-                                    )
-                                    logger.warning("[hermes-code] stream %s cooled down for 120s after 400", provider_model)
-                                except Exception:
-                                    pass
+                                # 400 errors (bad request). Do not penalise prompt-too-long
+                                # requests — those are routing/compaction issues, not provider
+                                # health issues. Other 400s get a short cooldown.
+                                if not _is_prompt_too_long_error(_exc_str):
+                                    try:
+                                        from agent.model_cooldown_db import mark_model_cooldown
+                                        mark_model_cooldown(
+                                            provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
+                                            model=provider_model,
+                                            cooldown_seconds=120.0,
+                                            reason="hermes_code_stream_400",
+                                        )
+                                        logger.warning("[hermes-code] stream %s cooled down for 120s after 400", provider_model)
+                                    except Exception:
+                                        pass
                             elif _status_code == 500:
                                 # 500 (server error) — provider is broken or degraded.
                                 # Won't resolve in seconds. 5min cooldown.
@@ -6661,6 +6765,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             mark_provider_success(prov, resolved_model, base_url=base_url or "")
                         except Exception:
                             pass
+                        try:
+                            from agent.model_quality_db import record_success
+                            record_success(prov, provider_model, base_url=base_url or "", latency_ms=0)
+                        except Exception:
+                            pass
                         # Release parallel stream slot on success
                         if _acquired_stream:
                             try:
@@ -6942,6 +7051,22 @@ class APIServerAdapter(BasePlatformAdapter):
                                 except Exception:
                                     pass
                             break
+                        # Prompt too long — bail out of the chain. The client must
+                        # compact its transcript; further attempts against larger-context
+                        # models will fail the same way and just burn latency.
+                        if _is_prompt_too_long_error(_exc_str):
+                            logger.warning(
+                                "[hermes-code] prompt too long for %s (~%d tokens), stopping chain",
+                                provider_model, _approx_tokens,
+                            )
+                            passthrough_error = exc
+                            if _acquired_stream:
+                                try:
+                                    from agent.provider_parallel_limiter import release_stream
+                                    release_stream(prov)
+                                except Exception:
+                                    pass
+                            break
                         # Release parallel stream slot on provider error
                         if _acquired_stream:
                             try:
@@ -7010,18 +7135,21 @@ class APIServerAdapter(BasePlatformAdapter):
                                 except Exception:
                                     pass
                         elif _status_code == 400:
-                            # 400 errors (bad request) — reduce to 120s cooldown.
-                            try:
-                                from agent.model_cooldown_db import mark_model_cooldown
-                                mark_model_cooldown(
-                                    provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
-                                    model=provider_model,
-                                    cooldown_seconds=120.0,
-                                    reason="hermes_code_stream_400",
-                                )
-                                logger.warning("[hermes-code] stream %s cooled down for 120s after 400", provider_model)
-                            except Exception:
-                                pass
+                            # 400 errors (bad request). Skip cooldown for prompt-too-long
+                            # errors — those are routing/compaction issues, not provider
+                            # health. Other 400s get a short cooldown.
+                            if not _is_prompt_too_long_error(_exc_str):
+                                try:
+                                    from agent.model_cooldown_db import mark_model_cooldown
+                                    mark_model_cooldown(
+                                        provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
+                                        model=provider_model,
+                                        cooldown_seconds=120.0,
+                                        reason="hermes_code_stream_400",
+                                    )
+                                    logger.warning("[hermes-code] stream %s cooled down for 120s after 400", provider_model)
+                                except Exception:
+                                    pass
                         elif _is_auth_error:
                             # For pool-backed credentials (openai-codex), skip the model-level
                             # cooldown — the credential pool's mark_exhausted_and_rotate() below
@@ -7822,6 +7950,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
             if passthrough_error:
                 _err_msg = str(passthrough_error)
+                if _is_prompt_too_long_error(_err_msg):
+                    logger.warning(
+                        "[api_server] hermes-code passthrough stopped: prompt too long (~%d tokens). Returning 413.",
+                        _approx_tokens,
+                    )
+                    return web.json_response(
+                        _openai_error(
+                            f"Context too large: too many tokens (~{_approx_tokens:,}) exceeds provider prompt limit. "
+                            "Please compact the conversation history and retry.",
+                            err_type="invalid_request_error",
+                            code="context_too_large",
+                        ),
+                        status=413,
+                    )
                 logger.warning("[api_server] hermes-code passthrough exhausted providers: %s", _err_msg)
                 return web.json_response(
                     _openai_error(
