@@ -3069,8 +3069,8 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                 cached = _RUNTIME_KWARGS_CACHE[provider_prefix]
                 result_model = normalized_model.split("/", 1)[1].strip()
                 logging.getLogger(__name__).info(
-                    "[timing] _runtime_kwargs_for_model_id: CACHED (%.3fs) for model=%s",
-                    time.time() - _t_rk, model,
+                    "[timing] _runtime_kwargs_for_model_id: CACHED (%.3fs) for model=%s cached_provider=%s",
+                    time.time() - _t_rk, model, cached.get("provider", "?"),
                 )
                 return dict(cached), result_model
         if provider_prefix == "opencode-zen":
@@ -5073,10 +5073,12 @@ class APIServerAdapter(BasePlatformAdapter):
             })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — return hermes-agent as an available model."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
+        """GET /v1/models — return hermes-agent as an available model.
+
+        Auth is NOT required here: model names are not sensitive and IDE
+        extensions (e.g. Zoo Code) call this endpoint before knowing a key.
+        The actual chat/completion endpoint still enforces auth.
+        """
 
         now = int(time.time())
         hermes_code_context = _hermes_code_advertised_context_length()
