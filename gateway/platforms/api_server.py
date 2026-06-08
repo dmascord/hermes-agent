@@ -5295,6 +5295,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # handles overflow based on actual model's context window.
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        # Short request ID for log correlation across provider attempts.
+        # First 8 hex chars of the completion_id is unique enough to trace
+        # a single request through fallback chain, quality scoring, etc.
+        _req_id = completion_id.replace("chatcmpl-", "")[:8]
         model_name = body.get("model", self._model_name)
         role_cfg = _get_role_alias_config(model_name)
         role_hint = dict(role_cfg.get("hint") or {}) if role_cfg else None
@@ -5315,8 +5319,8 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 external_tool_mode = "inband" if force_connection_close else "broker"
         logger.info(
-            "[api_server] chat request stream=%s tools=%s external_tool_mode=%s ua=%s model=%s",
-            stream, bool(tools), external_tool_mode, user_agent[:120], model_name,
+            "[api_server][req=%s] chat request stream=%s tools=%s external_tool_mode=%s ua=%s model=%s",
+            _req_id, stream, bool(tools), external_tool_mode, user_agent[:120], model_name,
         )
 
         _approx_tokens = 0
@@ -5658,7 +5662,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         reverse=True,
                     )
                     logger.info(
-                        "[hermes-code] quality-sorted chain: top5=%s",
+                        "[hermes-code][req=%s] quality-sorted chain: top5=%s",
+                        _req_id,
                         [f"{m.split('/',1)[-1] if '/' in m else m}:{get_quality_score(m.split('/',1)[0], m.split('/',1)[1] if '/' in m else m):.0f}" for m in _passthrough_models[:5]],
                     )
                 except Exception:
@@ -5974,7 +5979,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 for tc in tool_calls_out if isinstance(tc, dict)
                             ]
                             logger.warning(
-                                "[hermes-code] response: model=%s finish=%s tool_calls=%d args=%s content_len=%d",
+                                "[hermes-code][req=%s] response: model=%s finish=%s tool_calls=%d args=%s content_len=%d",
+                                _req_id,
                                 provider_model,
                                 finish_reason,
                                 len(tool_calls_out),
@@ -6433,13 +6439,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         # ── Enforce parallel stream limit ─────────────────────────
                         _acquired_stream = False  # Defined before try so it's always accessible in exception handlers
                         _stream_start = _time.time()
-                        logger.info("[hermes-code] stream: attempting provider=%s model=%s base_url=%s", prov, resolved_model, base_url)
+                        logger.info("[hermes-code][req=%s] stream: attempting provider=%s model=%s base_url=%s", _req_id, prov, resolved_model, base_url)
                         try:
                             from agent.provider_parallel_limiter import acquire_stream, release_stream
                             logger.debug("[hermes-code] stream: acquiring parallel slot for %s (wait=30s)", prov)
                             _stream_acquired = acquire_stream(prov, wait=True, timeout=30.0)
                             _stream_acquire_time = _time.time() - _stream_start
-                            logger.info("[hermes-code] stream: acquire_stream=%s for %s in %.1fs", _stream_acquired, prov, _stream_acquire_time)
+                            logger.info("[hermes-code][req=%s] stream: acquire_stream=%s for %s in %.1fs", _req_id, _stream_acquired, prov, _stream_acquire_time)
                             if _stream_acquired:
                                 _acquired_stream = True
                             else:
@@ -6453,7 +6459,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             logger.warning("[hermes-code] stream: acquire_stream exception for %s: %s", prov, _stream_exc)
                         if not _skip_normal_call:
                             _call_start = _time.time()
-                            logger.info("[hermes-code] stream: calling call_llm for %s timeout=30s", prov)
+                            logger.info("[hermes-code][req=%s] stream: calling call_llm for %s timeout=30s", _req_id, prov)
                             try:
                                 response_obj = await _s_loop.run_in_executor(
                                     None,
@@ -6471,11 +6477,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 )
                                 _call_duration = _time.time() - _call_start
                                 _total_duration = _time.time() - _stream_start
-                                logger.info("[hermes-code] stream: SUCCESS %s in %.1fs (total=%.1fs)", prov, _call_duration, _total_duration)
+                                logger.info("[hermes-code][req=%s] stream: SUCCESS %s in %.1fs (total=%.1fs)", _req_id, prov, _call_duration, _total_duration)
                             except Exception as _call_exc:
                                 _call_duration = _time.time() - _call_start
                                 _total_duration = _time.time() - _stream_start
-                                logger.warning("[hermes-code] stream: FAILED %s after %.1fs (total=%.1fs): %s", prov, _call_duration, _total_duration, _call_exc)
+                                logger.warning("[hermes-code][req=%s] stream: FAILED %s after %.1fs (total=%.1fs): %s", _req_id, prov, _call_duration, _total_duration, _call_exc)
                                 # Store latency on exception so outer handler can penalise slow providers
                                 _call_exc._hermes_latency_ms = _call_duration * 1000
                                 raise _call_exc
@@ -6591,7 +6597,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             for tc in tool_calls_out if isinstance(tc, dict)
                         ]
                         logger.warning(
-                            "[hermes-code] response: model=%s finish=%s tool_calls=%d args=%s content_len=%d",
+                            "[hermes-code][req=%s] response: model=%s finish=%s tool_calls=%d args=%s content_len=%d",
+                            _req_id,
                             provider_model,
                             finish_reason,
                             len(tool_calls_out),
@@ -6894,7 +6901,8 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[%d] streaming passthrough exhausted all providers, trying non-streaming", _req_id)
             # Non-streaming passthrough
             _pt_call_count[0] = 0  # reset counter for non-streaming loop
-            logger.warning("[hermes-code] NS-ENTRY tools=%d tool_names=%s",
+            logger.warning("[hermes-code][req=%s] NS-ENTRY tools=%d tool_names=%s",
+                _req_id,
                 len(passthrough_tools) if passthrough_tools else 0,
                 [t.get("function", {}).get("name", "?") for t in (passthrough_tools or [])[:5]],
             )
