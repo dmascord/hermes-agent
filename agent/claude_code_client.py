@@ -125,10 +125,14 @@ def _format_messages_as_ndjson(
             continue
         role = str(message.get("role") or "unknown").strip().lower()
         content = message.get("content")
-        if content is None or content == "":
+        # Tool-call messages (assistant with tool_calls) must NOT be skipped even
+        # if they have no text content — the tool result that follows needs the
+        # assistant message in the history for the model to understand context.
+        _has_tool_calls = isinstance(message.get("tool_calls"), list) and message.get("tool_calls")
+        if (content is None or content == "") and not _has_tool_calls:
             continue
         if role == "system":
-            system_parts.append(str(content))
+            system_parts.append(str(content or ""))
             continue
         if role == "tool":
             history_parts.append(f"[Tool result]\n{content}")
@@ -136,12 +140,12 @@ def _format_messages_as_ndjson(
         if role == "user":
             # Promote the last user message into the live user turn; keep
             # earlier ones in the history so the model sees full context.
-            user_parts = [{"type": "text", "text": str(content)}]
+            user_parts = [{"type": "text", "text": str(content or "")}]
             continue
         if role == "assistant":
-            history_parts.append(f"[Assistant]\n{content}")
+            history_parts.append(f"[Assistant]\n{content or ''}")
             continue
-        history_parts.append(f"[{role.title()}]\n{content}")
+        history_parts.append(f"[{role.title()}]\n{content or ''}")
 
     if system_parts or history_parts:
         prefix = []
@@ -186,6 +190,15 @@ def _parse_stream_json_output(output: str) -> dict[str, Any]:
         if not isinstance(obj, dict):
             continue
         typ = obj.get("type")
+        if typ == "error":
+            # CLI returned an explicit error — surface it so the caller
+            # gets a meaningful exception instead of a silent empty result.
+            err_msg = obj.get("error", {}) or {}
+            if isinstance(err_msg, dict):
+                err_text = err_msg.get("message") or err_msg.get("type") or str(obj)
+            else:
+                err_text = str(err_msg)
+            raise RuntimeError(f"Claude Code CLI error: {err_text}")
         if typ == "assistant":
             msg = obj.get("message", {})
             if isinstance(msg, dict):
@@ -472,10 +485,14 @@ class ClaudeCodeClient:
             err_thread.join(timeout=1)
 
             stderr_text = "".join(error_lines)
-            if proc.returncode != 0 and stderr_text:
-                # Non-zero exit with stderr - check for errors
-                if "error" in stderr_text.lower():
-                    raise RuntimeError(f"Claude Code failed: {stderr_text}")
+            if proc.returncode != 0:
+                # Non-zero exit — always treat as failure, even if stderr is
+                # empty (could be a crash or无声 error). Surface the stderr
+                # if available, otherwise use a generic message.
+                if stderr_text:
+                    raise RuntimeError(f"Claude Code failed (exit {proc.returncode}): {stderr_text}")
+                else:
+                    raise RuntimeError(f"Claude Code CLI exited with code {proc.returncode} (no stderr)")
 
             return "".join(output_lines)
 

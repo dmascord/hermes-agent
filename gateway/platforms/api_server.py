@@ -7187,7 +7187,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         continue
 
                 _err_msg = str(passthrough_error) if passthrough_error else "all passthrough providers failed"
-                logger.warning("[hermes-code] passthrough stream exhausted providers: %s", _err_msg)
+                if not _err_msg:
+                    _err_msg = f"all providers failed ({type(passthrough_error).__name__})"
+                    logger.warning(
+                        "[hermes-code] passthrough stream exhausted: last error type=%s has empty message, "
+                        "indicates silent provider failure — check provider logs above",
+                        type(passthrough_error).__name__,
+                    )
+                else:
+                    logger.warning("[hermes-code] passthrough stream exhausted providers: %s", _err_msg)
                 return web.json_response(
                     _openai_error(
                         f"hermes-code passthrough exhausted all configured providers: {_err_msg}",
@@ -7964,7 +7972,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         status=413,
                     )
-                logger.warning("[api_server] hermes-code passthrough exhausted providers: %s", _err_msg)
+                if not _err_msg:
+                    _err_msg = f"all providers failed ({type(passthrough_error).__name__})"
+                    logger.warning(
+                        "[api_server] hermes-code passthrough exhausted: last error type=%s has empty message, "
+                        "indicates silent provider failure — check provider logs above",
+                        type(passthrough_error).__name__,
+                    )
+                else:
+                    logger.warning("[api_server] hermes-code passthrough exhausted providers: %s", _err_msg)
                 return web.json_response(
                     _openai_error(
                         f"hermes-code passthrough exhausted all configured providers: {_err_msg}",
