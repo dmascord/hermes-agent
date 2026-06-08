@@ -3467,6 +3467,12 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
             runtime_kwargs["base_url"] = base_url
             runtime_kwargs["api_key"] = os.getenv("XIAOMI_API_KEY", "")
             runtime_kwargs["provider"] = "xiaomi"
+        elif provider_prefix == "nous":
+            # Nous API — routes nous/* models (e.g. nvidia/nemotron-3-ultra:free)
+            # to the Nous inference endpoint, not OpenRouter.
+            runtime_kwargs["base_url"] = os.getenv("NOUS_BASE_URL", "https://inference-api.nousresearch.com/v1")
+            runtime_kwargs["api_key"] = os.getenv("NOUS_API_KEY", "")
+            runtime_kwargs["provider"] = "nous"
         elif provider_prefix == "qwen":
             runtime_kwargs["base_url"] = os.getenv("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/zen/v1")
             runtime_kwargs["api_key"] = os.getenv("OPENCODE_ZEN_API_KEY", "")
