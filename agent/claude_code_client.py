@@ -282,29 +282,20 @@ class ClaudeCodeClient:
         # Build NDJSON payload for --input-format stream-json
         ndjson_payload = _format_messages_as_ndjson(messages or [], model=model)
 
-        # Build command args.  We use NDJSON streaming input rather than
-        # a positional prompt, and rely on stream-json for the output.
-        # Don't include the prompt as a positional arg.
-        cmd_args = [self._claude_command] + list(self._claude_args)
-
-        # Add --input-format stream-json (required for stdin NDJSON)
-        if not any(a == "--input-format" or a.startswith("--input-format=") for a in cmd_args):
-            cmd_args.extend(["--input-format", "stream-json"])
-
-        # Add --output-format stream-json
-        if not any(a == "--output-format" or a.startswith("--output-format=") for a in cmd_args):
-            cmd_args.extend(["--output-format", "stream-json"])
-
-        # --verbose is required when using --output-format=stream-json
-        if not any(a == "--verbose" for a in cmd_args):
-            cmd_args.append("--verbose")
-
-        # Add model flag
-        if not any(a == "--model" or a.startswith("--model=") for a in cmd_args):
-            cmd_args.extend(["--model", model_flag])
+        # Build command args in the exact order verified to work manually:
+        #   claude -p --input-format stream-json --output-format stream-json
+        #          --verbose --model sonnet
+        cmd_args = [
+            self._claude_command,
+            "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", model_flag,
+        ]
 
         # Add max turns if tools are provided
-        if tools and not any(a == "--max-turns" or a.startswith("--max-turns=") for a in cmd_args):
+        if tools:
             cmd_args.extend(["--max-turns", "10"])
 
         # Add allowed tools if tools are provided
@@ -315,7 +306,7 @@ class ClaudeCodeClient:
                     fn = t.get("function", {})
                     if isinstance(fn, dict) and fn.get("name"):
                         tool_names.append(fn["name"])
-            if tool_names and not any(a == "--allowedTools" or a.startswith("--allowedTools=") for a in cmd_args):
+            if tool_names:
                 cmd_args.extend(["--allowedTools", ",".join(tool_names)])
 
         # Timeout handling
