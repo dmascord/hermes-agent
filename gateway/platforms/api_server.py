@@ -5647,24 +5647,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     if fb and fb not in _passthrough_models:
                         _passthrough_models.append(fb)
             # ── Quality-based reordering ─────────────────────────────────────────
-            # Sort ALL models in the chain by live quality score (best first).
-            # This replaces round-robin ordering with quality-proved ordering —
-            # fast/reliable providers rise to the top, slow/failing ones sink.
+            # Sort the REST of the chain by live quality score (best first).
+            # Pin position 0 (user's requested model or HERMES_CODE_MODEL) so the
+            # explicit request is always honoured first.
             if len(_passthrough_models) > 1:
                 try:
                     from agent.model_quality_db import get_quality_score
-                    # Sort entire chain by quality score descending (best first)
-                    _passthrough_models.sort(
+                    _pinned = _passthrough_models[0]  # user's request or HERMES_CODE_MODEL
+                    _rest = _passthrough_models[1:]
+                    _rest.sort(
                         key=lambda m: get_quality_score(
                             m.split("/", 1)[0] if "/" in m else "",
                             m.split("/", 1)[1] if "/" in m else m,
                         ),
                         reverse=True,
                     )
+                    _passthrough_models = [_pinned] + _rest
                     logger.info(
-                        "[hermes-code][req=%s] quality-sorted chain: top5=%s",
+                        "[hermes-code][req=%s] quality-sorted chain: pinned=%s rest_top5=%s",
                         _req_id,
-                        [f"{m.split('/',1)[-1] if '/' in m else m}:{get_quality_score(m.split('/',1)[0], m.split('/',1)[1] if '/' in m else m):.0f}" for m in _passthrough_models[:5]],
+                        _pinned,
+                        [f"{m.split('/',1)[-1] if '/' in m else m}:{get_quality_score(m.split('/',1)[0], m.split('/',1)[1] if '/' in m else m):.0f}" for m in _passthrough_models[1:6]],
                     )
                 except Exception:
                     pass
