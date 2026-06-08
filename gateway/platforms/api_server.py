@@ -6517,6 +6517,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         # Initialize tool_call_id mapper (always needed — referenced after dispatch)
                         _mapper = None
                         _raw_tool_calls = None
+                        # Initialize _skip_normal_call so it's always defined regardless
+                        # of which provider branch is taken (copilot/claude/gemini/else).
+                        _skip_normal_call = False
                         if _needs_audio and prov == "google":
                             def _gemini_audio_call():
                                 from agent.gemini_native_adapter import GeminiNativeClient
