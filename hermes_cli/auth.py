@@ -5876,25 +5876,54 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
-        raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
-            provider=provider_id,
-            code="missing_copilot_cli",
+    # Provider-specific command resolution
+    if provider_id == "copilot-acp":
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
         )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        api_key = "copilot-acp"
+        check_scheme = "acp+tcp://"
+    elif provider_id == "claude-code":
+        command = (
+            os.getenv("HERMES_CLAUDE_CODE_COMMAND", "").strip()
+            or os.getenv("CLAUDE_CODE_CLI_PATH", "").strip()
+            or "claude"
+        )
+        raw_args = os.getenv("HERMES_CLAUDE_CODE_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "json"]
+        api_key = "claude-code"
+        check_scheme = "claude://"
+    else:
+        raise AuthError(
+            f"External process provider '{provider_id}' not supported.",
+            provider=provider_id,
+            code="unsupported_provider",
+        )
+
+    resolved_command = shutil.which(command) if command else None
+    if not resolved_command and not base_url.startswith(check_scheme):
+        if provider_id == "copilot-acp":
+            raise AuthError(
+                f"Could not find the Copilot CLI command '{command}'. "
+                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+                provider=provider_id,
+                code="missing_copilot_cli",
+            )
+        elif provider_id == "claude-code":
+            raise AuthError(
+                f"Could not find the Claude Code command '{command}'. "
+                "Install Claude Code CLI: npm install -g @anthropic-ai/claude-code",
+                provider=provider_id,
+                code="missing_claude_code_cli",
+            )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
