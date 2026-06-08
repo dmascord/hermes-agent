@@ -3370,6 +3370,23 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
             runtime_kwargs["base_url"] = os.getenv("COHERE_BASE_URL", "https://api.cohere.com/compatibility/v1").rstrip("/")
             runtime_kwargs["api_key"] = os.getenv("COHERE_API_KEY", "").strip()
             runtime_kwargs["provider"] = "cohere"
+        elif provider_prefix == "openai-codex":
+            # Explicit handler for openai-codex models — prevents them falling
+            # through to the OpenRouter last-resort handler below, which would
+            # cause FORCE_FREE_OPENROUTER to block them incorrectly.
+            try:
+                from agent.credential_pool import load_pool
+                _pool = load_pool("openai-codex")
+                _entry = _pool.peek()
+                _codex_api_key = getattr(_entry, "runtime_api_key", "") if _entry else ""
+                if _codex_api_key:
+                    runtime_kwargs["base_url"] = getattr(_entry, "runtime_base_url", None) or getattr(_entry, "base_url", "") or os.getenv("OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex")
+                    runtime_kwargs["api_key"] = _codex_api_key
+                    runtime_kwargs["provider"] = "openai-codex"
+                    runtime_kwargs["api_mode"] = "codex_responses"
+                    runtime_kwargs["credential_pool"] = _pool
+            except Exception:
+                pass
         elif provider_prefix == "cerebras":
             runtime_kwargs["base_url"] = os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1").rstrip("/")
             runtime_kwargs["api_key"] = os.getenv("CEREBRAS_API_KEY", "").strip()
