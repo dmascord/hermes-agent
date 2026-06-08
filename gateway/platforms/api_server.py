@@ -5867,26 +5867,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     # ── Tool set selection (quality-aware) ──
                     # Models with a high text-only rate (> 30%) get reduced essential tools
-                    # (7 of 24) because they produce text instead of tool_calls with full tools.
-                    # Models with low text-only rate (≤ 30%) get the full client tool set.
-                    # Unknown models (< 3 calls) get the full set — we have no data to decide.
-                    if passthrough_tools and _fallback_tools is not passthrough_tools:
+                    # because they frequently answer in plain text instead of emitting tool_calls.
+                    # Models with low/unknown text-only rate get the full client tool set.
+                    if passthrough_tools and _passthrough_tools_full:
                         from agent.model_quality_db import get_text_only_rate
                         _f_prov = provider_model.split("/")[0] if "/" in provider_model else ""
                         _f_rate = get_text_only_rate(_f_prov, provider_model)
                         if _f_rate > 0.30:
-                            passthrough_tools = _fallback_tools
-                            logger.warning(
-                                "[hermes-code] %s: text-only rate %.0f%% → reduced to %d essential tools",
-                                provider_model, _f_rate * 100, len(_fallback_tools),
-                            )
-                        elif passthrough_tools is _fallback_tools:
-                            # Previous model swapped to fallback — restore full tools
-                            passthrough_tools = _passthrough_tools_full
-                            logger.debug(
-                                "[hermes-code] %s: text-only rate %.0f%% → restored full %d tools",
-                                provider_model, _f_rate * 100, len(passthrough_tools),
-                            )
+                            if passthrough_tools is not _fallback_tools:
+                                passthrough_tools = _fallback_tools
+                                logger.warning(
+                                    "[hermes-code] %s: text-only rate %.0f%% → reduced to %d essential tools",
+                                    provider_model, _f_rate * 100, len(_fallback_tools),
+                                )
+                        else:
+                            if passthrough_tools is not _passthrough_tools_full:
+                                passthrough_tools = _passthrough_tools_full
+                                logger.debug(
+                                    "[hermes-code] %s: text-only rate %.0f%% → restored full %d tools",
+                                    provider_model, _f_rate * 100, len(passthrough_tools),
+                                )
 
                     # Check cooldown before attempting this provider
                     _prov_prefix = provider_model.split("/")[0] if "/" in provider_model else ""
