@@ -7459,6 +7459,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                 )
                             response_obj = await _ns_loop.run_in_executor(None, _claude_code_call_ns)
                             logger.info("[hermes-code][req=%s] claude-code-cli ns subprocess returned: %s", _req_id, type(response_obj).__name__)
+                            try:
+                                from agent.model_cooldown_db import mark_provider_success
+                                mark_provider_success(prov, resolved_model, base_url=base_url or "")
+                            except Exception:
+                                pass
+                            try:
+                                from agent.model_quality_db import record_success
+                                record_success(prov, provider_model, base_url=base_url or "", latency_ms=0)
+                            except Exception:
+                                pass
                         else:
                             continue
                     else:
