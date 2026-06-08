@@ -1550,20 +1550,6 @@ def _extract_openai_tool_calls(raw_tool_calls: Any) -> List[Dict[str, Any]]:
         _ec = tc.get("extra_content")
         if _ec:
             item["extra_content"] = _ec
-        # ── Google thought_signature: pack into call_id for round-trip ─────
-        # Standard OpenAI clients strip non-standard fields like extra_content
-        # when re-sending conversation history. To survive the round-trip, pack
-        # the thought_signature into a custom suffix on the call_id that we
-        # can detect and unpack on the next request. The visible part of the
-        # id stays the same (e.g. "abc123") plus a sentinel + base64 sig.
-        _google_ec = (_ec or {}).get("google") if isinstance(_ec, dict) else None
-        _ts = _google_ec.get("thought_signature") if isinstance(_google_ec, dict) else None
-        if _ts and isinstance(call_id, str) and call_id.strip() and ":hermes_ts:" not in call_id:
-            import base64
-            _packed = base64.urlsafe_b64encode(_ts.encode("utf-8")).decode("ascii").rstrip("=")
-            _packed_id = f"{call_id.strip()}:hermes_ts:{_packed}"
-            item["id"] = _packed_id
-            item["call_id"] = _packed_id
         normalized.append(item)
     return normalized
 
@@ -6229,6 +6215,20 @@ class APIServerAdapter(BasePlatformAdapter):
                                     _ec = getattr(tc, "extra_content", None) or (tc.get("extra_content") if isinstance(tc, dict) else None)
                                     if _ec:
                                         _tc_dict["extra_content"] = _ec
+                                    # ── Google thought_signature: pack into call_id ────────
+                                    # Standard OpenAI clients strip non-standard fields like
+                                    # extra_content when re-sending history. Pack the signature
+                                    # into the tool_call id as `<orig>:hermes_ts:<b64>` so it
+                                    # survives the round-trip. The injection code unpacks it
+                                    # back into extra_content on the next request.
+                                    _google_ec = (_ec or {}).get("google") if isinstance(_ec, dict) else None
+                                    _ts = _google_ec.get("thought_signature") if isinstance(_google_ec, dict) else None
+                                    if _ts and isinstance(_tc_dict.get("id"), str) and ":hermes_ts:" not in _tc_dict["id"]:
+                                        import base64
+                                        _packed = base64.urlsafe_b64encode(_ts.encode("utf-8")).decode("ascii").rstrip("=")
+                                        _packed_id = f"{_tc_dict['id']}:hermes_ts:{_packed}"
+                                        _tc_dict["id"] = _packed_id
+                                        _tc_dict["call_id"] = _packed_id
                                     tool_calls_out.append(_tc_dict)
                                 tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
                                 usage_obj = getattr(response_obj, "usage", None)
