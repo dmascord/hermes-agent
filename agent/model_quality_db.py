@@ -172,6 +172,8 @@ def record_success(
 ) -> None:
     """Record a successful API call."""
     key = _make_key(provider, model, base_url)
+    # Strip provider prefix for model column storage (e.g. "minimax/MiniMax-M2.7" → "MiniMax-M2.7")
+    stored_model = model.split("/", 1)[1] if "/" in model else model
     now = time.time()
     with _LOCK:
         conn = _get_conn()
@@ -199,7 +201,7 @@ def record_success(
                    (key, provider, model, base_url, total_calls, success_calls,
                     avg_latency_ms, quality_score, last_success_at, updated_at)
                    VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?, ?)""",
-                (key, provider, model, base_url, latency_ms, score, now, now),
+                (key, provider, stored_model, base_url, latency_ms, score, now, now),
             )
         # Record event
         conn.execute(
@@ -221,6 +223,8 @@ def record_failure(
 ) -> None:
     """Record a failed API call."""
     key = _make_key(provider, model, base_url)
+    # Strip provider prefix for model column storage (e.g. "minimax/MiniMax-M2.7" → "MiniMax-M2.7")
+    stored_model = model.split("/", 1)[1] if "/" in model else model
     now = time.time()
     with _LOCK:
         conn = _get_conn()
@@ -248,7 +252,7 @@ def record_failure(
                    (key, provider, model, base_url, total_calls, failure_calls,
                     avg_latency_ms, quality_score, last_failure_at, updated_at)
                    VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?, ?)""",
-                (key, provider, model, base_url, latency_ms, score, now, now),
+                (key, provider, stored_model, base_url, latency_ms, score, now, now),
             )
         conn.execute(
             "INSERT INTO model_events (provider, model, event_type, latency_ms, error_code, error_message, created_at) VALUES (?, ?, 'failure', ?, ?, ?, ?)",
@@ -271,6 +275,8 @@ def record_text_only(
     so it counts as success for API reliability but failure for tool support.
     """
     key = _make_key(provider, model, base_url)
+    # Strip provider prefix for model column storage
+    stored_model = model.split("/", 1)[1] if "/" in model else model
     now = time.time()
     with _LOCK:
         conn = _get_conn()
@@ -298,7 +304,7 @@ def record_text_only(
                    (key, provider, model, base_url, total_calls, success_calls, text_only_calls,
                     avg_latency_ms, quality_score, last_success_at, updated_at)
                    VALUES (?, ?, ?, ?, 1, 1, 1, ?, ?, ?, ?)""",
-                (key, provider, model, base_url, latency_ms, score, now, now),
+                (key, provider, stored_model, base_url, latency_ms, score, now, now),
             )
         conn.execute(
             "INSERT INTO model_events (provider, model, event_type, latency_ms, created_at) VALUES (?, ?, 'text_only', ?, ?)",
