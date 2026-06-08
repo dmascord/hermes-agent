@@ -44,9 +44,11 @@ def _resolve_command() -> str:
 
 
 def _resolve_args() -> list[str]:
+    """Default CLI args. Override via HERMES_CLAUDE_CODE_ARGS env var."""
     raw = os.getenv("HERMES_CLAUDE_CODE_ARGS", "").strip()
     if not raw:
-        return ["-p", "--output-format", "json", "--no-stream"]
+        # Use stream-json for structured API-like output
+        return ["-p", "--output-format", "stream-json"]
     return shlex.split(raw)
 
 
@@ -134,20 +136,40 @@ def _format_messages_as_prompt(
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
-def _parse_json_output(output: str) -> tuple[str, str]:
-    """Parse JSON output from Claude Code print mode."""
-    try:
-        data = json.loads(output)
-        if isinstance(data, dict):
-            # Success response
-            result = data.get("result", "")
-            reason = data.get("reasoning", "") or data.get("reason", "")
-            return str(result) if result else "", str(reason) if reason else ""
-    except json.JSONDecodeError:
-        pass
+def _parse_stream_json_output(output: str) -> dict[str, Any]:
+    """Parse Claude Code stream-json output.
 
-    # Not JSON - return as-is
-    return output.strip(), ""
+    The CLI emits newline-delimited JSON objects. We care about the final
+    `result` object, which contains the text result and usage information.
+    """
+    final: dict[str, Any] = {}
+    assistant_text = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        typ = obj.get("type")
+        if typ == "assistant":
+            msg = obj.get("message", {})
+            if isinstance(msg, dict):
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text = str(part.get("text", ""))
+                            if text:
+                                assistant_text.append(text)
+        elif typ == "result":
+            final = obj
+    if assistant_text and "assistant_text" not in final:
+        final["assistant_text"] = "".join(assistant_text)
+    return final
 
 
 class _ClaudeCodeChatCompletions:
@@ -260,14 +282,16 @@ class ClaudeCodeClient:
             timeout_seconds=effective_timeout,
         )
 
-        result_text, reasoning_text = _parse_json_output(response_text)
+        parsed = _parse_stream_json_output(response_text)
+        result_text = str(parsed.get("result") or parsed.get("assistant_text") or "")
+        reasoning_text = str(parsed.get("reasoning") or "")
 
-        # Extract tool calls if any (Claude Code uses JSON in result)
+        # Extract tool calls if any (Claude Code uses JSON in stream output)
         tool_calls = []
         try:
-            # Try to parse tool calls from the result
+            # If the final result text contains embedded tool_call JSON snippets,
+            # preserve them for the gateway's tool-call handling.
             if "tool_call" in result_text.lower() or "<tool_call>" in result_text:
-                # Extract JSON tool calls
                 tool_call_re = re.compile(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', re.DOTALL)
                 for m in tool_call_re.finditer(result_text):
                     try:
@@ -289,10 +313,11 @@ class ClaudeCodeClient:
         except Exception:
             pass
 
+        usage_obj = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
         usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
+            prompt_tokens=int(usage_obj.get("input_tokens", 0) or 0),
+            completion_tokens=int(usage_obj.get("output_tokens", 0) or 0),
+            total_tokens=int((usage_obj.get("input_tokens", 0) or 0) + (usage_obj.get("output_tokens", 0) or 0)),
         )
 
         assistant_message = SimpleNamespace(
@@ -307,7 +332,7 @@ class ClaudeCodeClient:
         return SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "claude-code",
+            model=(parsed.get("model") if isinstance(parsed, dict) and parsed.get("model") else model or "claude-code"),
         )
 
     def _run_prompt(
