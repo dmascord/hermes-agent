@@ -56,7 +56,17 @@ def _resolve_args() -> list[str]:
 
 
 def _resolve_home_dir() -> str:
-    """Return a stable HOME for child Claude Code processes."""
+    """Return a stable HOME for child Claude Code processes.
+
+    Claude Code's OAuth credentials are currently restored into `/root/.claude`
+    by the container entrypoint. If those credentials exist, prefer `/root` so
+    the subprocess can see them. Otherwise fall back to Hermes' per-profile
+    subprocess HOME.
+    """
+    # If entrypoint restored Claude credentials into /root, prefer that.
+    if os.path.exists('/root/.claude/.credentials.json'):
+        return '/root'
+
     try:
         from hermes_constants import get_subprocess_home
 
