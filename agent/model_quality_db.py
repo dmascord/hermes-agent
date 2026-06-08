@@ -311,14 +311,29 @@ def record_text_only(
 # ── Querying ───────────────────────────────────────────────────────────
 
 def get_quality_score(provider: str, model: str, base_url: str = "") -> float:
-    """Return the quality score (0-100) for a model, or 50.0 if unknown."""
-    key = _make_key(provider, model, base_url)
+    """Return the quality score (0-100) for a model, or 50.0 if unknown.
+
+    When base_url is empty, returns the best (max) score across all base_urls
+    for this provider/model — so chain sorting uses the highest quality any
+    endpoint has achieved, not a blank-entry score of 100.
+    """
     with _LOCK:
         conn = _get_conn()
-        row = conn.execute(
-            "SELECT quality_score FROM model_metrics WHERE key=?", (key,)
-        ).fetchone()
-        return row["quality_score"] if row else 50.0
+        if base_url:
+            key = _make_key(provider, model, base_url)
+            row = conn.execute(
+                "SELECT quality_score FROM model_metrics WHERE key=?", (key,)
+            ).fetchone()
+            return row["quality_score"] if row else 50.0
+        # No base_url — find the best score across all endpoints for this model
+        # Strip provider prefix if model already includes it
+        if "/" in model:
+            model = model.split("/", 1)[1]
+        rows = conn.execute(
+            "SELECT quality_score FROM model_metrics WHERE provider=? AND model=? ORDER BY quality_score DESC",
+            (provider, model),
+        ).fetchall()
+        return rows[0]["quality_score"] if rows else 50.0
 
 def get_text_only_rate(provider: str, model: str, base_url: str = "") -> float:
     """Return the text-only rate (0.0-1.0) for a model, or 0.0 if unknown.
