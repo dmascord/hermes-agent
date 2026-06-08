@@ -5657,7 +5657,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         reverse=True,
                     )
-                    logger.debug(
+                    logger.info(
                         "[hermes-code] quality-sorted chain: top5=%s",
                         [f"{m.split('/',1)[-1] if '/' in m else m}:{get_quality_score(m.split('/',1)[0], m.split('/',1)[1] if '/' in m else m):.0f}" for m in _passthrough_models[:5]],
                     )
@@ -6323,6 +6323,17 @@ class APIServerAdapter(BasePlatformAdapter):
                                     logger.debug("[hermes-code] arliai: sanitized tool_call_ids in %d messages", len(_msgs_to_send))
                                 except Exception as _map_exc:
                                     logger.warning("[hermes-code] arliai: failed to init tool_id mapper: %s", _map_exc)
+
+                            # ── cerebras call_id stripping ───────────────────────────
+                            # cerebras does not support the `call_id` field in tool_calls.
+                            # Strip it from all assistant tool_call messages before sending.
+                            if prov == "cerebras":
+                                for _msg in _msgs_to_send:
+                                    if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
+                                        for _tc in _msg.get("tool_calls", []):
+                                            if isinstance(_tc, dict):
+                                                _tc.pop("call_id", None)
+                                logger.debug("[hermes-code] cerebras: stripped call_id from %d tool_calls", sum(len(m.get("tool_calls", [])) for m in _msgs_to_send if m.get("role") == "assistant"))
 
                             logger.debug(
                                 "[hermes-code] streaming call_llm: model=%s provider=%s has_rc=%s echo=%s msgs=%d",
