@@ -1550,6 +1550,20 @@ def _extract_openai_tool_calls(raw_tool_calls: Any) -> List[Dict[str, Any]]:
         _ec = tc.get("extra_content")
         if _ec:
             item["extra_content"] = _ec
+        # ── Google thought_signature: pack into call_id for round-trip ─────
+        # Standard OpenAI clients strip non-standard fields like extra_content
+        # when re-sending conversation history. To survive the round-trip, pack
+        # the thought_signature into a custom suffix on the call_id that we
+        # can detect and unpack on the next request. The visible part of the
+        # id stays the same (e.g. "abc123") plus a sentinel + base64 sig.
+        _google_ec = (_ec or {}).get("google") if isinstance(_ec, dict) else None
+        _ts = _google_ec.get("thought_signature") if isinstance(_google_ec, dict) else None
+        if _ts and isinstance(call_id, str) and call_id.strip() and ":hermes_ts:" not in call_id:
+            import base64
+            _packed = base64.urlsafe_b64encode(_ts.encode("utf-8")).decode("ascii").rstrip("=")
+            _packed_id = f"{call_id.strip()}:hermes_ts:{_packed}"
+            item["id"] = _packed_id
+            item["call_id"] = _packed_id
         normalized.append(item)
     return normalized
 
@@ -6608,10 +6622,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             # 3.1+ returns 400. The API returns thought_signature in:
                             #   extra_content.google.thought_signature
                             # We must preserve this and pass it back in subsequent turns.
-                            # The OpenAI-compatible endpoint accepts extra_content, so we
-                            # inject it at the top level of each tool_call dict.
+                            #
+                            # Round-trip strategy: the client may strip non-standard fields
+                            # like extra_content when re-sending. To survive, we pack the
+                            # signature into the tool_call id as `<orig_id>:hermes_ts:<b64>`
+                            # when responding, and unpack it back into extra_content here
+                            # when the client sends it back.
                             if "generativelanguage.googleapis.com" in (base_url or ""):
+                                import base64
                                 _injected = 0
+                                _unpacked = 0
                                 for _msg in _msgs_to_send:
                                     if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
                                         for _tc in _msg["tool_calls"]:
@@ -6620,11 +6640,33 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 _ec = _tc.get("extra_content", {})
                                                 _google = _ec.get("google", {}) if isinstance(_ec, dict) else {}
                                                 _ts = _google.get("thought_signature") if isinstance(_google, dict) else None
+                                                if not _ts:
+                                                    # Unpack from packed call_id: "<id>:hermes_ts:<b64>"
+                                                    _tc_id = _tc.get("id") or _tc.get("call_id") or ""
+                                                    if isinstance(_tc_id, str) and ":hermes_ts:" in _tc_id:
+                                                        _parts = _tc_id.split(":hermes_ts:", 1)
+                                                        if len(_parts) == 2:
+                                                            try:
+                                                                _b64 = _parts[1]
+                                                                _pad = "=" * (-len(_b64) % 4)
+                                                                _ts = base64.urlsafe_b64decode(_b64 + _pad).decode("utf-8")
+                                                                _unpacked += 1
+                                                                # Restore original id (strip the suffix)
+                                                                _tc["id"] = _parts[0]
+                                                                _tc["call_id"] = _parts[0]
+                                                            except Exception as _b64e:
+                                                                logger.warning(
+                                                                    "[hermes-code] thought_signature unpack failed for %s: %s",
+                                                                    _tc_id[:40], _b64e,
+                                                                )
                                                 if _ts:
                                                     _tc["extra_content"] = {"google": {"thought_signature": _ts}}
                                                     _injected += 1
-                                if _injected:
-                                    logger.warning("[hermes-code] Google thought_signature: injected=%d into %d messages for %s", _injected, len(_msgs_to_send), resolved_model)
+                                if _injected or _unpacked:
+                                    logger.warning(
+                                        "[hermes-code] Google thought_signature: injected=%d unpacked=%d into %d messages for %s",
+                                        _injected, _unpacked, len(_msgs_to_send), resolved_model,
+                                    )
 
                             # ── arliai tool_call_id sanitization ────────────────────
                             # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
