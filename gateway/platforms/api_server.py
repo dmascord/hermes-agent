@@ -7766,16 +7766,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_calls_out = []
                     for tc in tool_calls_raw:
                         if hasattr(tc, "model_dump"):
-                            tool_calls_out.append(tc.model_dump())
+                            _tc_dict = tc.model_dump()
                         elif hasattr(tc, "dict"):
-                            tool_calls_out.append(tc.dict())
+                            _tc_dict = tc.dict()
                         elif isinstance(tc, dict):
-                            tool_calls_out.append(tc)
+                            _tc_dict = tc
                         else:
                             _func = getattr(tc, "function", None)
                             _func_name = str(getattr(_func, "name", getattr(tc, "name", "")))
                             _func_args = str(getattr(_func, "arguments", getattr(tc, "arguments", "{}")))
-                            tool_calls_out.append({"id": str(getattr(tc, "id", "")), "type": "function", "function": {"name": _func_name, "arguments": _func_args}})
+                            _tc_dict = {"id": str(getattr(tc, "id", "")), "type": "function", "function": {"name": _func_name, "arguments": _func_args}}
+                        # Preserve extra_content (contains google.thought_signature for Gemini)
+                        _ec = getattr(tc, "extra_content", None) or (_tc_dict.get("extra_content") if isinstance(_tc_dict, dict) else None)
+                        if _ec and isinstance(_tc_dict, dict):
+                            _tc_dict["extra_content"] = _ec
+                        # ── Google thought_signature: pack into call_id ────────
+                        # Standard OpenAI clients strip non-standard fields like
+                        # extra_content when re-sending history. Pack the signature
+                        # into the tool_call id as `<orig>:hermes_ts:<b64>` so it
+                        # survives the round-trip. The injection code unpacks it
+                        # back into extra_content on the next request.
+                        if isinstance(_tc_dict, dict):
+                            _google_ec = (_ec or {}).get("google") if isinstance(_ec, dict) else None
+                            _ts = _google_ec.get("thought_signature") if isinstance(_google_ec, dict) else None
+                            if _ts and isinstance(_tc_dict.get("id"), str) and ":hermes_ts:" not in _tc_dict["id"]:
+                                import base64
+                                _packed = base64.urlsafe_b64encode(_ts.encode("utf-8")).decode("ascii").rstrip("=")
+                                _packed_id = f"{_tc_dict['id']}:hermes_ts:{_packed}"
+                                _tc_dict["id"] = _packed_id
+                                _tc_dict["call_id"] = _packed_id
+                        tool_calls_out.append(_tc_dict)
                     tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
 
                     # If any provider returned no tool calls (or empty bash commands)
