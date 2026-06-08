@@ -6304,9 +6304,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             # Claude Code CLI — external process provider.
                             # Resolve credentials via the external_process path and
                             # invoke the ClaudeCodeClient which runs `claude -p`.
+                            logger.info("[hermes-code][req=%s] claude-code-cli dispatch: prov=%s base_url=%s", _req_id, prov, base_url)
                             try:
                                 from hermes_cli.auth import resolve_external_process_provider_credentials
                                 _cc_creds = resolve_external_process_provider_credentials("claude-code-cli")
+                                logger.info("[hermes-code][req=%s] claude-code-cli creds: command=%s args=%s", _req_id, _cc_creds.get("command"), _cc_creds.get("args"))
                                 from agent.claude_code_client import ClaudeCodeClient
                                 _cc_client = ClaudeCodeClient(
                                     api_key=_cc_creds.get("api_key", "claude-code-cli"),
@@ -6318,6 +6320,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 logger.warning("[hermes-code][req=%s] claude-code-cli credential resolution failed: %s", _req_id, _cc_exc)
                                 _cc_client = None
                             if _cc_client is not None:
+                                logger.info("[hermes-code][req=%s] claude-code-cli invoking subprocess for model=%s", _req_id, resolved_model)
                                 def _claude_code_call(_c=_cc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
                                     return _c.chat.completions.create(
                                         model=_m,
@@ -6326,8 +6329,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                         timeout=300,
                                     )
                                 response_obj = await _s_loop.run_in_executor(None, _claude_code_call)
+                                logger.info("[hermes-code][req=%s] claude-code-cli subprocess returned: %s", _req_id, type(response_obj).__name__)
                             else:
                                 # Fall through to next provider
+                                logger.warning("[hermes-code][req=%s] claude-code-cli: no client, falling through", _req_id)
                                 continue
                         else:
                             _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
