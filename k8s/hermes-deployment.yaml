@@ -101,7 +101,7 @@ spec:
           operator: Exists
       containers:
         - name: hermes
-          image: 10.0.0.231:5000/hermes-agent:swarm-alpine-20260609132825
+          image: 10.0.0.231:5000/hermes-agent:swarm-alpine-202606091731
           imagePullPolicy: IfNotPresent
           command: ["/sbin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh"]
           args: ["gateway"]
