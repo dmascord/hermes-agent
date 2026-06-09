@@ -4169,6 +4169,122 @@ def _strip_unsupported_content_for_openai(messages: List[Dict[str, Any]]) -> Lis
             # conversation structure is preserved (role ordering matters).
             out.append({**msg, "content": ""})
     return out
+# ---------------------------------------------------------------------------
+# Hermes-internal packed tool_call_id handling
+# ---------------------------------------------------------------------------
+# When Google's Gemini returns a tool_call with a ``thought_signature`` in
+# ``extra_content``, we pack that signature into the tool_call id as
+# ``<orig_id>:hermes_ts:<b64>`` so it survives the round-trip through clients
+# that strip non-standard fields.  These helpers undo the packing — restoring
+# the original id on assistant tool_calls AND the corresponding tool result
+# message — so providers receive clean, un-suffixed ids.
+
+_HERMES_TS_DELIMITER = ":hermes_ts:"
+
+
+def _strip_hermes_ts_packed_ids(messages: List[Dict[str, Any]]) -> int:
+    """Strip ``:hermes_ts:`` packed suffix from all tool_call ids.
+
+    Walks both assistant tool_calls (``id`` / ``call_id``) and tool result
+    messages (``tool_call_id``).  Returns the number of ids repaired.  Safe to
+    run on any provider's input — the suffix is only present when a previous
+    Google turn wrote it.
+    """
+    fixed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg.get("tool_calls", []):
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id") or tc.get("call_id") or ""
+                if isinstance(tc_id, str) and _HERMES_TS_DELIMITER in tc_id:
+                    original = tc_id.split(_HERMES_TS_DELIMITER, 1)[0]
+                    tc["id"] = original
+                    tc["call_id"] = original
+                    fixed += 1
+        elif msg.get("role") == "tool":
+            tcid = msg.get("tool_call_id", "")
+            if isinstance(tcid, str) and _HERMES_TS_DELIMITER in tcid:
+                msg["tool_call_id"] = tcid.split(_HERMES_TS_DELIMITER, 1)[0]
+                fixed += 1
+    return fixed
+
+
+def _unpack_hermes_ts_and_inject_signatures(messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    """Unpack ``:hermes_ts:`` packed ids AND restore Google thought_signature.
+
+    For Google providers only: the packed base64 value encodes the
+    ``thought_signature`` that Gemini 3.1+ requires on functionCall parts.
+    This function strips the packed suffix, restores original ids on BOTH
+    assistant tool_calls and tool result messages, AND injects the
+    extracted signature back into ``extra_content.google.thought_signature``
+    on the assistant tool_calls.
+
+    Returns ``(injected, unpacked)`` counts.
+    """
+    import base64
+    injected = 0
+    unpacked = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg.get("tool_calls", []):
+                if not isinstance(tc, dict):
+                    continue
+                # Check if extra_content.google.thought_signature already exists
+                _ec = tc.get("extra_content", {})
+                _google = _ec.get("google", {}) if isinstance(_ec, dict) else {}
+                _ts = _google.get("thought_signature") if isinstance(_google, dict) else None
+                if not _ts:
+                    # Unpack from packed call_id: "<id>:hermes_ts:<b64>"
+                    tc_id = tc.get("id") or tc.get("call_id") or ""
+                    if isinstance(tc_id, str) and _HERMES_TS_DELIMITER in tc_id:
+                        parts = tc_id.split(_HERMES_TS_DELIMITER, 1)
+                        if len(parts) == 2:
+                            try:
+                                b64 = parts[1]
+                                pad = "=" * (-len(b64) % 4)
+                                _ts = base64.urlsafe_b64decode(b64 + pad).decode("utf-8")
+                                unpacked += 1
+                                tc["id"] = parts[0]
+                                tc["call_id"] = parts[0]
+                            except Exception:
+                                # Can't decode — just strip the suffix
+                                tc["id"] = parts[0]
+                                tc["call_id"] = parts[0]
+                if _ts:
+                    tc["extra_content"] = {"google": {"thought_signature": _ts}}
+                    injected += 1
+        elif msg.get("role") == "tool":
+            tcid = msg.get("tool_call_id", "")
+            if isinstance(tcid, str) and _HERMES_TS_DELIMITER in tcid:
+                msg["tool_call_id"] = tcid.split(_HERMES_TS_DELIMITER, 1)[0]
+    return injected, unpacked
+
+
+def _strip_call_id_from_tool_calls(messages: List[Dict[str, Any]]) -> int:
+    """Remove the ``call_id`` field from assistant tool_calls.
+
+    Several OpenAI-compat providers (cerebras, groq, cohere, etc.) reject
+    unknown fields on tool_calls with 400.  Stripping ``call_id`` before
+    sending to providers that don't support it prevents a class of
+    ``tool_call.id is invalid`` 400 errors.  Returns the number of fields
+    removed.
+    """
+    removed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg.get("tool_calls", []):
+                if isinstance(tc, dict) and "call_id" in tc:
+                    tc.pop("call_id", None)
+                    removed += 1
+    return removed
+
 
 
 def check_api_server_requirements() -> bool:
@@ -6616,58 +6732,25 @@ class APIServerAdapter(BasePlatformAdapter):
                             if _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url):
                                 _msgs_to_send = _synthesize_reasoning_for_tool_calls(_msgs_to_send)
 
-                            # ── Google thought_signature injection ──────────────────
-                            # Google's OpenAI-compatible API requires thoughtSignature on
-                            # functionCall parts in assistant messages. Without it, Gemini
-                            # 3.1+ returns 400. The API returns thought_signature in:
-                            #   extra_content.google.thought_signature
-                            # We must preserve this and pass it back in subsequent turns.
-                            #
-                            # Round-trip strategy: the client may strip non-standard fields
-                            # like extra_content when re-sending. To survive, we pack the
-                            # signature into the tool_call id as `<orig_id>:hermes_ts:<b64>`
-                            # when responding, and unpack it back into extra_content here
-                            # when the client sends it back.
+                            # ── Packed tool_call_id cleanup ────────────────────────
+                            # Hermes packs Google thought_signature into tool_call ids
+                            # as ``<orig_id>:hermes_ts:<b64>`` so it survives the round-trip
+                            # through clients that strip non-standard fields.  These packed
+                            # IDs are garbage to every other provider, so we strip them for
+                            # all providers; for Google specifically, we also extract the
+                            # base64 signature and inject it into extra_content so the
+                            # Gemini API accepts the request.
                             if "generativelanguage.googleapis.com" in (base_url or ""):
-                                import base64
-                                _injected = 0
-                                _unpacked = 0
-                                for _msg in _msgs_to_send:
-                                    if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
-                                        for _tc in _msg["tool_calls"]:
-                                            if isinstance(_tc, dict) and _tc.get("type") == "function":
-                                                # Check if extra_content.google.thought_signature exists
-                                                _ec = _tc.get("extra_content", {})
-                                                _google = _ec.get("google", {}) if isinstance(_ec, dict) else {}
-                                                _ts = _google.get("thought_signature") if isinstance(_google, dict) else None
-                                                if not _ts:
-                                                    # Unpack from packed call_id: "<id>:hermes_ts:<b64>"
-                                                    _tc_id = _tc.get("id") or _tc.get("call_id") or ""
-                                                    if isinstance(_tc_id, str) and ":hermes_ts:" in _tc_id:
-                                                        _parts = _tc_id.split(":hermes_ts:", 1)
-                                                        if len(_parts) == 2:
-                                                            try:
-                                                                _b64 = _parts[1]
-                                                                _pad = "=" * (-len(_b64) % 4)
-                                                                _ts = base64.urlsafe_b64decode(_b64 + _pad).decode("utf-8")
-                                                                _unpacked += 1
-                                                                # Restore original id (strip the suffix)
-                                                                _tc["id"] = _parts[0]
-                                                                _tc["call_id"] = _parts[0]
-                                                            except Exception as _b64e:
-                                                                logger.warning(
-                                                                    "[hermes-code] thought_signature unpack failed for %s: %s",
-                                                                    _tc_id[:40], _b64e,
-                                                                )
-                                                if _ts:
-                                                    _tc["extra_content"] = {"google": {"thought_signature": _ts}}
-                                                    _injected += 1
+                                _injected, _unpacked = _unpack_hermes_ts_and_inject_signatures(_msgs_to_send)
                                 if _injected or _unpacked:
                                     logger.warning(
                                         "[hermes-code] Google thought_signature: injected=%d unpacked=%d into %d messages for %s",
                                         _injected, _unpacked, len(_msgs_to_send), resolved_model,
                                     )
-
+                            else:
+                                _ts_fixed = _strip_hermes_ts_packed_ids(_msgs_to_send)
+                                if _ts_fixed:
+                                    logger.debug("[hermes-code] stripped %d hermes_ts packed ids for %s", _ts_fixed, provider_model)
                             # ── arliai tool_call_id sanitization ────────────────────
                             # arliai enforces ≤9-char tool_call_ids. Use a bidirectional
                             # mapper so the client sees the original IDs while upstream
@@ -6685,12 +6768,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             # cerebras does not support the `call_id` field in tool_calls.
                             # Strip it from all assistant tool_call messages before sending.
                             if prov == "cerebras":
-                                for _msg in _msgs_to_send:
-                                    if _msg.get("role") == "assistant" and _msg.get("tool_calls"):
-                                        for _tc in _msg.get("tool_calls", []):
-                                            if isinstance(_tc, dict):
-                                                _tc.pop("call_id", None)
-                                logger.debug("[hermes-code] cerebras: stripped call_id from %d tool_calls", sum(len(m.get("tool_calls", [])) for m in _msgs_to_send if m.get("role") == "assistant"))
+                                _cc_removed = _strip_call_id_from_tool_calls(_msgs_to_send)
+                                if _cc_removed:
+                                    logger.debug("[hermes-code] cerebras: stripped call_id from %d tool_calls", _cc_removed)
 
                             logger.debug(
                                 "[hermes-code] streaming call_llm: model=%s provider=%s has_rc=%s echo=%s msgs=%d",
@@ -7710,6 +7790,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         if _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url):
                             _msgs_to_send = _synthesize_reasoning_for_tool_calls(_msgs_to_send)
 
+                        # ── Packed tool_call_id cleanup (non-streaming) ──────────
+                        # Strip ``:hermes_ts:`` packed ids for all providers, and
+                        # for Google also inject the thought_signature back into
+                        # extra_content.  See the streaming path for the full
+                        # rationale.
+                        if "generativelanguage.googleapis.com" in (base_url or ""):
+                            _injected, _unpacked = _unpack_hermes_ts_and_inject_signatures(_msgs_to_send)
+                            if _injected or _unpacked:
+                                logger.warning(
+                                    "[hermes-code] ns Google thought_signature: injected=%d unpacked=%d into %d messages for %s",
+                                    _injected, _unpacked, len(_msgs_to_send), resolved_model,
+                                )
+                        else:
+                            _ts_fixed = _strip_hermes_ts_packed_ids(_msgs_to_send)
+                            if _ts_fixed:
+                                logger.debug("[hermes-code] ns: stripped %d hermes_ts packed ids for %s", _ts_fixed, provider_model)
+
                         # ── arliai tool_call_id sanitization ────────────────────
                         _mapper_ns = None
                         if base_url and "arliai" in (base_url or "").lower():
@@ -7720,6 +7817,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 logger.debug("[hermes-code] arliai ns: sanitized tool_call_ids",)
                             except Exception as _map_exc:
                                 logger.warning("[hermes-code] arliai ns: failed to init mapper: %s", _map_exc)
+
+                        # ── cerebras call_id stripping (non-streaming) ───────────
+                        if prov == "cerebras":
+                            _cc_removed_ns = _strip_call_id_from_tool_calls(_msgs_to_send)
+                            if _cc_removed_ns:
+                                logger.debug("[hermes-code] cerebras ns: stripped call_id from %d tool_calls", _cc_removed_ns)
 
                         logger.debug(
                             "[hermes-code] non-streaming call_llm: model=%s provider=%s has_rc=%s echo=%s msgs=%d",
