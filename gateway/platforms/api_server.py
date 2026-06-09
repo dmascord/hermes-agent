@@ -7424,9 +7424,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             if _cpool is not None:
                                 try:
                                     _cpool.mark_exhausted_and_rotate(
-                                        error_code=401,
-                                        error_reason="token_invalidated",
-                                        error_message=str(exc)[:200],
+                                        status_code=401,
+                                        error_context={"reason": "token_invalidated", "message": str(exc)[:200]},
                                     )
                                     logger.warning("[hermes-code] stream %s: rotated credential pool after 401", provider_model)
                                 except Exception as _pool_exc:
