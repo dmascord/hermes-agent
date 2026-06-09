@@ -4285,6 +4285,31 @@ def _strip_call_id_from_tool_calls(messages: List[Dict[str, Any]]) -> int:
                     removed += 1
     return removed
 
+def _has_unsigned_google_tool_calls(messages: List[Dict[str, Any]]) -> int:
+    """Count assistant tool_calls that lack a Google thought_signature.
+
+    Gemini 3.1+ rejects requests where any functionCall part is missing a
+    ``thought_signature`` with HTTP 400.  When a session is sticky to Google
+    and the client replays a conversation history whose tool_calls came from
+    non-Google providers (or whose signatures were stripped on the round-
+    trip), the request will fail before producing a response.  Counting
+    these lets the chain skip Google without spending a 1.2s round-trip.
+    """
+    count = 0
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            if not isinstance(tc, dict):
+                continue
+            ec = tc.get("extra_content")
+            google = ec.get("google") if isinstance(ec, dict) else None
+            ts = google.get("thought_signature") if isinstance(google, dict) else None
+            if not ts:
+                count += 1
+    return count
+
+
 
 
 def check_api_server_requirements() -> bool:
@@ -6161,6 +6186,27 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                         continue
 
+                    # Skip Google when the request history has assistant tool_calls
+                    # without thought_signature. Gemini 3.1+ rejects these with 400
+                    # (Function call is missing a thought_signature). We strip
+                    # extra_content on the round-trip, so a sticky session replayed
+                    # from a client (opencode/OMP) lands here unsigned. Skipping
+                    # saves the 1.2s RTT and lets the fallback chain handle the
+                    # request — the user still gets a response.
+                    #
+                    # We also clear the session's sticky model so subsequent turns
+                    # don't keep re-trying Google for the same broken history.
+                    if _prov_prefix == "google" and passthrough_messages:
+                        _unsigned = _has_unsigned_google_tool_calls(passthrough_messages)
+                        if _unsigned > 0:
+                            logger.warning(
+                                "[hermes-code] %s: %d assistant tool_call(s) lack thought_signature, skipping to avoid known 400",
+                                provider_model, _unsigned,
+                            )
+                            if session_id:
+                                _clear_hermes_code_session_model(session_id, reason="google_unsigned_history")
+                            continue
+
                     # Skip models whose context window cannot safely hold the estimated
                     # request tokens. This prevents costly "prompt too long" round-trips
                     # that waste API quota and trigger circuit breakers unnecessarily.
@@ -7385,6 +7431,24 @@ class APIServerAdapter(BasePlatformAdapter):
                             continue
                     except Exception:
                         pass
+
+                # Skip Google when the request history has assistant tool_calls
+                # without thought_signature. Same rationale as the streaming path:
+                # the client strips extra_content on the round-trip, so a sticky
+                # session replayed from a client lands here unsigned and would
+                # fail with a 400. Skipping lets the fallback chain handle it.
+                # Also clear the session's sticky model so subsequent turns don't
+                # keep re-trying Google for the same broken history.
+                if _prov_prefix == "google" and passthrough_messages:
+                    _unsigned = _has_unsigned_google_tool_calls(passthrough_messages)
+                    if _unsigned > 0:
+                        logger.warning(
+                            "[hermes-code] ns-skip %s: %d assistant tool_call(s) lack thought_signature, skipping to avoid known 400",
+                            provider_model, _unsigned,
+                        )
+                        if session_id:
+                            _clear_hermes_code_session_model(session_id, reason="google_unsigned_history")
+                        continue
 
                 # Skip models whose context window cannot safely hold the estimated
                 # request tokens. This prevents costly "prompt too long" round-trips
