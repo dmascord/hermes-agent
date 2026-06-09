@@ -4285,15 +4285,22 @@ def _strip_call_id_from_tool_calls(messages: List[Dict[str, Any]]) -> int:
                     removed += 1
     return removed
 
-def _has_unsigned_google_tool_calls(messages: List[Dict[str, Any]]) -> int:
+# Sentinel value that bypasses Google's per-functionCall signature validator.
+# The native Gemini adapter uses this for non-Gemini-origin tool calls and
+# the OpenAI-compat endpoint honours it the same way.  See
+# ``agent/gemini_native_adapter.py::_translate_tool_call_to_gemini``.
+_GOOGLE_THOUGHT_SIGNATURE_SENTINEL = "skip_thought_signature_validator"
+
+
+def _count_unsigned_google_tool_calls(messages: List[Dict[str, Any]]) -> int:
     """Count assistant tool_calls that lack a Google thought_signature.
 
     Gemini 3.1+ rejects requests where any functionCall part is missing a
-    ``thought_signature`` with HTTP 400.  When a session is sticky to Google
-    and the client replays a conversation history whose tool_calls came from
-    non-Google providers (or whose signatures were stripped on the round-
-    trip), the request will fail before producing a response.  Counting
-    these lets the chain skip Google without spending a 1.2s round-trip.
+    ``thought_signature`` with HTTP 400.  When a session replays a
+    conversation whose tool_calls came from non-Google providers (or whose
+    signatures were stripped on the round-trip), the request will fail
+    before producing a response.  Counting these lets the chain decide
+    whether to inject a sentinel signature before calling Google.
     """
     count = 0
     for msg in messages:
@@ -4308,6 +4315,45 @@ def _has_unsigned_google_tool_calls(messages: List[Dict[str, Any]]) -> int:
             if not ts:
                 count += 1
     return count
+
+
+# Backwards-compat alias — earlier callers used the predicate-style name.
+_has_unsigned_google_tool_calls = _count_unsigned_google_tool_calls
+
+
+def _inject_google_sentinel_signatures(messages: List[Dict[str, Any]]) -> int:
+    """Inject a sentinel thought_signature on every unsigned tool_call.
+
+    Walks assistant messages and sets
+    ``extra_content.google.thought_signature = skip_thought_signature_validator``
+    on any tool_call that lacks one.  This satisfies Google's per-functionCall
+    signature requirement for tool calls that originated outside its own
+    chain (e.g. from a non-Gemini provider, or whose signature was stripped
+    by the client on the round-trip).
+
+    Returns the number of tool_calls modified.  The function mutates
+    ``messages`` in place — pass a deep copy if the caller needs the
+    original.
+    """
+    modified = 0
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            if not isinstance(tc, dict):
+                continue
+            ec = tc.get("extra_content")
+            google = ec.get("google") if isinstance(ec, dict) else None
+            ts = google.get("thought_signature") if isinstance(google, dict) else None
+            if ts:
+                continue
+            # Set/overwrite extra_content with the sentinel.  The OpenAI-compat
+            # transport keeps extra_content for Gemini-family targets and
+            # drops it for everyone else, so this is safe.
+            tc["extra_content"] = {"google": {"thought_signature": _GOOGLE_THOUGHT_SIGNATURE_SENTINEL}}
+            modified += 1
+    return modified
+
 
 
 
@@ -6186,26 +6232,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                         continue
 
-                    # Skip Google when the request history has assistant tool_calls
-                    # without thought_signature. Gemini 3.1+ rejects these with 400
-                    # (Function call is missing a thought_signature). We strip
-                    # extra_content on the round-trip, so a sticky session replayed
-                    # from a client (opencode/OMP) lands here unsigned. Skipping
-                    # saves the 1.2s RTT and lets the fallback chain handle the
-                    # request — the user still gets a response.
-                    #
-                    # We also clear the session's sticky model so subsequent turns
-                    # don't keep re-trying Google for the same broken history.
+                    # Google Gemini 3.1+ requires thought_signature on every
+                    # functionCall part.  When the opencode/OMP client replays
+                    # a conversation whose tool_calls came from a non-Gemini
+                    # provider (or whose extra_content was stripped on the
+                    # round-trip), the message history has unsigned function
+                    # calls.  The cleanest fix is to inject a sentinel
+                    # ``extra_content.google.thought_signature`` value on
+                    # each unsigned call before sending to Google — Google's
+                    # OpenAI-compat endpoint accepts the sentinel and skips
+                    # the per-call signature validator.
                     if _prov_prefix == "google" and passthrough_messages:
-                        _unsigned = _has_unsigned_google_tool_calls(passthrough_messages)
+                        _unsigned = _count_unsigned_google_tool_calls(passthrough_messages)
                         if _unsigned > 0:
-                            logger.warning(
-                                "[hermes-code] %s: %d assistant tool_call(s) lack thought_signature, skipping to avoid known 400",
+                            logger.debug(
+                                "[hermes-code] %s: %d assistant tool_call(s) lack thought_signature; sentinel will be injected in message build step",
                                 provider_model, _unsigned,
                             )
-                            if session_id:
-                                _clear_hermes_code_session_model(session_id, reason="google_unsigned_history")
-                            continue
 
                     # Skip models whose context window cannot safely hold the estimated
                     # request tokens. This prevents costly "prompt too long" round-trips
@@ -6787,11 +6830,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             # base64 signature and inject it into extra_content so the
                             # Gemini API accepts the request.
                             if "generativelanguage.googleapis.com" in (base_url or ""):
+                                # 1) Strip any :hermes_ts: packed ids and restore signatures
                                 _injected, _unpacked = _unpack_hermes_ts_and_inject_signatures(_msgs_to_send)
-                                if _injected or _unpacked:
+                                # 2) Inject sentinel thought_signature on unsigned tool_calls
+                                #    (e.g. those originating from non-Google providers, or
+                                #    whose extra_content was stripped on the round-trip).
+                                _sentinel = _inject_google_sentinel_signatures(_msgs_to_send)
+                                if _injected or _unpacked or _sentinel:
                                     logger.warning(
-                                        "[hermes-code] Google thought_signature: injected=%d unpacked=%d into %d messages for %s",
-                                        _injected, _unpacked, len(_msgs_to_send), resolved_model,
+                                        "[hermes-code] Google thought_signature: injected=%d unpacked=%d sentinel=%d into %d messages for %s",
+                                        _injected, _unpacked, _sentinel, len(_msgs_to_send), resolved_model,
                                     )
                             else:
                                 _ts_fixed = _strip_hermes_ts_packed_ids(_msgs_to_send)
@@ -7432,23 +7480,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
-                # Skip Google when the request history has assistant tool_calls
-                # without thought_signature. Same rationale as the streaming path:
-                # the client strips extra_content on the round-trip, so a sticky
-                # session replayed from a client lands here unsigned and would
-                # fail with a 400. Skipping lets the fallback chain handle it.
-                # Also clear the session's sticky model so subsequent turns don't
-                # keep re-trying Google for the same broken history.
+                # Google Gemini 3.1+ requires thought_signature on every
+                # functionCall part.  The actual injection of a sentinel
+                # ``extra_content.google.thought_signature`` value happens
+                # later in the message-building step — here we just log
+                # for observability.
                 if _prov_prefix == "google" and passthrough_messages:
-                    _unsigned = _has_unsigned_google_tool_calls(passthrough_messages)
+                    _unsigned = _count_unsigned_google_tool_calls(passthrough_messages)
                     if _unsigned > 0:
-                        logger.warning(
-                            "[hermes-code] ns-skip %s: %d assistant tool_call(s) lack thought_signature, skipping to avoid known 400",
+                        logger.debug(
+                            "[hermes-code] ns %s: %d assistant tool_call(s) lack thought_signature; will inject sentinel",
                             provider_model, _unsigned,
                         )
-                        if session_id:
-                            _clear_hermes_code_session_model(session_id, reason="google_unsigned_history")
-                        continue
 
                 # Skip models whose context window cannot safely hold the estimated
                 # request tokens. This prevents costly "prompt too long" round-trips
@@ -7860,11 +7903,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         # extra_content.  See the streaming path for the full
                         # rationale.
                         if "generativelanguage.googleapis.com" in (base_url or ""):
+                            # 1) Strip any :hermes_ts: packed ids and restore signatures
                             _injected, _unpacked = _unpack_hermes_ts_and_inject_signatures(_msgs_to_send)
-                            if _injected or _unpacked:
+                            # 2) Inject sentinel thought_signature on unsigned tool_calls
+                            _sentinel = _inject_google_sentinel_signatures(_msgs_to_send)
+                            if _injected or _unpacked or _sentinel:
                                 logger.warning(
-                                    "[hermes-code] ns Google thought_signature: injected=%d unpacked=%d into %d messages for %s",
-                                    _injected, _unpacked, len(_msgs_to_send), resolved_model,
+                                    "[hermes-code] ns Google thought_signature: injected=%d unpacked=%d sentinel=%d into %d messages for %s",
+                                    _injected, _unpacked, _sentinel, len(_msgs_to_send), resolved_model,
                                 )
                         else:
                             _ts_fixed = _strip_hermes_ts_packed_ids(_msgs_to_send)
