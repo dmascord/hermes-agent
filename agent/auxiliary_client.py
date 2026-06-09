@@ -591,30 +591,51 @@ class _CodexCompletionsAdapter:
             collected_output_items: List[Any] = []
             collected_text_deltas: List[str] = []
             has_function_calls = False
-            print(f"[HTTP_LOG] REQUEST provider=copilot model={model} url={self._client.base_url}/responses.stream messages={len(input_msgs)}", flush=True)
-            try:
-                with self._client.responses.stream(**resp_kwargs) as stream:
-                    for _event in stream:
-                        _etype = getattr(_event, "type", "")
-                        if _etype == "response.output_item.done":
-                            _done = getattr(_event, "item", None)
-                            if _done is not None:
-                                collected_output_items.append(_done)
-                        elif "output_text.delta" in _etype:
-                            _delta = getattr(_event, "delta", "")
-                            if _delta:
-                                collected_text_deltas.append(_delta)
-                        elif "function_call" in _etype:
-                            has_function_calls = True
-                    final = stream.get_final_response()
+            print(f"[HTTP_LOG] REQUEST provider=copilot model={model} url={self._client.base_url}/responses messages={len(input_msgs)}", flush=True)
+            # HACK: OpenAI SDK's responses.stream() adds ".stream" suffix to the URL,
+            # but chatgpt.com/backend-api/codex does NOT have a /responses.stream route.
+            # Use raw httpx streaming to the correct /responses endpoint.
+            import httpx
+            _raw_client = self._client._client  # underlying httpx.Client (SyncHttpxClientWrapper)
+            _url = f"{str(self._client.base_url).rstrip('/')}/responses"
+            # The OpenAI SDK adds Authorization via _build_request, not via default_headers on httpx.
+            # We must add it explicitly when going around the SDK.
+            _req_headers = {"Authorization": f"Bearer {self._client.api_key}"}
+            with _raw_client.stream("POST", _url, json=resp_kwargs, headers=_req_headers) as _resp:
+                if _resp.status_code >= 400:
+                    _body = b"".join(_resp.iter_bytes())[:500]
+                    raise RuntimeError(f"codex stream HTTP {_resp.status_code}: {_body!r}")
+                for _line in _resp.iter_lines():
+                    if not _line:
+                        continue
+                    _text = _line.decode("utf-8", errors="replace").strip()
+                    if not _text.startswith("data: "):
+                        continue
+                    try:
+                        _data = json.loads(_text[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    _etype = _data.get("type", "")
+                    if _etype == "response.output_item.done":
+                        _done = _data.get("item")
+                        if _done is not None:
+                            collected_output_items.append(_done)
+                    elif "output_text.delta" in _etype:
+                        _delta = _data.get("delta", "")
+                        if _delta:
+                            collected_text_deltas.append(_delta)
+                    elif "function_call" in _etype:
+                        has_function_calls = True
+                # Synthesize a final response object from collected items
+                final = SimpleNamespace(output=collected_output_items)
                 _stream_elapsed = time.time() - _adapter_start
                 print(f"[HTTP_LOG] RESPONSE_OK provider=copilot model={model} elapsed={_stream_elapsed:.2f}s stream=true", flush=True)
-            except Exception as _codex_exc:
-                _stream_elapsed = time.time() - _adapter_start
-                _codex_status = getattr(_codex_exc, "status_code", None)
-                _codex_body = str(getattr(_codex_exc, "body", "") or getattr(_codex_exc, "message", ""))[:500]
-                print(f"[HTTP_LOG] RESPONSE_ERROR provider=copilot model={model} status={_codex_status} elapsed={_stream_elapsed:.2f}s body={_codex_body[:300]}", flush=True)
-                raise
+        except Exception as _codex_exc:
+            _stream_elapsed = time.time() - _adapter_start
+            _codex_status = getattr(_codex_exc, "status_code", None)
+            _codex_body = str(getattr(_codex_exc, "body", "") or getattr(_codex_exc, "message", ""))[:500]
+            print(f"[HTTP_LOG] RESPONSE_ERROR provider=copilot model={model} status={_codex_status} elapsed={_stream_elapsed:.2f}s body={_codex_body[:300]}", flush=True)
+            raise
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
