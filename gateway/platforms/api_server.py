@@ -6360,7 +6360,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 from hermes_cli.copilot_auth import copilot_request_headers
 
                                 _s_loop = asyncio.get_running_loop()
-                                headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
+                                # codex endpoints need the Cloudflare-safe originator/User-Agent
+                                # (chatgpt.com whitelists only codex_cli_rs/codex_vscode/codex_sdk_ts).
+                                if "chatgpt.com" in (base_url or "").lower() and api_mode == "codex_responses":
+                                    from agent.auxiliary_client import _codex_cloudflare_headers
+                                    headers = _codex_cloudflare_headers(api_key)
+                                else:
+                                    headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
                                 client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
 
                                 if api_mode == "codex_responses":
@@ -7599,7 +7605,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             from hermes_cli.copilot_auth import copilot_request_headers
 
                             _ns_loop = asyncio.get_running_loop()
-                            headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
+                            # codex endpoints need the Cloudflare-safe originator/User-Agent
+                            # (chatgpt.com whitelists only codex_cli_rs/codex_vscode/codex_sdk_ts).
+                            # The generic copilot headers trigger cf_chl_opt challenges.
+                            if "chatgpt.com" in (base_url or "").lower() and api_mode == "codex_responses":
+                                from agent.auxiliary_client import _codex_cloudflare_headers
+                                headers = _codex_cloudflare_headers(api_key)
+                            else:
+                                headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
                             client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
 
                             if api_mode == "codex_responses":
