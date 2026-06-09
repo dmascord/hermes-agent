@@ -1642,6 +1642,7 @@ def _call_codex_passthrough(
         _responses_tools,
         _deterministic_call_id,
     )
+    logger.info("[HTTP_LOG] Codex passthrough URL=%s model=%s auth_key_preview=%s key_len=%d", effective_base, model, api_key[:10], len(api_key))
 
     effective_base = (base_url or "https://chatgpt.com/backend-api/codex").rstrip("/")
 
@@ -1697,7 +1698,7 @@ def _call_codex_passthrough(
     tc_map: Dict[str, Dict[str, str]] = {}
     tc_order: List[str] = []  # preserve insertion order
     usage_obj = None
-
+    print(f"[HTTP_LOG] REQUEST codex passthrough model={model} url={effective_base}/responses", flush=True)
     with client.responses.create(**kwargs) as stream:
         for event in stream:
             etype = getattr(event, "type", "") or ""
