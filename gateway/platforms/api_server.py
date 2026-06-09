@@ -1670,10 +1670,6 @@ def _call_codex_passthrough(
         instructions = "You are a helpful assistant."
 
     headers = _codex_cloudflare_headers(api_key)
-    headers["originator"] = "opencode"
-    headers["User-Agent"] = (
-        f"opencode/0.1.131 ({platform.system()} {platform.release()}; {platform.machine()})"
-    )
 
     client = OpenAI(api_key=api_key, base_url=effective_base, default_headers=headers,
                     timeout=timeout, http_client=_keepalive_httpx)
