@@ -50,7 +50,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from aiohttp import web
@@ -6086,28 +6086,54 @@ class APIServerAdapter(BasePlatformAdapter):
                     fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
                     if fb and fb not in _passthrough_models:
                         _passthrough_models.append(fb)
-            # ── Quality-based reordering ─────────────────────────────────────────
-            # Sort the REST of the chain by live quality score (best first).
-            # Pin position 0 (user's requested model or HERMES_CODE_MODEL) so the
-            # explicit request is always honoured first.
+            # ── Quality-based reordering + quality floor ─────────────────────────
+            # Sort the REST of the chain by live quality score (best first), then
+            # drop any non-pinned model whose score is below the floor — they
+            # belong in the dead-models cleanup script, not in a live fallback
+            # chain.  Pin position 0 (user's requested model or HERMES_CODE_MODEL)
+            # so the explicit request is always honoured first, even if its
+            # recorded score is low (e.g. brand-new model, or model currently
+            # being debugged).
             if len(_passthrough_models) > 1:
                 try:
                     from agent.model_quality_db import get_quality_score
                     _pinned = _passthrough_models[0]  # user's request or HERMES_CODE_MODEL
                     _rest = _passthrough_models[1:]
-                    _rest.sort(
-                        key=lambda m: get_quality_score(
+
+                    def _score(m: str) -> float:
+                        return get_quality_score(
                             m.split("/", 1)[0] if "/" in m else "",
                             m.split("/", 1)[1] if "/" in m else m,
-                        ),
-                        reverse=True,
-                    )
-                    _passthrough_models = [_pinned] + _rest
+                        )
+
+                    _rest.sort(key=_score, reverse=True)
+                    # Quality floor — drop chronically-bad models from the chain.
+                    # Default 60.0 (a model with 60% success + 30/30 tool reliability
+                    # + 0 latency bonus is at the floor; anything worse is dropped).
+                    # Set HERMES_CODE_QUALITY_FLOOR=0 to disable.
+                    _floor = float(os.getenv("HERMES_CODE_QUALITY_FLOOR", "60.0") or 0.0)
+                    _kept: List[str] = []
+                    _dropped: List[Tuple[str, float]] = []
+                    for m in _rest:
+                        s = _score(m)
+                        if s < _floor:
+                            _dropped.append((m, s))
+                        else:
+                            _kept.append(m)
+                    _passthrough_models = [_pinned] + _kept
+                    if _dropped:
+                        logger.info(
+                            "[hermes-code][req=%s] quality floor %.1f dropped %d model(s): %s",
+                            _req_id,
+                            _floor,
+                            len(_dropped),
+                            ", ".join(f"{m}={s:.0f}" for m, s in _dropped),
+                        )
                     logger.info(
                         "[hermes-code][req=%s] quality-sorted chain: pinned=%s rest_top5=%s",
                         _req_id,
                         _pinned,
-                        [f"{m.split('/',1)[-1] if '/' in m else m}:{get_quality_score(m.split('/',1)[0], m.split('/',1)[1] if '/' in m else m):.0f}" for m in _passthrough_models[1:6]],
+                        [f"{m.split('/',1)[-1] if '/' in m else m}:{_score(m):.0f}" for m in _passthrough_models[1:6]],
                     )
                 except Exception:
                     pass
