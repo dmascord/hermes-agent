@@ -1642,9 +1642,8 @@ def _call_codex_passthrough(
         _responses_tools,
         _deterministic_call_id,
     )
-    logger.info("[HTTP_LOG] Codex passthrough URL=%s model=%s auth_key_preview=%s key_len=%d", effective_base, model, api_key[:10], len(api_key))
-
     effective_base = (base_url or "https://chatgpt.com/backend-api/codex").rstrip("/")
+    logger.info("[HTTP_LOG] Codex passthrough URL=%s model=%s auth_key_preview=%s key_len=%d", effective_base, model, api_key[:10], len(api_key))
 
     # Build a keepalive httpx client to prevent the SITA NGFW or upstream
     # from closing idle connections before the first SSE event arrives.

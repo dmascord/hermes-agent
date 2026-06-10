@@ -583,6 +583,29 @@ class CredentialPool:
                 self._replace_entry(entry, updated)
                 self._persist()
                 return updated
+            # Even when tokens match, if the entry is exhausted and the
+            # cooldown has expired, clear exhaustion so the pool self-heals.
+            if entry.last_status == STATUS_EXHAUSTED and store_access == entry_access:
+                reset_at = entry.last_error_reset_at or 0
+                if time.time() >= reset_at:
+                    logger.debug(
+                        "Pool entry %s: Codex tokens match auth.json but "
+                        "entry is exhausted with expired cooldown — "
+                        "clearing exhaustion",
+                        entry.id,
+                    )
+                    field_updates = {
+                        "last_status": None,
+                        "last_status_at": None,
+                        "last_error_code": None,
+                        "last_error_reason": None,
+                        "last_error_message": None,
+                        "last_error_reset_at": None,
+                    }
+                    updated = replace(entry, **field_updates)
+                    self._replace_entry(entry, updated)
+                    self._persist()
+                    return updated
         except Exception as exc:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
         return entry
