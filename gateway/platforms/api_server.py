@@ -1635,7 +1635,6 @@ def _call_codex_passthrough(
     passthrough serialisation layer.
     """
     import types, platform
-    from openai import OpenAI
     from agent.auxiliary_client import _codex_cloudflare_headers
     from agent.codex_responses_adapter import (
         _chat_messages_to_responses_input,
@@ -1670,14 +1669,20 @@ def _call_codex_passthrough(
         instructions = "You are a helpful assistant."
 
     headers = _codex_cloudflare_headers(api_key)
-
-    client = OpenAI(api_key=api_key, base_url=effective_base, default_headers=headers,
-                    timeout=timeout, http_client=_keepalive_httpx)
+    # Manually add Authorization — the OpenAI SDK adds it via _build_request,
+    # but we are going around the SDK, so it must be explicit.
+    headers["Authorization"] = f"Bearer {api_key}"
 
     responses_input = _chat_messages_to_responses_input(input_messages)
     responses_tools = _responses_tools(tools) if tools else None
-
-    kwargs: Dict[str, Any] = {
+    # The OpenAI SDK's responses.create() appends "/responses" to base_url, but
+    # chatgpt.com/backend-api/codex already includes the path segment, so the
+    # SDK ends up calling /responses/responses → Cloudflare challenge HTML.
+    # Use raw httpx streaming against the correct /responses URL instead.
+    url = f"{effective_base}/responses"
+    # The Codex endpoint rejects max_output_tokens and temperature — omit
+    # both to avoid 400 errors.
+    body = {
         "model": model,
         "instructions": instructions,
         "input": responses_input,
@@ -1685,7 +1690,10 @@ def _call_codex_passthrough(
         "stream": True,
     }
     if responses_tools:
-        kwargs["tools"] = responses_tools
+        body["tools"] = responses_tools
+
+    # Build kwargs dict for logging (avoid building twice)
+    kwargs = body
 
     # Parse raw SSE events. We cannot use client.responses.stream() because its
     # ResponseStream wrapper calls parse_response() on response.completed, which
@@ -1697,42 +1705,49 @@ def _call_codex_passthrough(
     tc_map: Dict[str, Dict[str, str]] = {}
     tc_order: List[str] = []  # preserve insertion order
     usage_obj = None
-    print(f"[HTTP_LOG] REQUEST codex passthrough model={model} url={effective_base}/responses", flush=True)
-    with client.responses.create(**kwargs) as stream:
-        for event in stream:
-            etype = getattr(event, "type", "") or ""
-
+    print(f"[HTTP_LOG] REQUEST codex passthrough model={model} url={url}", flush=True)
+    with _keepalive_httpx.stream("POST", url, json=body, headers=headers, timeout=timeout) as resp:
+        if resp.status_code >= 400:
+            err_body = b"".join(resp.iter_bytes())[:500]
+            raise RuntimeError(
+                f"codex passthrough HTTP {resp.status_code}: {err_body!r}"
+            )
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            text = line.decode("utf-8", errors="replace").strip() if isinstance(line, bytes) else line.strip()
+            if not text.startswith("data: "):
+                continue
+            try:
+                data = json.loads(text[6:])
+            except json.JSONDecodeError:
+                continue
+            etype = data.get("type", "")
             if etype == "response.output_text.delta":
-                delta = getattr(event, "delta", "") or ""
+                delta = data.get("delta", "") or ""
                 if delta:
                     content_parts.append(delta)
-
             elif etype == "response.output_item.added":
-                item = getattr(event, "item", None)
-                if item and getattr(item, "type", "") == "function_call":
-                    call_id = str(getattr(item, "call_id", "") or "").strip()
-                    name = str(getattr(item, "name", "") or "").strip()
+                item = data.get("item")
+                if item and item.get("type") == "function_call":
+                    call_id = str(item.get("call_id", "") or "").strip()
+                    name = str(item.get("name", "") or "").strip()
                     if call_id and call_id not in tc_map:
                         tc_map[call_id] = {"name": name, "arguments": ""}
                         tc_order.append(call_id)
-
             elif etype == "response.function_call_arguments.done":
-                call_id = str(getattr(event, "call_id", "") or "").strip()
-                args = str(getattr(event, "arguments", "") or "")
+                call_id = str(data.get("call_id", "") or "").strip()
+                args = str(data.get("arguments", "") or "")
                 if call_id in tc_map:
                     tc_map[call_id]["arguments"] = args
-
             elif etype == "response.output_item.done":
-                item = getattr(event, "item", None)
-                if item and getattr(item, "type", "") == "function_call":
-                    call_id = str(getattr(item, "call_id", "") or "").strip()
-                    name = str(getattr(item, "name", "") or "").strip()
-                    arguments = getattr(item, "arguments", "{}")
+                item = data.get("item")
+                if item and item.get("type") == "function_call":
+                    call_id = str(item.get("call_id", "") or "").strip()
+                    name = str(item.get("name", "") or "").strip()
+                    arguments = item.get("arguments", "{}")
                     if not isinstance(arguments, str):
-                        try:
-                            arguments = json.dumps(arguments, ensure_ascii=False)
-                        except Exception:
-                            arguments = str(arguments)
+                        arguments = json.dumps(arguments, ensure_ascii=False)
                     if call_id:
                         entry = tc_map.get(call_id)
                         if entry is None:
@@ -1743,12 +1758,10 @@ def _call_codex_passthrough(
                                 entry["name"] = name
                             if arguments:
                                 entry["arguments"] = arguments
-
             elif etype == "response.completed":
-                resp = getattr(event, "response", None)
-                if resp is not None:
-                    usage_obj = getattr(resp, "usage", None)
-
+                resp_obj = data.get("response")
+                if resp_obj is not None:
+                    usage_obj = resp_obj.get("usage")
     content = "".join(content_parts)
 
     tool_calls_out: List[Any] = []

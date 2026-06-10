@@ -502,6 +502,8 @@ class _CodexCompletionsAdapter:
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        import sys
+        print(f"[HTTP_LOG] _CodexCompletionsAdapter.create called model={kwargs.get('model', self._model)} base_url={self._client.base_url}", file=sys.stderr, flush=True)
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
