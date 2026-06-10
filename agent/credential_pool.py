@@ -1499,7 +1499,12 @@ def _dedupe_subscription_oauth_entries(provider: str, entries: List[PooledCreden
     retained = [best_by_key[key] for key in key_order]
     # Tokenless entries cannot service requests; drop them for these runtime
     # pools instead of letting them count as available credentials.
+    # Tokenless entries cannot service requests; drop them for these runtime
     if len(retained) == len(entries) and not tokenless:
+        return False
+    if not retained and entries:
+        # Do not wipe the pool if deduplication fails to retain anything;
+        # this prevents losing the last credential in an auth-state race.
         return False
     entries[:] = [replace(entry, priority=idx) for idx, entry in enumerate(retained)]
     return True
@@ -1926,6 +1931,10 @@ def _prune_stale_seeded_entries(entries: List[PooledCredential], active_sources:
         )
     ]
     if len(retained) == len(entries):
+        return False
+    if not retained and entries:
+        # Do not wipe the pool if pruning removes everything;
+        # this prevents losing credentials in a race.
         return False
     entries[:] = retained
     return True
