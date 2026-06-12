@@ -717,6 +717,17 @@ class CredentialPool:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
+                    # Persist expires_at_ms so the next pool load can
+                    # decide whether the token is still valid without
+                    # re-decoding the JWT.  Format as ISO-8601 for
+                    # human readability in auth.json.
+                    if entry.expires_at_ms is not None:
+                        from datetime import datetime, timezone
+                        _exp_iso = datetime.fromtimestamp(
+                            entry.expires_at_ms / 1000, tz=timezone.utc
+                        ).isoformat().replace("+00:00", "Z")
+                        state["expires_at"] = _exp_iso
+                        state["expires_at_ms"] = entry.expires_at_ms
                     _save_provider_state(auth_store, "openai-codex", state)
 
                 else:
@@ -764,11 +775,17 @@ class CredentialPool:
                     entry.access_token,
                     entry.refresh_token,
                 )
+                # Capture expires_at_ms from the refresh result so the
+                # entry's expiry check can predict when to refresh next
+                # without re-decoding the JWT every time.  Falls back to
+                # None when the field is missing (old refresh flow).
+                _new_expires_ms = refreshed.get("expires_at_ms")
                 updated = replace(
                     entry,
                     access_token=refreshed["access_token"],
                     refresh_token=refreshed["refresh_token"],
                     last_refresh=refreshed.get("last_refresh"),
+                    expires_at_ms=_new_expires_ms,
                 )
             elif self.provider == "nous":
                 synced = self._sync_nous_entry_from_auth_store(entry)
@@ -896,6 +913,15 @@ class CredentialPool:
                 return False
             return int(entry.expires_at_ms) <= int(time.time() * 1000) + 120_000
         if self.provider == "openai-codex":
+            # Prefer the cached expires_at_ms written by the refresh
+            # flow — avoids re-decoding the JWT on every pool query.
+            # Fall back to JWT-decoded check for entries that haven't
+            # been through the new refresh path yet (e.g. env-seeded).
+            if entry.expires_at_ms is not None:
+                return (
+                    int(entry.expires_at_ms)
+                    <= int(time.time() * 1000) + CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS * 1000
+                )
             return _codex_access_token_is_expiring(
                 entry.access_token,
                 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -1759,6 +1785,23 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # existing Codex CLI credentials get a one-time, explicit prompt
         # via `hermes auth openai-codex`.
         if not _codex_device_code_suppressed and isinstance(tokens, dict) and tokens.get("access_token"):
+            # Reconstruct expires_at_ms from the state if present, so the
+            # entry can answer _entry_needs_refresh() without re-decoding
+            # the JWT.  Falls back to None (legacy behaviour).
+            _codex_expires_at_ms = None
+            try:
+                _raw_exp = state.get("expires_at_ms")
+                if _raw_exp is not None:
+                    _codex_expires_at_ms = int(_raw_exp)
+                else:
+                    _raw_iso = state.get("expires_at")
+                    if _raw_iso:
+                        from datetime import datetime as _dt
+                        _codex_expires_at_ms = int(
+                            _dt.fromisoformat(_raw_iso).timestamp() * 1000
+                        )
+            except Exception:
+                _codex_expires_at_ms = None
             active_sources.add("device_code")
             changed |= _upsert_entry(
                 entries,
@@ -1771,6 +1814,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "refresh_token": tokens.get("refresh_token"),
                     "base_url": "https://chatgpt.com/backend-api/codex",
                     "last_refresh": state.get("last_refresh"),
+                    "expires_at_ms": _codex_expires_at_ms,
                     "label": label_from_token(tokens.get("access_token", ""), "device_code"),
                 },
             )
@@ -1840,6 +1884,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                                     "base_url": entry.get("base_url")
                                     or "https://chatgpt.com/backend-api/codex",
                                     "last_refresh": entry.get("last_refresh"),
+                                    "expires_at_ms": entry.get("expires_at_ms"),
                                     "label": str(entry.get("label") or unique_source),
                                 },
                             )

@@ -3317,6 +3317,7 @@ def _sync_codex_pool_entries(
     auth_store: Dict[str, Any],
     tokens: Dict[str, str],
     last_refresh: Optional[str],
+    expires_in: Optional[int] = None,
 ) -> None:
     """Mirror a fresh Codex re-auth into the credential_pool OAuth entries.
 
@@ -3365,6 +3366,10 @@ def _sync_codex_pool_entries(
     # OAuth re-auth.  ``manual:api_key`` and unknown sources are intentionally
     # excluded — they represent independent credentials.
     REFRESHABLE_SOURCES = {"device_code", "manual:device_code"}
+    import time as _time
+    _sync_expires_at_ms: Optional[int] = None
+    if isinstance(expires_in, (int, float)) and expires_in > 0:
+        _sync_expires_at_ms = int(_time.time() * 1000) + int(expires_in * 1000)
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -3376,6 +3381,10 @@ def _sync_codex_pool_entries(
             entry["refresh_token"] = refresh_token
         if last_refresh:
             entry["last_refresh"] = last_refresh
+        # Mirror the absolute expiry so the pool entry can answer
+        # _entry_needs_refresh() without re-decoding the JWT.
+        if _sync_expires_at_ms is not None:
+            entry["expires_at_ms"] = _sync_expires_at_ms
         entry["last_status"] = None
         entry["last_status_at"] = None
         entry["last_error_code"] = None
@@ -3384,8 +3393,20 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: str = None,
+    label: str = None,
+    expires_in: Optional[int] = None,
+) -> None:
+    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json).
+
+    When ``expires_in`` is provided (seconds until the access token expires),
+    the absolute expiry is computed and persisted to both ``state["expires_at"]``
+    (ISO-8601, human-readable) and ``state["expires_at_ms"]`` (epoch ms, for
+    fast numeric comparison).  Downstream codex-pool lookups can then answer
+    "is the token still valid?" without re-decoding the JWT.
+    """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock():
@@ -3396,8 +3417,25 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
+        if isinstance(expires_in, (int, float)) and expires_in > 0:
+            import time as _time
+            _exp_ms = int(_time.time() * 1000) + int(expires_in * 1000)
+            state["expires_at_ms"] = _exp_ms
+            state["expires_at"] = datetime.fromtimestamp(
+                _exp_ms / 1000, tz=timezone.utc
+            ).isoformat().replace("+00:00", "Z")
         _save_provider_state(auth_store, "openai-codex", state)
-        _sync_codex_pool_entries(auth_store, tokens, last_refresh)
+        # Compute expires_in once for the sync — also derive it from
+        # the freshly-stored state if not explicitly provided.
+        _sync_expires_in = expires_in
+        if _sync_expires_in is None and isinstance(state.get("expires_at_ms"), int):
+            _sync_expires_in = max(
+                0,
+                int((state["expires_at_ms"] - time.time() * 1000) / 1000),
+            )
+        _sync_codex_pool_entries(
+            auth_store, tokens, last_refresh, expires_in=_sync_expires_in,
+        )
         _save_auth_store(auth_store)
 
 
@@ -3518,10 +3556,33 @@ def refresh_codex_oauth_pure(
             relogin_required=True,
         )
 
+    # Compute expires_at_ms from the JWT's exp claim (refresh endpoint does
+    # not reliably return expires_in).  Decode the access token's claims to
+    # get the authoritative expiry; fall back to a 1-hour default if opaque.
+    expires_at_ms = int(time.time() * 1000) + 3600 * 1000
+    try:
+        from agent.codex_oauth import _extract_token_profile
+        _profile = _extract_token_profile(refreshed_access.strip())
+    except Exception:
+        _profile = {}
+    # Re-derive exp from the JWT payload itself for the real value.
+    try:
+        import base64 as _b64
+        _parts = refreshed_access.strip().split(".")
+        if len(_parts) >= 2:
+            _pad = "=" * (-len(_parts[1]) % 4)
+            _claims = json.loads(_b64.urlsafe_b64decode(_parts[1] + _pad))
+            _exp = _claims.get("exp")
+            if isinstance(_exp, (int, float)):
+                expires_at_ms = int(float(_exp) * 1000)
+    except Exception:
+        pass
+
     updated = {
         "access_token": refreshed_access.strip(),
         "refresh_token": refresh_token.strip(),
         "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "expires_at_ms": expires_at_ms,
     }
     next_refresh = refresh_payload.get("refresh_token")
     if isinstance(next_refresh, str) and next_refresh.strip():
@@ -6906,6 +6967,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
         or DEFAULT_CODEX_BASE_URL
     )
 
+    expires_in = tokens.get("expires_in", 3600)
     return {
         "tokens": {
             "access_token": access_token,
@@ -6915,6 +6977,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
         "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "auth_mode": "chatgpt",
         "source": "device-code",
+        "expires_in": expires_in,
     }
 
 

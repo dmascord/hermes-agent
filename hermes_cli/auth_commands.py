@@ -316,6 +316,7 @@ def auth_add_command(args) -> None:
             creds["tokens"],
             last_refresh=creds.get("last_refresh"),
             label=label,
+            expires_in=creds.get("expires_in"),
         )
         pool = load_pool(provider)
         entry = next((item for item in pool.entries() if item.source == "device_code"), None)
