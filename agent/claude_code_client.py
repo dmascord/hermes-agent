@@ -209,26 +209,40 @@ def _maybe_refresh_claude_oauth() -> bool:
             return False
         try:
             result = _claude_oauth_refresh_token(refresh_token)
+        except urllib.error.HTTPError as exc:
+            # Anthropic returns 400 with body {"error":"invalid_grant",...}
+            # when the refresh token has been consumed/revoked.  This is
+            # unrecoverable until the user re-runs `claude /login` (or the
+            # equivalent OAuth device flow).  Surface the body in the log
+            # and persist it to .credentials.json so the gateway can show
+            # the operator which Claude account needs re-auth.
+            err_body = ""
+            try:
+                err_body = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            auth["last_refresh_error"] = {
+                "code": exc.code,
+                "body": err_body,
+                "at": int(time.time() * 1000),
+            }
+            _logger.warning(
+                "claude_oauth: refresh failed (HTTP %s); body=%s. "
+                "Run `claude /login` to re-authorise.",
+                exc.code, err_body,
+            )
+            # Best-effort: persist the error so subsequent gateway
+            # calls / health checks can surface it without re-trying.
+            try:
+                creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            return False
         except Exception as exc:
             _logger.warning(
                 "claude_oauth: refresh failed (%s); CLI may return 'Not logged in'",
                 exc,
             )
-            return False
-        # Update the credentials dict in place and persist atomically.
-        auth["accessToken"] = result["access_token"]
-        auth["refreshToken"] = result["refresh_token"]
-        auth["expiresAt"] = int(time.time() * 1000) + int(result["expires_in"]) * 1000
-        try:
-            tmp_path = creds_path.with_suffix(".json.tmp")
-            tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            try:
-                os.chmod(tmp_path, 0o600)
-            except Exception:
-                pass
-            os.replace(tmp_path, creds_path)
-        except Exception as exc:
-            _logger.warning("claude_oauth: failed to persist refreshed creds: %s", exc)
             return False
         _logger.info(
             "claude_oauth: refreshed access token, expires in %s seconds",
