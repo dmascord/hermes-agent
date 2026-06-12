@@ -9,6 +9,7 @@ Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -16,15 +17,23 @@ import shlex
 import subprocess
 import threading
 import time
+import urllib.parse
+import urllib.request
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-CLAUDE_CODE_BASE_URL = "claude://codex"
+_logger = logging.getLogger(__name__)
+
+# Anthropic OAuth constants (decoded from base64: Claude Code clientId)
+_CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_CLAUDE_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+
 _DEFAULT_TIMEOUT_SECONDS = 300.0  # 5 minutes for print mode
 
-# Model mapping: hermes model hint → Claude Code --model flag
+CLAUDE_CODE_BASE_URL = "claude://codex"
+
 MODEL_MAP = {
     # Use Claude CLI's own model aliases; these work reliably in print mode.
     "sonnet": "sonnet",
@@ -98,6 +107,134 @@ def _build_subprocess_env() -> dict[str, str]:
     if "ANTHROPIC_API_KEY" in os.environ:
         env["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_API_KEY"]
     return env
+
+
+# Lock to serialise concurrent refresh attempts inside one process.
+_claude_oauth_refresh_lock = threading.Lock()
+
+
+def _claude_oauth_needs_refresh(creds: dict, *, skew_seconds: int = 300) -> bool:
+    """Return True if the Claude OAuth access token is expired or about to expire.
+
+    ``skew_seconds`` (default 5 min) is the safety margin — refresh proactively
+    so a request in flight doesn't hit an expired token.
+    """
+    try:
+        expires_at = int(creds.get("expiresAt") or 0)
+    except Exception:
+        return True
+    if not expires_at:
+        return True
+    return expires_at <= int(time.time() * 1000) + skew_seconds * 1000
+
+
+def _claude_oauth_refresh_token(refresh_token: str, *, timeout: float = 15.0) -> dict:
+    """Call Anthropic's OAuth token endpoint with a refresh token.
+
+    Mirrors the OMP implementation at
+    ``omp-src/packages/ai/src/utils/oauth/anthropic.ts:refreshAnthropicToken``.
+    Returns a dict with at least ``access_token``, ``refresh_token``,
+    ``expires_in`` seconds.  Raises on HTTP failure.
+    """
+    body = (
+        f"grant_type=refresh_token"
+        f"&client_id={_CLAUDE_CLIENT_ID}"
+        f"&refresh_token={urllib.parse.quote(refresh_token, safe='')}"
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        _CLAUDE_TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "anthropic-sdk-typescript/0.94.0 userOAuthProvider",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Anthropic OAuth refresh returned non-object: {raw[:200]}")
+    access = data.get("access_token")
+    new_refresh = data.get("refresh_token") or refresh_token
+    expires_in = int(data.get("expires_in") or 3600)
+    if not access:
+        raise RuntimeError(f"Anthropic OAuth refresh returned no access_token: {raw[:200]}")
+    return {
+        "access_token": access,
+        "refresh_token": new_refresh,
+        "expires_in": expires_in,
+    }
+
+
+def _maybe_refresh_claude_oauth() -> bool:
+    """Refresh the Claude OAuth token if it's expired.
+
+    The Claude Code CLI does NOT auto-refresh expired access tokens — when the
+    stored ``accessToken`` in ``.credentials.json`` is past its ``expiresAt``,
+    the CLI returns "Not logged in · Please run /login" and fails every request.
+    To keep the subprocess working, we proactively refresh using the stored
+    ``refreshToken`` and write the new ``accessToken`` / ``expiresAt`` back to
+    ``.credentials.json`` in place before each Claude CLI invocation.
+
+    The function is best-effort: any failure (no credentials, no refresh token,
+    HTTP error) is swallowed and logged, so a broken refresh can never break
+    the request path — it just means the next CLI invocation will hit the
+    same "Not logged in" error and the operator can fix credentials manually.
+
+    Returns True if a refresh was actually performed, False otherwise.
+    """
+    home = _resolve_home_dir()
+    creds_path = Path(home) / ".claude" / ".credentials.json"
+    if not creds_path.exists():
+        return False
+    with _claude_oauth_refresh_lock:
+        try:
+            data = json.loads(creds_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _logger.debug("claude_oauth: failed to read %s: %s", creds_path, exc)
+            return False
+        if not isinstance(data, dict):
+            return False
+        auth = data.get("claudeAiOauth")
+        if not isinstance(auth, dict):
+            return False
+        if not _claude_oauth_needs_refresh(auth):
+            return False
+        refresh_token = auth.get("refreshToken")
+        if not refresh_token:
+            _logger.debug("claude_oauth: no refresh_token in %s", creds_path)
+            return False
+        try:
+            result = _claude_oauth_refresh_token(refresh_token)
+        except Exception as exc:
+            _logger.warning(
+                "claude_oauth: refresh failed (%s); CLI may return 'Not logged in'",
+                exc,
+            )
+            return False
+        # Update the credentials dict in place and persist atomically.
+        auth["accessToken"] = result["access_token"]
+        auth["refreshToken"] = result["refresh_token"]
+        auth["expiresAt"] = int(time.time() * 1000) + int(result["expires_in"]) * 1000
+        try:
+            tmp_path = creds_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            try:
+                os.chmod(tmp_path, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp_path, creds_path)
+        except Exception as exc:
+            _logger.warning("claude_oauth: failed to persist refreshed creds: %s", exc)
+            return False
+        _logger.info(
+            "claude_oauth: refreshed access token, expires in %s seconds",
+            result["expires_in"],
+        )
+        return True
 
 
 def _format_messages_as_ndjson(
@@ -284,6 +421,12 @@ class ClaudeCodeClient:
         tool_choice: Any = None,
         **_: Any,
     ) -> Any:
+        # Proactively refresh the Claude OAuth access token before launching
+        # the subprocess. The CLI itself does NOT refresh expired tokens —
+        # when the stored accessToken has passed its expiresAt, the CLI just
+        # returns "Not logged in · Please run /login" and fails every request.
+        # Best-effort: a refresh failure is logged but does not abort the call.
+        _maybe_refresh_claude_oauth()
         # Map model hint to Claude Code model
         model_flag = MODEL_MAP.get(model or "sonnet", "claude-sonnet-4-6")
 
