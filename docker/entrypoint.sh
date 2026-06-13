@@ -73,6 +73,14 @@ if [ "$(id -u)" = "0" ]; then
 
         echo "Restored Claude Code CLI credentials from PVC backup"
     fi
+    # Symlink ~/.claude → hermes subprocess home so Claude CLI finds credentials.
+    # Without this the CLI looks at /root/.claude (or $HOME/.claude) and reports
+    # "Not logged in" even though credentials exist at ${HERMES_HOME}/home/.claude.
+    CLAUDE_USER_HOME="/home/$(stat -c %U "$HERMES_HOME" 2>/dev/null || echo tusker)"
+    if [ -d "${HERMES_HOME}/home/.claude" ] && [ ! -e "${CLAUDE_USER_HOME}/.claude" ]; then
+        ln -s "${HERMES_HOME}/home/.claude" "${CLAUDE_USER_HOME}/.claude" 2>/dev/null || true
+        echo "Symlinked ${CLAUDE_USER_HOME}/.claude → ${HERMES_HOME}/home/.claude"
+    fi
 
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
