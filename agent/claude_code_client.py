@@ -248,6 +248,22 @@ def _maybe_refresh_claude_oauth() -> bool:
             "claude_oauth: refreshed access token, expires in %s seconds",
             result["expires_in"],
         )
+        # Persist the new tokens back to .credentials.json so the next
+        # subprocess invocation uses the fresh access token instead of
+        # the expired one.  Without this write-back the refresh is a
+        # no-op — the old (expired) credentials stay on disk and every
+        # subsequent request fails with "Not logged in".
+        auth["accessToken"] = result["access_token"]
+        auth["refreshToken"] = result["refresh_token"]
+        auth["expiresAt"] = int(time.time() * 1000) + result["expires_in"] * 1000
+        auth.pop("last_refresh_error", None)
+        try:
+            creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as exc:
+            _logger.warning(
+                "claude_oauth: failed to persist refreshed tokens to %s: %s",
+                creds_path, exc,
+            )
         return True
 
 
