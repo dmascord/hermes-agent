@@ -19,11 +19,12 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-
+from datetime import datetime, timezone
 _logger = logging.getLogger(__name__)
 
 # Anthropic OAuth constants (decoded from base64: Claude Code clientId)
@@ -169,6 +170,82 @@ def _claude_oauth_refresh_token(refresh_token: str, *, timeout: float = 15.0) ->
     }
 
 
+def _persist_claude_tokens_to_auth_json(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+) -> None:
+    """Persist Claude tokens to hermes auth.json (source of truth).
+
+    The Claude CLI deletes .credentials.json on 401 — this file is
+    ephemeral.  auth.json (managed by hermes_cli.auth) is never touched
+    by the CLI, so it's always safe as a recovery source.
+    """
+    try:
+        from hermes_cli.auth import (
+            _load_auth_store,
+            _save_provider_state,
+            _save_auth_store,
+            _auth_store_lock,
+        )
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            _save_provider_state(auth_store, "claude-code-cli", {
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                },
+                "expires_at_ms": expires_at_ms,
+                "auth_mode": "oauth",
+            })
+            _save_auth_store(auth_store)
+        _logger.debug("claude_oauth: persisted tokens to auth.json")
+    except Exception as exc:
+        _logger.debug("claude_oauth: failed to persist to auth.json: %s", exc)
+
+
+def _recover_claude_tokens_from_auth_json() -> bool:
+    """Try to recover Claude tokens from auth.json when .credentials.json is missing.
+
+    The CLI deletes .credentials.json on 401.  If auth.json has a valid
+    refresh token, write it to .credentials.json so the next CLI call
+    succeeds without requiring manual re-auth.
+    """
+    home = _resolve_home_dir()
+    creds_path = Path(home) / ".claude" / ".credentials.json"
+    try:
+        from hermes_cli.auth import (
+            _load_auth_store,
+            _load_provider_state,
+            _auth_store_lock,
+        )
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            state = _load_provider_state(auth_store, "claude-code-cli") or {}
+        tokens = state.get("tokens", {})
+        access_token = tokens.get("access_token", "")
+        refresh_token = tokens.get("refresh_token", "")
+        if not refresh_token:
+            _logger.debug("claude_oauth: no refresh token in auth.json for recovery")
+            return False
+        # Write to .credentials.json so the CLI can use them
+        data = {
+            "claudeAiOauth": {
+                "accessToken": access_token,
+                "refreshToken": refresh_token,
+                "expiresAt": state.get("expires_at_ms", 0),
+            }
+        }
+        os.makedirs(creds_path.parent, exist_ok=True)
+        creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.chmod(creds_path, 0o600)
+        _logger.info("claude_oauth: recovered tokens from auth.json to %s", creds_path)
+        return True
+    except Exception as exc:
+        _logger.debug("claude_oauth: failed to recover from auth.json: %s", exc)
+        return False
+
+
 def _maybe_refresh_claude_oauth() -> bool:
     """Refresh the Claude OAuth token if it's expired.
 
@@ -179,70 +256,67 @@ def _maybe_refresh_claude_oauth() -> bool:
     ``refreshToken`` and write the new ``accessToken`` / ``expiresAt`` back to
     ``.credentials.json`` in place before each Claude CLI invocation.
 
-    The function is best-effort: any failure (no credentials, no refresh token,
-    HTTP error) is swallowed and logged, so a broken refresh can never break
-    the request path — it just means the next CLI invocation will hit the
-    same "Not logged in" error and the operator can fix credentials manually.
+    The refresh token is also persisted to ``auth.json`` (source of truth)
+    so that even if the CLI deletes ``.credentials.json`` on a 401, we can
+    always recover from auth.json on the next attempt.
 
     Returns True if a refresh was actually performed, False otherwise.
     """
     home = _resolve_home_dir()
     creds_path = Path(home) / ".claude" / ".credentials.json"
+
+    # If credentials file is missing, try to recover from auth.json
     if not creds_path.exists():
+        _logger.info("claude_oauth: .credentials.json missing — attempting recovery from auth.json")
+        if _recover_claude_tokens_from_auth_json():
+            return _maybe_refresh_claude_oauth()  # recursive: try refresh with recovered tokens
         return False
+
     with _claude_oauth_refresh_lock:
         try:
             data = json.loads(creds_path.read_text(encoding="utf-8"))
         except Exception as exc:
             _logger.debug("claude_oauth: failed to read %s: %s", creds_path, exc)
             return False
-        if not isinstance(data, dict):
-            return False
-        auth = data.get("claudeAiOauth")
-        if not isinstance(auth, dict):
-            return False
-        if not _claude_oauth_needs_refresh(auth):
-            return False
-        refresh_token = auth.get("refreshToken")
+        auth = data.get("claudeAiOauth", {})
+        access_token = auth.get("accessToken", "")
+        refresh_token = auth.get("refreshToken", "")
+        expires_at = auth.get("expiresAt", 0)
         if not refresh_token:
-            _logger.debug("claude_oauth: no refresh_token in %s", creds_path)
+            _logger.debug("claude_oauth: no refresh token — cannot refresh")
+            return False
+        now_ms = int(time.time() * 1000)
+        remaining_ms = expires_at - now_ms
+        # Only refresh if within 5 minutes of expiry (or already expired)
+        if remaining_ms > 5 * 60 * 1000:
+            _logger.debug("claude_oauth: token still valid for %.0fs — no refresh needed", remaining_ms / 1000)
             return False
         try:
             result = _claude_oauth_refresh_token(refresh_token)
         except urllib.error.HTTPError as exc:
-            # Anthropic returns 400 with body {"error":"invalid_grant",...}
-            # when the refresh token has been consumed/revoked.  This is
-            # unrecoverable until the user re-runs `claude /login` (or the
-            # equivalent OAuth device flow).  Surface the body in the log
-            # and persist it to .credentials.json so the gateway can show
-            # the operator which Claude account needs re-auth.
-            err_body = ""
-            try:
-                err_body = exc.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                pass
-            auth["last_refresh_error"] = {
-                "code": exc.code,
-                "body": err_body,
-                "at": int(time.time() * 1000),
-            }
+            error_body = exc.read().decode("utf-8", errors="replace")
             _logger.warning(
-                "claude_oauth: refresh failed (HTTP %s); body=%s. "
-                "Run `claude /login` to re-authorise.",
-                exc.code, err_body,
+                "claude_oauth: refresh HTTP %d: %s", exc.code, error_body[:200],
             )
-            # Best-effort: persist the error so subsequent gateway
-            # calls / health checks can surface it without re-trying.
+            # Record the error in the credentials file for operator visibility
+            data.setdefault("claudeAiOauth", {})["last_refresh_error"] = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "http_code": exc.code,
+                "error": error_body[:200],
+            }
             try:
                 creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
             except Exception:
                 pass
+            # If the refresh token is dead (invalid_grant), persist the error
+            # to auth.json for operator visibility
+            if exc.code in (400, 401):
+                _persist_claude_tokens_to_auth_json(
+                    access_token="", refresh_token="", expires_at_ms=0,
+                )
             return False
         except Exception as exc:
-            _logger.warning(
-                "claude_oauth: refresh failed (%s); CLI may return 'Not logged in'",
-                exc,
-            )
+            _logger.warning("claude_oauth: refresh failed: %s", exc)
             return False
         _logger.info(
             "claude_oauth: refreshed access token, expires in %s seconds",
@@ -250,9 +324,7 @@ def _maybe_refresh_claude_oauth() -> bool:
         )
         # Persist the new tokens back to .credentials.json so the next
         # subprocess invocation uses the fresh access token instead of
-        # the expired one.  Without this write-back the refresh is a
-        # no-op — the old (expired) credentials stay on disk and every
-        # subsequent request fails with "Not logged in".
+        # the expired one.
         auth["accessToken"] = result["access_token"]
         auth["refreshToken"] = result["refresh_token"]
         auth["expiresAt"] = int(time.time() * 1000) + result["expires_in"] * 1000
@@ -279,6 +351,12 @@ def _maybe_refresh_claude_oauth() -> bool:
                 "claude_oauth: failed to persist refreshed tokens to %s: %s",
                 creds_path, exc,
             )
+        # Also persist to auth.json (source of truth) — survives CLI 401 deletions
+        _persist_claude_tokens_to_auth_json(
+            result["access_token"],
+            result["refresh_token"],
+            int(time.time() * 1000) + result["expires_in"] * 1000,
+        )
         return True
 
 
