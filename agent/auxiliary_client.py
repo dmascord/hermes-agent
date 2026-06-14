@@ -2260,10 +2260,18 @@ def resolve_provider_client(
             return False
         if api_mode == "codex_responses":
             return True
-        # Auto-detect: api.openai.com + codex model name pattern
+        # Auto-detect: base URL matches a known Codex endpoint.
+        # Covers both api.openai.com (official) and chatgpt.com/backend-api/codex
+        # (ChatGPT's backend, used by the Hermes gateway for Codex passthrough).
         if api_mode and api_mode != "codex_responses":
             return False  # explicit non-codex mode
-        if base_url_hostname(base_url_str) == "api.openai.com":
+        _hostname = base_url_hostname(base_url_str)
+        _base_lower = (base_url_str or "").lower()
+        _is_codex_endpoint = (
+            _hostname == "api.openai.com"
+            or "chatgpt.com/backend-api/codex" in _base_lower
+        )
+        if _is_codex_endpoint:
             model_lower = (model_str or "").lower()
             if "codex" in model_lower:
                 return True
