@@ -5242,13 +5242,6 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             skip_memory=skip_memory,
             skip_context_files=skip_context_files,
-            tools=tools,
-            tool_choice=tool_choice,
-            external_tool_mode=external_tool_mode,
-            # In provider mode the client manages its own context, so
-            # disable the agent's built-in context compression to avoid
-            # redundant cloud LLM calls and unnecessary latency.
-            compression_enabled=False if provider_mode else None,
         )
         _t_aiagent_done = time.time()
         logger.info("[timing] _create_agent AIAgent.__init__: %.3fs", _t_aiagent_done - _t_aiagent)
@@ -8328,7 +8321,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     logger.warning("[hermes-code] passthrough %s failed: %s", provider_model, exc)
                     continue
 
-            if passthrough_error:
+            if passthrough_error or not _pt_call_count[0]:
+                if not passthrough_error:
+                    passthrough_error = Exception("no passthrough providers available (all skipped or missing credentials)")
                 _err_msg = str(passthrough_error)
                 if _is_prompt_too_long_error(_err_msg):
                     logger.warning(
