@@ -6801,6 +6801,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 )
                             response_obj = await _s_loop.run_in_executor(None, _gemini_audio_call)
                         elif prov == "openai-codex":
+                            _skip_normal_call = True  # Uses _call_codex_passthrough, not call_llm
                             response_obj = await _s_loop.run_in_executor(
                                 None,
                                 lambda: _call_codex_passthrough(
@@ -6834,6 +6835,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 logger.warning("[hermes-code][req=%s] claude-code-cli credential resolution failed: %s", _req_id, _cc_exc)
                                 _cc_client = None
                             if _cc_client is not None:
+                                _skip_normal_call = True  # Uses ClaudeCodeClient, not call_llm
                                 logger.info("[hermes-code][req=%s] claude-code-cli invoking subprocess for model=%s", _req_id, resolved_model)
                                 def _claude_code_call(_c=_cc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
                                     return _c.chat.completions.create(
