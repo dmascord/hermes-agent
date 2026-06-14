@@ -6080,8 +6080,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if model_name.startswith("github-copilot") or model_name.startswith("copilot-"):
                 pass  # Already added above
             # Then HERMES_CODE_MODEL as the actual runtime model for hermes-code
+            # (skipped in strict mode — the explicit user request is honored alone)
             primary = os.getenv("HERMES_CODE_MODEL", "").strip()
-            if primary and "/" in primary and primary not in _passthrough_models:
+            if not _strict_mode and primary and "/" in primary and primary not in _passthrough_models:
                 _passthrough_models.append(primary)
             if not _strict_mode:
                 _cool = []
@@ -7896,6 +7897,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                 timeout=300,
                             ),
                         )
+                        try:
+                            from agent.model_cooldown_db import mark_provider_success
+                            mark_provider_success(prov, resolved_model, base_url=base_url or "")
+                        except Exception:
+                            pass
+                        try:
+                            from agent.model_quality_db import record_success
+                            record_success(prov, provider_model, base_url=base_url or "", latency_ms=0)
+                        except Exception:
+                            pass
                     elif prov == "claude-code-cli":
                         # Claude Code CLI — external process provider (non-streaming variant).
                         logger.info("[hermes-code][req=%s] claude-code-cli ns dispatch: prov=%s", _req_id, prov)
