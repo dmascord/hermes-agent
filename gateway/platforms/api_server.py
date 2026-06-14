@@ -6054,9 +6054,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 len(passthrough_tools) if passthrough_tools else 0,
             )
             # Build passthrough provider chain from HERMES_CODE_MODEL and HERMES_CODE_FALLBACK_*
-            # Build passthrough provider chain from HERMES_CODE_MODEL and HERMES_CODE_FALLBACK_*
             # Put user's requested model FIRST, then HERMES_CODE_MODEL as primary, then fallbacks
             _passthrough_models: List[str] = []
+            _strict_mode = False  # when True, only the explicitly-requested model is tried
             # User's requested model goes first (unless already in chain)
             if model_name == "hermes-code":
                 selected_code_model = _select_hermes_code_model(
@@ -6070,6 +6070,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     _passthrough_models.append(selected_code_model)
             elif model_name and "/" in model_name and model_name not in _passthrough_models:
                 _passthrough_models.append(model_name)
+                _strict_mode = True  # explicit model — no silent fallback
+                logger.info(
+                    "[hermes-code][req=%s] strict mode: explicit model %s requested, "
+                    "fallback chain will be skipped",
+                    _req_id, model_name,
+                )
             # Copernican copilot models go next (user's personal API)
             if model_name.startswith("github-copilot") or model_name.startswith("copilot-"):
                 pass  # Already added above
@@ -6077,28 +6083,25 @@ class APIServerAdapter(BasePlatformAdapter):
             primary = os.getenv("HERMES_CODE_MODEL", "").strip()
             if primary and "/" in primary and primary not in _passthrough_models:
                 _passthrough_models.append(primary)
-            # Then fallback chain — filter through cooldown check so we skip
-            # models that will be rejected anyway.  Uses lightweight DB-only
-            # cooldown check (not the heavier _hermes_code_model_is_selectable
-            # which loads credential pools and catalog checks).
-            _cool = []
-            try:
-                from agent.model_cooldown_db import model_cooldown_remaining
-                for idx in range(1, 36):
-                    fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
-                    if fb and fb not in _passthrough_models:
-                        _prov = fb.split("/")[0] if "/" in fb else ""
-                        _rem = model_cooldown_remaining(_prov, fb) if _prov else 0
-                        if _rem and _rem > 0:
-                            logger.debug("[hermes-code] passthrough: skipping %s in cooldown (%.0fs)", fb, _rem)
-                            continue
-                        _passthrough_models.append(fb)
-            except Exception:
-                # Fallback: add all models without checking (original behaviour)
-                for idx in range(1, 36):
-                    fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
-                    if fb and fb not in _passthrough_models:
-                        _passthrough_models.append(fb)
+            if not _strict_mode:
+                _cool = []
+                try:
+                    from agent.model_cooldown_db import model_cooldown_remaining
+                    for idx in range(1, 36):
+                        fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
+                        if fb and fb not in _passthrough_models:
+                            _prov = fb.split("/")[0] if "/" in fb else ""
+                            _rem = model_cooldown_remaining(_prov, fb) if _prov else 0
+                            if _rem and _rem > 0:
+                                logger.debug("[hermes-code] passthrough: skipping %s in cooldown (%.0fs)", fb, _rem)
+                                continue
+                            _passthrough_models.append(fb)
+                except Exception:
+                    # Fallback: add all models without checking (original behaviour)
+                    for idx in range(1, 36):
+                        fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
+                        if fb and fb not in _passthrough_models:
+                            _passthrough_models.append(fb)
             # ── Quality-based reordering + quality floor ─────────────────────────
             # Sort the REST of the chain by live quality score (best first), then
             # drop any non-pinned model whose score is below the floor — they
@@ -6107,7 +6110,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # so the explicit request is always honoured first, even if its
             # recorded score is low (e.g. brand-new model, or model currently
             # being debugged).
-            if len(_passthrough_models) > 1:
+            if not _strict_mode and len(_passthrough_models) > 1:
                 try:
                     from agent.model_quality_db import get_quality_score
                     _pinned = _passthrough_models[0]  # user's request or HERMES_CODE_MODEL
