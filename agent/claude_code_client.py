@@ -257,6 +257,21 @@ def _maybe_refresh_claude_oauth() -> bool:
         auth["refreshToken"] = result["refresh_token"]
         auth["expiresAt"] = int(time.time() * 1000) + result["expires_in"] * 1000
         auth.pop("last_refresh_error", None)
+        # Guard against clobbering with stale backups or race conditions:
+        # only persist if we are writing a genuinely newer token window.
+        try:
+            _disk_creds = json.loads(creds_path.read_text(encoding="utf-8"))
+            _disk_auth = _disk_creds.get("claudeAiOauth", {})
+            if _disk_auth.get("expiresAt", 0) > auth.get("expiresAt", 0):
+                _logger.warning(
+                    "claude_oauth: skipping write — disk has newer tokens (disk=%s, refresh=%s). "
+                    "This may indicate a stale backup restoration.",
+                    _disk_auth.get("expiresAt"), auth["expiresAt"]
+                )
+                return True
+        except Exception as _exc:
+            _logger.debug("claude_oauth: could not verify disk age: %s", _exc)
+
         try:
             creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as exc:
