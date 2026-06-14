@@ -169,17 +169,21 @@ def _claude_oauth_refresh_token(refresh_token: str, *, timeout: float = 15.0) ->
         "expires_in": expires_in,
     }
 
-
-def _persist_claude_tokens_to_auth_json(
-    access_token: str,
-    refresh_token: str,
+def _persist_claude_credentials_to_auth_json(
+    full_credentials: dict[str, Any],
     expires_at_ms: int,
 ) -> None:
-    """Persist Claude tokens to hermes auth.json (source of truth).
+    """Persist the full Claude credentials dict to hermes auth.json.
 
-    The Claude CLI deletes .credentials.json on 401 — this file is
-    ephemeral.  auth.json (managed by hermes_cli.auth) is never touched
-    by the CLI, so it's always safe as a recovery source.
+    The Claude CLI requires several fields in .credentials.json beyond just
+    the access/refresh tokens — ``scopes``, ``subscriptionType``,
+    ``rateLimitTier`` are all needed for the CLI to consider the session
+    valid.  We persist the full claudeAiOauth dict so we can rebuild the
+    .credentials.json file byte-for-byte on recovery.
+
+    The Claude CLI deletes .credentials.json on 401 — auth.json (managed by
+    hermes_cli.auth) is never touched by the CLI, so it's always safe as
+    a recovery source.
     """
     try:
         from hermes_cli.auth import (
@@ -191,25 +195,23 @@ def _persist_claude_tokens_to_auth_json(
         with _auth_store_lock():
             auth_store = _load_auth_store()
             _save_provider_state(auth_store, "claude-code-cli", {
-                "tokens": {
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                },
+                "full_credentials": full_credentials,
                 "expires_at_ms": expires_at_ms,
                 "auth_mode": "oauth",
             })
             _save_auth_store(auth_store)
-        _logger.debug("claude_oauth: persisted tokens to auth.json")
+        _logger.debug("claude_oauth: persisted full credentials to auth.json")
     except Exception as exc:
         _logger.debug("claude_oauth: failed to persist to auth.json: %s", exc)
 
 
 def _recover_claude_tokens_from_auth_json() -> bool:
-    """Try to recover Claude tokens from auth.json when .credentials.json is missing.
+    """Try to recover Claude credentials from auth.json when .credentials.json is missing.
 
-    The CLI deletes .credentials.json on 401.  If auth.json has a valid
-    refresh token, write it to .credentials.json so the next CLI call
-    succeeds without requiring manual re-auth.
+    The CLI deletes .credentials.json on 401.  If auth.json has a saved
+    full credential dict (including scopes, subscriptionType, etc.),
+    write it to .credentials.json so the next CLI call succeeds without
+    requiring manual re-auth.
     """
     home = _resolve_home_dir()
     creds_path = Path(home) / ".claude" / ".credentials.json"
@@ -222,13 +224,33 @@ def _recover_claude_tokens_from_auth_json() -> bool:
         with _auth_store_lock():
             auth_store = _load_auth_store()
             state = _load_provider_state(auth_store, "claude-code-cli") or {}
+
+        # Try the new full_credentials format first
+        full_creds = state.get("full_credentials", {})
+        if full_creds.get("accessToken") and full_creds.get("refreshToken"):
+            data = {"claudeAiOauth": full_creds}
+            os.makedirs(creds_path.parent, exist_ok=True)
+            creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.chmod(creds_path, 0o600)
+            expires_ms = state.get("expires_at_ms", 0)
+            remaining_h = max(0, (expires_ms / 1000 - time.time()) / 3600)
+            _logger.info(
+                "claude_oauth: recovered full credentials from auth.json to %s "
+                "(access_token=%s..., expires_in=%.1fh, scopes=%d)",
+                creds_path,
+                full_creds["accessToken"][:25],
+                remaining_h,
+                len(full_creds.get("scopes", [])),
+            )
+            return True
+
+        # Fall back to legacy tokens format (3-field only, for compatibility)
         tokens = state.get("tokens", {})
         access_token = tokens.get("access_token", "")
         refresh_token = tokens.get("refresh_token", "")
         if not refresh_token:
-            _logger.debug("claude_oauth: no refresh token in auth.json for recovery")
+            _logger.debug("claude_oauth: no credentials in auth.json for recovery")
             return False
-        # Write to .credentials.json so the CLI can use them
         data = {
             "claudeAiOauth": {
                 "accessToken": access_token,
@@ -242,8 +264,8 @@ def _recover_claude_tokens_from_auth_json() -> bool:
         expires_ms = state.get("expires_at_ms", 0)
         remaining_h = max(0, (expires_ms / 1000 - time.time()) / 3600)
         _logger.info(
-            "claude_oauth: recovered tokens from auth.json to %s "
-            "(access_token=%s..., expires_in=%.1fh)",
+            "claude_oauth: recovered legacy tokens from auth.json to %s "
+            "(access_token=%s..., expires_in=%.1fh, WARNING: missing scopes)",
             creds_path,
             access_token[:25],
             remaining_h,
@@ -320,11 +342,11 @@ def _maybe_refresh_claude_oauth() -> bool:
                 creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
             except Exception:
                 pass
-            # If the refresh token is dead (invalid_grant), persist the error
-            # to auth.json for operator visibility
+            # If the refresh token is dead (invalid_grant), write a tombstone
+            # to auth.json to prevent repeated failed attempts
             if exc.code in (400, 401):
-                _persist_claude_tokens_to_auth_json(
-                    access_token="", refresh_token="", expires_at_ms=0,
+                _persist_claude_credentials_to_auth_json(
+                    full_credentials={}, expires_at_ms=0,
                 )
             return False
         except Exception as exc:
@@ -364,10 +386,9 @@ def _maybe_refresh_claude_oauth() -> bool:
                 creds_path, exc,
             )
         # Also persist to auth.json (source of truth) — survives CLI 401 deletions
-        _persist_claude_tokens_to_auth_json(
-            result["access_token"],
-            result["refresh_token"],
-            int(time.time() * 1000) + result["expires_in"] * 1000,
+        _persist_claude_credentials_to_auth_json(
+            full_credentials=data.get("claudeAiOauth", auth),
+            expires_at_ms=auth["expiresAt"],
         )
         return True
 
