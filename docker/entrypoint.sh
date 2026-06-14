@@ -73,14 +73,18 @@ if [ "$(id -u)" = "0" ]; then
 
         echo "Restored Claude Code CLI credentials from PVC backup"
     fi
-    # Symlink ~/.claude → hermes subprocess home so Claude CLI finds credentials.
-    # Without this the CLI looks at /root/.claude (or $HOME/.claude) and reports
-    # "Not logged in" even though credentials exist at ${HERMES_HOME}/home/.claude.
-    CLAUDE_USER_HOME="/home/$(stat -c %U "$HERMES_HOME" 2>/dev/null || echo tusker)"
-    if [ -d "${HERMES_HOME}/home/.claude" ] && [ ! -e "${CLAUDE_USER_HOME}/.claude" ]; then
-        ln -s "${HERMES_HOME}/home/.claude" "${CLAUDE_USER_HOME}/.claude" 2>/dev/null || true
-        echo "Symlinked ${CLAUDE_USER_HOME}/.claude → ${HERMES_HOME}/home/.claude"
-    fi
+    # Symlink ~/.claude → hermes subprocess home so Claude CLI finds credentials
+    # for direct shell invocations. The gateway path resolves HOME via
+    # _resolve_home_dir(), but CLI invocations outside the gateway use $HOME.
+    # Try several likely home paths (HERMES_UID user, then fall back to tusker,
+    # then hermes) so the symlink lands wherever the running process is homed.
+    HERMES_UID_NAME="$(stat -c %U "$HERMES_HOME" 2>/dev/null || echo hermes)"
+    for _candidate in "/home/${HERMES_UID_NAME}" "/home/tusker" "/home/hermes" "/root"; do
+        if [ -d "${HERMES_HOME}/home/.claude" ] && [ ! -e "${_candidate}/.claude" ] && [ -d "${_candidate}" ]; then
+            ln -s "${HERMES_HOME}/home/.claude" "${_candidate}/.claude" 2>/dev/null && \
+                echo "Symlinked ${_candidate}/.claude → ${HERMES_HOME}/home/.claude" && break
+        fi
+    done
 
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"

@@ -3412,18 +3412,37 @@ def _save_codex_tokens(
     with _auth_store_lock():
         auth_store = _load_auth_store()
         state = _load_provider_state(auth_store, "openai-codex") or {}
-        state["tokens"] = tokens
-        state["last_refresh"] = last_refresh
-        state["auth_mode"] = "chatgpt"
-        if label and str(label).strip():
-            state["label"] = str(label).strip()
+        # Guard against clobbering newer Codex tokens in auth.json with stale
+        # callers (e.g. backup restores, race conditions, expired-then-saved
+        # refreshes).  Compare the expires_at_ms we'll be writing against
+        # what's already on disk; refuse to overwrite a longer-lived window.
         if isinstance(expires_in, (int, float)) and expires_in > 0:
             import time as _time
-            _exp_ms = int(_time.time() * 1000) + int(expires_in * 1000)
-            state["expires_at_ms"] = _exp_ms
+            _incoming_exp_ms = int(_time.time() * 1000) + int(expires_in * 1000)
+            _disk_exp_ms = state.get("expires_at_ms", 0) or 0
+            if _disk_exp_ms > _incoming_exp_ms:
+                logger.debug(
+                    "codex_auth: skipping auth.json overwrite — disk has newer "
+                    "Codex tokens (disk_expires_at_ms=%s, incoming_expires_at_ms=%s). "
+                    "This may indicate a stale backup restoration.",
+                    _disk_exp_ms, _incoming_exp_ms,
+                )
+                return
+            state["tokens"] = tokens
+            state["last_refresh"] = last_refresh
+            state["auth_mode"] = "chatgpt"
+            if label and str(label).strip():
+                state["label"] = str(label).strip()
+            state["expires_at_ms"] = _incoming_exp_ms
             state["expires_at"] = datetime.fromtimestamp(
-                _exp_ms / 1000, tz=timezone.utc
+                _incoming_exp_ms / 1000, tz=timezone.utc
             ).isoformat().replace("+00:00", "Z")
+        else:
+            state["tokens"] = tokens
+            state["last_refresh"] = last_refresh
+            state["auth_mode"] = "chatgpt"
+            if label and str(label).strip():
+                state["label"] = str(label).strip()
         _save_provider_state(auth_store, "openai-codex", state)
         # Compute expires_in once for the sync — also derive it from
         # the freshly-stored state if not explicitly provided.
