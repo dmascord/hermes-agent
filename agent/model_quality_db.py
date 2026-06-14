@@ -124,9 +124,10 @@ def _compute_quality_score(
     """Compute a 0-100 quality score from metrics.
 
     Score components:
-    - Success rate: 0-50 points (50 * success_rate)
-    - Tool reliability: 0-30 points (30 * (1 - text_only_rate))
+    - Success rate: 0-80 points (80 * success_rate)
     - Latency: 0-20 points (20 * latency_bonus)
+    - Text-only responses are recorded but no longer penalise quality (ambiguous signal).
+    - Cooldown (2 min) still applies to prevent wasted retries on the current request.
 
     A model with 100% success, 0% text-only, and <5s latency gets 100.
     A model with 0% success gets 0.
@@ -141,9 +142,7 @@ def _compute_quality_score(
 
     score = 0.0
     # Success rate component (50 points max)
-    score += 50.0 * success_rate
-    # Tool reliability component (30 points max)
-    score += 30.0 * (1.0 - min(text_only_rate, 1.0))
+    score += 80.0 * success_rate
     # Latency component (20 points max) — <5s = 20, >30s = 0
     latency_s = avg_latency_ms / 1000.0
     latency_bonus = max(0.0, min(1.0, (30.0 - latency_s) / 25.0))
