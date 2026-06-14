@@ -248,6 +248,7 @@ def _recover_claude_tokens_from_auth_json() -> bool:
             access_token[:25],
             remaining_h,
         )
+        return True
     except Exception as exc:
         _logger.debug("claude_oauth: failed to recover from auth.json: %s", exc)
         return False
