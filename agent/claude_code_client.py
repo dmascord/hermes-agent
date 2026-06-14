@@ -239,8 +239,15 @@ def _recover_claude_tokens_from_auth_json() -> bool:
         os.makedirs(creds_path.parent, exist_ok=True)
         creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.chmod(creds_path, 0o600)
-        _logger.info("claude_oauth: recovered tokens from auth.json to %s", creds_path)
-        return True
+        expires_ms = state.get("expires_at_ms", 0)
+        remaining_h = max(0, (expires_ms / 1000 - time.time()) / 3600)
+        _logger.info(
+            "claude_oauth: recovered tokens from auth.json to %s "
+            "(access_token=%s..., expires_in=%.1fh)",
+            creds_path,
+            access_token[:25],
+            remaining_h,
+        )
     except Exception as exc:
         _logger.debug("claude_oauth: failed to recover from auth.json: %s", exc)
         return False
@@ -269,7 +276,11 @@ def _maybe_refresh_claude_oauth() -> bool:
     if not creds_path.exists():
         _logger.info("claude_oauth: .credentials.json missing — attempting recovery from auth.json")
         if _recover_claude_tokens_from_auth_json():
-            return _maybe_refresh_claude_oauth()  # recursive: try refresh with recovered tokens
+            # Credentials restored.  We intentionally skip the HTTP refresh
+            # here — the recovered token is fresh (auth.json is the source of
+            # truth and only written with valid tokens).  Return True so callers
+            # know credentials are now available.
+            return True
         return False
 
     with _claude_oauth_refresh_lock:
