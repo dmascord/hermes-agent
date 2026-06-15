@@ -50,6 +50,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -6830,14 +6831,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 ),
                             )
                         elif prov == "claude-code-cli":
-                            # Claude Code CLI — external process provider.
-                            # Resolve credentials via the external_process path and
-                            # invoke the ClaudeCodeClient which runs `claude -p`.
-                            logger.info("[hermes-code][req=%s] claude-code-cli dispatch: prov=%s base_url=%s", _req_id, prov, base_url)
+                            # Claude Code CLI — MCP bridge mode.
+                            # Uses run_with_tool_bridge generator to handle
+                            # multi-turn tool calling via the MCP proxy.
+                            logger.info("[hermes-code][req=%s] claude-code-cli bridge dispatch: prov=%s base_url=%s", _req_id, prov, base_url)
                             try:
                                 from hermes_cli.auth import resolve_external_process_provider_credentials
                                 _cc_creds = resolve_external_process_provider_credentials("claude-code-cli")
-                                logger.info("[hermes-code][req=%s] claude-code-cli creds: command=%s args=%s", _req_id, _cc_creds.get("command"), _cc_creds.get("args"))
                                 from agent.claude_code_client import ClaudeCodeClient
                                 _cc_client = ClaudeCodeClient(
                                     api_key=_cc_creds.get("api_key", "claude-code-cli"),
@@ -6846,22 +6846,103 @@ class APIServerAdapter(BasePlatformAdapter):
                                     args=_cc_creds.get("args"),
                                 )
                             except Exception as _cc_exc:
-                                logger.warning("[hermes-code][req=%s] claude-code-cli credential resolution failed: %s", _req_id, _cc_exc)
+                                logger.warning("[hermes-code][req=%s] claude-code-cli bridge credential resolution failed: %s", _req_id, _cc_exc)
                                 _cc_client = None
                             if _cc_client is not None:
-                                _skip_normal_call = True  # Uses ClaudeCodeClient, not call_llm
-                                logger.info("[hermes-code][req=%s] claude-code-cli invoking subprocess for model=%s", _req_id, resolved_model)
-                                def _claude_code_call(_c=_cc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
-                                    return _c.chat.completions.create(
-                                        model=_m,
-                                        messages=_msgs,
-                                        tools=_tools,
-                                        timeout=300,
-                                    )
-                                response_obj = await _s_loop.run_in_executor(None, _claude_code_call)
-                                logger.info("[hermes-code][req=%s] claude-code-cli subprocess returned: %s", _req_id, type(response_obj).__name__)
+                                _skip_normal_call = True
+                                logger.info("[hermes-code][req=%s] claude-code-cli bridge starting for model=%s", _req_id, resolved_model)
+                                # Run the bridge generator in a thread, collect events via asyncio queue
+                                _bridge_events: asyncio.Queue = asyncio.Queue()
+                                _bridge_error: list[Exception] = []
+                                def _run_bridge(_c=_cc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                                    try:
+                                        gen = _c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools)
+                                        for event in gen:
+                                            _bridge_events.put_nowait(event)
+                                    except Exception as exc:
+                                        _bridge_error.append(exc)
+                                        _bridge_events.put_nowait({"type": "error", "message": str(exc)})
+                                    finally:
+                                        _bridge_events.put_nowait({"type": "_done"})
+                                _bridge_thread = threading.Thread(target=_run_bridge, daemon=True)
+                                _bridge_thread.start()
+                                # Process events from the bridge
+                                _bridge_final_text = ""
+                                _bridge_usage = {}
+                                _bridge_model = resolved_model
+                                _bridge_tool_calls: list[dict] = []
+                                while True:
+                                    _be = await _bridge_events.get()
+                                    if _be is None or _be.get("type") == "_done":
+                                        break
+                                    _bt = _be.get("type")
+                                    if _bt == "tool_call":
+                                        # Yield tool_call to OMP client
+                                        _call_id = _be.get("call_id", "")
+                                        _tool_name = _be.get("name", "")
+                                        _tool_args = _be.get("arguments", {})
+                                        _tc = {
+                                            "id": _call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": _tool_name,
+                                                "arguments": json.dumps(_tool_args),
+                                            },
+                                        }
+                                        _bridge_tool_calls.append(_tc)
+                                        _tc_chunk = {
+                                            "id": completion_id, "object": "chat.completion.chunk",
+                                            "created": created, "model": model_name,
+                                            "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
+                                        }
+                                        await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                        # The bridge blocks waiting for result file.
+                                        # We write a placeholder result so the CLI continues.
+                                        if _cc_client._queue_out_dir:
+                                            _result_path = os.path.join(_cc_client._queue_out_dir, f"{_call_id}.json")
+                                            try:
+                                                _placeholder = {"content": f"[Tool {_tool_name} called with {_tool_args}]"}
+                                                with open(_result_path, "w") as _rf:
+                                                    json.dump(_placeholder, _rf)
+                                            except Exception as _re:
+                                                logger.warning("[hermes-code] bridge: failed to write placeholder result: %s", _re)
+                                    elif _bt == "assistant_text":
+                                        _text = _be.get("text", "")
+                                        if _text:
+                                            _bridge_final_text += _text
+                                            _text_chunk = {
+                                                "id": completion_id, "object": "chat.completion.chunk",
+                                                "created": created, "model": model_name,
+                                                "choices": [{"index": 0, "delta": {"content": _text}, "finish_reason": None}],
+                                            }
+                                            await response.write(f"data: {json.dumps(_text_chunk)}\n\n".encode())
+                                    elif _bt == "final":
+                                        _bridge_final_text = _be.get("text", _bridge_final_text)
+                                        _bridge_usage = _be.get("usage", {})
+                                        _bridge_model = _be.get("model", _bridge_model)
+                                    elif _bt == "error":
+                                        logger.warning("[hermes-code] claude-code-cli bridge error: %s", _be.get("message"))
+                                # Build response_obj for downstream processing
+                                _bridge_usage_ns = SimpleNamespace(
+                                    prompt_tokens=int(_bridge_usage.get("input_tokens", 0) or 0),
+                                    completion_tokens=int(_bridge_usage.get("output_tokens", 0) or 0),
+                                    total_tokens=int((_bridge_usage.get("input_tokens", 0) or 0) + (_bridge_usage.get("output_tokens", 0) or 0)),
+                                )
+                                _bridge_msg = SimpleNamespace(
+                                    content=_bridge_final_text,
+                                    tool_calls=_bridge_tool_calls if _bridge_tool_calls else None,
+                                )
+                                _bridge_choice = SimpleNamespace(
+                                    message=_bridge_msg,
+                                    finish_reason="tool_calls" if _bridge_tool_calls else "stop",
+                                )
+                                response_obj = SimpleNamespace(
+                                    choices=[_bridge_choice],
+                                    usage=_bridge_usage_ns,
+                                    model=_bridge_model,
+                                )
+                                logger.info("[hermes-code][req=%s] claude-code-cli bridge completed: text_len=%d tool_calls=%d", _req_id, len(_bridge_final_text), len(_bridge_tool_calls))
                             else:
-                                # Fall through to next provider
                                 logger.warning("[hermes-code][req=%s] claude-code-cli: no client, falling through", _req_id)
                                 continue
                         else:
@@ -7118,7 +7199,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         # skip past it on the current request and avoid the worst
                         # case where 30+ models each return text-only in sequence.
                         if passthrough_tools and (not tool_calls_out or _has_empty_bash_tool_call(tool_calls_out)):
-                            if not tool_calls_out:
+                            # claude-code-cli is an agent, not a model API.
+                            # The CLI itself executes tools (Bash, Read, etc.) and returns
+                            # the final answer as text.  Don't penalise it for text-only —
+                            # the "tool calls" happened inside the subprocess.
+                            _is_claude_code = provider_model.startswith("claude-code-cli")
+                            if not _is_claude_code and not tool_calls_out:
                                 logger.warning(
                                     "[hermes-code] %s returned text-only (no tool calls) despite tools being provided, "
                                     "returning text and marking as bad tool-caller",
@@ -7153,6 +7239,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 except Exception:
                                     pass
                                 # Return text to client, let quality DB track text-only rate
+                            elif _is_claude_code:
+                                logger.info(
+                                    "[hermes-code] claude-code-cli: text-only response accepted (CLI executes tools internally)",
+                                    provider_model,
+                                )
                             else:
                                 logger.warning(
                                     "[hermes-code] %s returned bash with empty command despite tools being provided, "
@@ -7918,8 +8009,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
                     elif prov == "claude-code-cli":
-                        # Claude Code CLI — external process provider (non-streaming variant).
-                        logger.info("[hermes-code][req=%s] claude-code-cli ns dispatch: prov=%s", _req_id, prov)
+                        # Claude Code CLI — MCP bridge mode (non-streaming).
+                        logger.info("[hermes-code][req=%s] claude-code-cli ns bridge dispatch: prov=%s", _req_id, prov)
                         try:
                             from hermes_cli.auth import resolve_external_process_provider_credentials
                             _cc_creds_ns = resolve_external_process_provider_credentials("claude-code-cli")
@@ -7931,19 +8022,52 @@ class APIServerAdapter(BasePlatformAdapter):
                                 args=_cc_creds_ns.get("args"),
                             )
                         except Exception as _cc_exc:
-                            logger.warning("[hermes-code][req=%s] claude-code-cli ns credential resolution failed: %s", _req_id, _cc_exc)
+                            logger.warning("[hermes-code][req=%s] claude-code-cli ns bridge credential resolution failed: %s", _req_id, _cc_exc)
                             _cc_client_ns = None
                         if _cc_client_ns is not None:
-                            logger.info("[hermes-code][req=%s] claude-code-cli ns invoking subprocess for model=%s", _req_id, resolved_model)
-                            def _claude_code_call_ns(_c=_cc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
-                                return _c.chat.completions.create(
-                                    model=_m,
-                                    messages=_msgs,
-                                    tools=_tools,
-                                    timeout=300,
-                                )
-                            response_obj = await _ns_loop.run_in_executor(None, _claude_code_call_ns)
-                            logger.info("[hermes-code][req=%s] claude-code-cli ns subprocess returned: %s", _req_id, type(response_obj).__name__)
+                            _skip_normal_call = True
+                            _bridge_final_text_ns = ""
+                            _bridge_usage_ns = {}
+                            _bridge_model_ns = resolved_model
+                            _bridge_tool_calls_ns: list[dict] = []
+                            def _run_bridge_ns(_c=_cc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                                events = list(_c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools))
+                                return events
+                            _ns_events = await _ns_loop.run_in_executor(None, _run_bridge_ns)
+                            for _be in _ns_events:
+                                _bt = _be.get("type")
+                                if _bt == "tool_call":
+                                    _tc = {
+                                        "id": _be.get("call_id", ""),
+                                        "type": "function",
+                                        "function": {
+                                            "name": _be.get("name", ""),
+                                            "arguments": json.dumps(_be.get("arguments", {})),
+                                        },
+                                    }
+                                    _bridge_tool_calls_ns.append(_tc)
+                                elif _bt == "assistant_text":
+                                    _bridge_final_text_ns += _be.get("text", "")
+                                elif _bt == "final":
+                                    _bridge_final_text_ns = _be.get("text", _bridge_final_text_ns)
+                                    _bridge_usage_ns = _be.get("usage", {})
+                                    _bridge_model_ns = _be.get("model", _bridge_model_ns)
+                                elif _bt == "error":
+                                    logger.warning("[hermes-code] claude-code-cli ns bridge error: %s", _be.get("message"))
+                            _usage_ns_obj = SimpleNamespace(
+                                prompt_tokens=int(_bridge_usage_ns.get("input_tokens", 0) or 0),
+                                completion_tokens=int(_bridge_usage_ns.get("output_tokens", 0) or 0),
+                                total_tokens=int((_bridge_usage_ns.get("input_tokens", 0) or 0) + (_bridge_usage_ns.get("output_tokens", 0) or 0)),
+                            )
+                            response_obj = SimpleNamespace(
+                                choices=[SimpleNamespace(
+                                    message=SimpleNamespace(content=_bridge_final_text_ns, tool_calls=_bridge_tool_calls_ns if _bridge_tool_calls_ns else None),
+                                    finish_reason="tool_calls" if _bridge_tool_calls_ns else "stop",
+                                )],
+                                usage=_usage_ns_obj,
+                                model=_bridge_model_ns,
+                            )
+                            logger.info("[hermes-code][req=%s] claude-code-cli ns bridge completed: text_len=%d tool_calls=%d", _req_id, len(_bridge_final_text_ns), len(_bridge_tool_calls_ns))
                             try:
                                 from agent.model_cooldown_db import mark_provider_success
                                 mark_provider_success(prov, resolved_model, base_url=base_url or "")
@@ -8093,7 +8217,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     # skip past it on the current request and avoid the worst
                     # case where 30+ models each return text-only in sequence.
                     if passthrough_tools and (not tool_calls_out or _has_empty_bash_tool_call(tool_calls_out)):
-                        if not tool_calls_out:
+                        # claude-code-cli is an agent, not a model API.
+                        # The CLI itself executes tools (Bash, Read, etc.) and returns
+                        # the final answer as text.  Don't penalise it for text-only —
+                        # the "tool calls" happened inside the subprocess.
+                        _is_claude_code_ns = provider_model.startswith("claude-code-cli")
+                        if _is_claude_code_ns:
+                            logger.info(
+                                "[hermes-code] claude-code-cli: text-only response accepted (CLI executes tools internally)",
+                                provider_model,
+                            )
+                        elif not tool_calls_out:
                             logger.warning(
                                 "[hermes-code] %s returned text-only (no tool calls) despite tools being provided, "
                                 "raising _CodexPassthroughSkip to try next provider",

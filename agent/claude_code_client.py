@@ -15,11 +15,13 @@ import queue
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 import urllib.error
+import uuid
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,7 +63,7 @@ def _resolve_args() -> list[str]:
     """
     raw = os.getenv("HERMES_CLAUDE_CODE_ARGS", "").strip()
     if not raw:
-        return ["-p", "--output-format", "stream-json", "--verbose"]
+        return ["-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--bare", "--add-dir", "/tmp", "/opt", "/home", "/root"]
     return shlex.split(raw)
 
 
@@ -566,6 +568,11 @@ class ClaudeCodeClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._tools_manifest_path: str | None = None
+        self._mcp_config_path: str | None = None
+        self._session_id: str = os.environ.get("HERMES_REQUEST_ID", uuid.uuid4().hex[:12])
+        self._queue_in_path: str | None = None
+        self._queue_out_dir: str | None = None
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -583,6 +590,244 @@ class ClaudeCodeClient:
                 proc.kill()
             except Exception:
                 pass
+
+    def _write_tools_manifest(self, tools: list[dict[str, Any]] | None) -> str | None:
+        """Write the OMP client's tool definitions to a temp file for the MCP proxy.
+
+        Returns the path to the manifest file, or None if no tools provided.
+        """
+        if not tools:
+            return None
+        manifest = []
+        for t in tools:
+            if isinstance(t, dict) and "function" in t:
+                fn = t.get("function", {})
+                if isinstance(fn, dict) and fn.get("name"):
+                    manifest.append({
+                        "name": fn["name"],
+                        "description": fn.get("description", ""),
+                        "input_schema": fn.get("parameters", {}),
+                    })
+        if not manifest:
+            return None
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="hermes_tools_")
+        with os.fdopen(fd, "w") as f:
+            json.dump(manifest, f)
+        self._tools_manifest_path = path
+        return path
+
+    def _build_mcp_config(self, tools_manifest_path: str | None) -> str | None:
+        """Build an MCP config file pointing to the bridge proxy.
+
+        Returns the path to the config file, or None.
+        """
+        if not tools_manifest_path:
+            return None
+        # The MCP bridge script is co-located with this module.
+        bridge_script = os.path.join(os.path.dirname(__file__), "claude_mcp_bridge.py")
+        if not os.path.exists(bridge_script):
+            import logging
+            logging.getLogger(__name__).warning(
+                "[claude-code-client] MCP bridge script not found at %s", bridge_script
+            )
+            return None
+        # Create session-specific queue directory
+        self._queue_in_path = f"/tmp/hermes_queue_{self._session_id}.in"
+        self._queue_out_dir = f"/tmp/hermes_result_{self._session_id}"
+        os.makedirs(self._queue_out_dir, exist_ok=True)
+        config = {
+            "hermes-tools": {
+                "type": "stdio",
+                "command": "python3",
+                "args": [bridge_script],
+                "env": {
+                    "HERMES_TOOLS_FILE": tools_manifest_path,
+                    "HERMES_QUEUE_IN": self._queue_in_path,
+                    "HERMES_QUEUE_OUT_DIR": self._queue_out_dir,
+                },
+            }
+        }
+        fd, config_path = tempfile.mkstemp(suffix=".json", prefix="hermes_mcp_config_")
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f)
+        self._mcp_config_path = config_path
+
+    def run_with_tool_bridge(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        timeout_seconds: float = 300.0,
+    ):
+        """Run the Claude CLI subprocess with MCP tool bridging.
+
+        Yields a sequence of dicts:
+          {"type": "tool_call", "call_id": ..., "name": ..., "arguments": ...}
+          {"type": "tool_result", "result": ...}   (caller must .send(result) back)
+          {"type": "assistant_text", "text": ...}  (text deltas from CLI)
+          {"type": "final", "text": ..., "usage": ...}
+          {"type": "error", "message": ...}
+
+        The caller must call .send(result_str) on tool_call events to provide
+        the result, which is written to the bridge file for the MCP proxy.
+        """
+        _maybe_refresh_claude_oauth()
+        model_flag = MODEL_MAP.get(model or "sonnet", "claude-sonnet-4-6")
+        ndjson_payload = _format_messages_as_ndjson(messages or [], model=model)
+
+        cmd_args = [
+            self._claude_command, "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", model_flag,
+        ]
+        if tools:
+            cmd_args.extend(["--max-turns", "10"])
+            manifest_path = self._write_tools_manifest(tools)
+            mcp_config = self._build_mcp_config(manifest_path)
+            if mcp_config:
+                cmd_args.extend(["--mcp-config", mcp_config])
+                cmd_args.append("--strict-mcp-config")
+            tool_names = [t["function"]["name"] for t in tools
+                          if isinstance(t, dict) and isinstance(t.get("function"), dict)
+                          and t["function"].get("name")]
+            if tool_names:
+                cmd_args.extend(["--allowedTools", ",".join(tool_names)])
+
+        _logger.info("[claude-code-client] bridge cmd_args=%s", cmd_args)
+
+        # Truncate the queue file (start fresh)
+        if self._queue_in_path:
+            try:
+                if os.path.exists(self._queue_in_path):
+                    os.unlink(self._queue_in_path)
+            except Exception:
+                pass
+
+        try:
+            proc = subprocess.Popen(
+                cmd_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=self._claude_cwd,
+                env=_build_subprocess_env(),
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Could not start Claude Code command '{self._claude_command}'. "
+                "Install Claude Code CLI: npm install -g @anthropic-ai/claude-code"
+            ) from exc
+
+        with self._active_process_lock:
+            self._active_process = proc
+
+        try:
+            if proc.stdin:
+                if ndjson_payload:
+                    try:
+                        proc.stdin.write(ndjson_payload)
+                    except BrokenPipeError:
+                        pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            # Read stdout line by line, yielding events
+            pending_tool_calls: dict[str, str] = {}  # call_id -> result_str
+            for line in iter(proc.stdout.readline, ""):
+                line = line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                typ = obj.get("type")
+                if typ == "assistant":
+                    msg = obj.get("message", {})
+                    content = msg.get("content", [])
+                    if not isinstance(content, list):
+                        continue
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = part.get("type")
+                        if ptype == "tool_use":
+                            call_id = part.get("id", uuid.uuid4().hex)
+                            tool_name = part.get("name", "")
+                            tool_input = part.get("input", {})
+                            # Yield the tool_call, caller will .send(result)
+                            result = yield {
+                                "type": "tool_call",
+                                "call_id": call_id,
+                                "name": tool_name,
+                                "arguments": tool_input,
+                            }
+                            # Caller provided result — write to bridge file
+                            if self._queue_out_dir:
+                                result_path = os.path.join(
+                                    self._queue_out_dir, f"{call_id}.json"
+                                )
+                                try:
+                                    if isinstance(result, dict):
+                                        payload = result
+                                    else:
+                                        payload = {"content": str(result)}
+                                    with open(result_path, "w") as f:
+                                        json.dump(payload, f)
+                                except Exception as exc:
+                                    _logger.error(
+                                        "bridge: failed to write result for %s: %s",
+                                        call_id, exc,
+                                    )
+                        elif ptype == "text":
+                            text = part.get("text", "")
+                            if text:
+                                yield {"type": "assistant_text", "text": text}
+                elif typ == "result":
+                    result_text = str(obj.get("result") or "")
+                    usage = obj.get("usage", {})
+                    yield {
+                        "type": "final",
+                        "text": result_text,
+                        "usage": usage,
+                        "model": obj.get("model") or model or "claude-code",
+                    }
+                elif typ == "error":
+                    err_msg = obj.get("error", {}) or {}
+                    if isinstance(err_msg, dict):
+                        err_text = err_msg.get("message") or err_msg.get("type") or str(obj)
+                    else:
+                        err_text = str(err_msg)
+                    yield {"type": "error", "message": err_text}
+
+            proc.wait(timeout=timeout_seconds)
+            if proc.returncode != 0 and proc.stderr:
+                err_text = proc.stderr.read()[:500]
+                if err_text:
+                    yield {"type": "error", "message": f"exit {proc.returncode}: {err_text}"}
+
+        finally:
+            self.close()
+            for _temp_path in (self._tools_manifest_path, self._mcp_config_path,
+                                self._queue_in_path, self._queue_out_dir):
+                if _temp_path and os.path.exists(_temp_path):
+                    try:
+                        if os.path.isdir(_temp_path):
+                            import shutil
+                            shutil.rmtree(_temp_path)
+                        else:
+                            os.unlink(_temp_path)
+                    except Exception:
+                        pass
+            self._tools_manifest_path = None
+            self._mcp_config_path = None
 
     def _create_chat_completion(
         self,
@@ -623,7 +868,14 @@ class ClaudeCodeClient:
         if tools:
             cmd_args.extend(["--max-turns", "10"])
 
-        # Add allowed tools if tools are provided
+        # Integrate MCP tools if provided
+        manifest_path = self._write_tools_manifest(tools)
+        mcp_config = self._build_mcp_config(manifest_path)
+        if mcp_config:
+            cmd_args.extend(["--mcp-config", mcp_config])
+            cmd_args.append("--strict-mcp-config")
+
+        # Add allowed tools (legacy internal tools, should still be allowed)
         if tools:
             tool_names = []
             for t in tools:
@@ -815,3 +1067,12 @@ class ClaudeCodeClient:
 
         finally:
             self.close()
+            for _temp_path in (self._tools_manifest_path, self._mcp_config_path):
+                if _temp_path:
+                    try:
+                        if os.path.exists(_temp_path):
+                            os.unlink(_temp_path)
+                    except Exception:
+                        pass
+            self._tools_manifest_path = None
+            self._mcp_config_path = None
