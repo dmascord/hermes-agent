@@ -109,6 +109,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         -- Keep only last 1000 events per provider/model
         CREATE INDEX IF NOT EXISTS idx_me_created
             ON model_events(created_at);
+    """)
     _seed_default_quality_entries(conn)
     conn.commit()
 
