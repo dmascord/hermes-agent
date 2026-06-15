@@ -109,7 +109,43 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         -- Keep only last 1000 events per provider/model
         CREATE INDEX IF NOT EXISTS idx_me_created
             ON model_events(created_at);
-    """)
+    _seed_default_quality_entries(conn)
+    conn.commit()
+
+
+# Models that should be present in the quality DB with a healthy initial score so
+# they pass the quality floor (default 60.0) on first deployment, rather than
+# being dropped from the fallback chain while they accumulate their first 100
+# calls.  An entry here does NOT mean "this model is always good" — once real
+# calls start landing in record_success / record_failure the score is updated
+# normally and these seeds stop mattering.
+_QUALITY_SEED_ENTRIES: List[Tuple[str, str, float]] = [
+    # provider, model, initial_score
+    ("claude-code-cli", "sonnet", 90.0),
+    ("claude-code-cli", "opus", 90.0),
+    ("claude-code-cli", "haiku", 85.0),
+]
+
+
+def _seed_default_quality_entries(conn: sqlite3.Connection) -> None:
+    """Insert initial quality rows for known-bridge models if absent.
+
+    Uses INSERT OR IGNORE so it never overwrites a row that already exists
+    (the real score is built up by record_success/record_failure).
+    """
+    for provider, model, initial_score in _QUALITY_SEED_ENTRIES:
+        key = _make_key(provider, model, "")
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO model_metrics
+                   (key, provider, model, base_url, total_calls, success_calls,
+                    quality_score, last_success_at, updated_at)
+                   VALUES (?, ?, ?, '', 0, 0, ?, NULL, ?)""",
+                (key, provider, model, initial_score, time.time()),
+            )
+        except sqlite3.Error as _seed_exc:
+            logger.debug("[model-quality] seed insert failed for %s/%s: %s", provider, model, _seed_exc)
+
     conn.commit()
 
 
@@ -129,7 +165,7 @@ def _compute_quality_score(
     - Text-only responses are recorded but no longer penalise quality (ambiguous signal).
     - Cooldown (2 min) still applies to prevent wasted retries on the current request.
 
-    A model with 100% success, 0% text-only, and <5s latency gets 100.
+    A model with 100% success, 0% text-only, and under 5 seconds latency gets 100.
     A model with 0% success gets 0.
     """
     total = success_calls + failure_calls
@@ -143,7 +179,7 @@ def _compute_quality_score(
     score = 0.0
     # Success rate component (50 points max)
     score += 80.0 * success_rate
-    # Latency component (20 points max) — <5s = 20, >30s = 0
+    # Latency component (20 points max) — under 5s = 20, over 30s = 0
     latency_s = avg_latency_ms / 1000.0
     latency_bonus = max(0.0, min(1.0, (30.0 - latency_s) / 25.0))
     score += 20.0 * latency_bonus
