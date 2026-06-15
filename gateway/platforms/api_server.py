@@ -11286,6 +11286,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
+            # Start background sweeper for Codex pool token refresh
+            try:
+                from agent.codex_token_sweeper import _codex_token_sweeper_task
+                codex_sweep_task = asyncio.create_task(_codex_token_sweeper_task())
+                try:
+                    self._background_tasks.add(codex_sweep_task)
+                except TypeError:
+                    pass
+                if hasattr(codex_sweep_task, "add_done_callback"):
+                    codex_sweep_task.add_done_callback(self._background_tasks.discard)
+            except Exception:
+                pass
 
             # Refuse to start network-accessible without authentication
             if is_network_accessible(self._host) and not self._api_key:

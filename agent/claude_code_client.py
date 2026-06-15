@@ -295,9 +295,27 @@ def _maybe_refresh_claude_oauth() -> bool:
     home = _resolve_home_dir()
     creds_path = Path(home) / ".claude" / ".credentials.json"
 
-    # If credentials file is missing, try to recover from auth.json
+    # If credentials file is missing, try to recover from:
+    # 1. PVC backup location (entrypoint restores from here on startup)
+    # 2. auth.json (source of truth)
     if not creds_path.exists():
-        _logger.info("claude_oauth: .credentials.json missing — attempting recovery from auth.json")
+        _logger.info("claude_oauth: .credentials.json missing — checking PVC backup, then auth.json")
+        
+        # First try PVC backup (most reliable — survives pod restarts)
+        home_env = os.environ.get("HERMES_HOME", _resolve_home_dir())
+        pvc_backup = Path(home_env) / ".claude_backup" / ".credentials.json"
+        if pvc_backup.exists():
+            try:
+                import shutil
+                os.makedirs(creds_path.parent, exist_ok=True)
+                shutil.copy2(pvc_backup, creds_path)
+                os.chmod(creds_path, 0o600)
+                _logger.info("claude_oauth: restored from PVC backup %s", pvc_backup)
+                return True
+            except Exception as exc:
+                _logger.debug("claude_oauth: PVC backup copy failed: %s", exc)
+        
+        # Fall back to auth.json recovery
         if _recover_claude_tokens_from_auth_json():
             # Credentials restored.  We intentionally skip the HTTP refresh
             # here — the recovered token is fresh (auth.json is the source of
