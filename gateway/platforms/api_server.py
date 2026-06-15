@@ -6878,6 +6878,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _bridge_thread = threading.Thread(target=_run_bridge, daemon=True)
                                 _bridge_thread.start()
                                 # Process events from the bridge — stream SSE chunks directly
+
                                 _bridge_final_text = ""
                                 _bridge_usage = {}
                                 _bridge_model = resolved_model
@@ -6906,14 +6907,21 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
                                         await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                        # Write placeholder result to unblock the MCP bridge.
+                                        # The generator yields tool_call but does NOT expect
+                                        # .send() — the bridge thread uses "for event in gen"
+                                        # (next() only).  We write directly to the result file
+                                        # so the MCP proxy unblocks and the CLI continues.
                                         if _cc_client._queue_out_dir:
                                             _result_path = os.path.join(_cc_client._queue_out_dir, f"{_call_id}.json")
                                             try:
                                                 _placeholder = {"content": f"[Tool {_tool_name} called with {_tool_args}]"}
                                                 with open(_result_path, "w") as _rf:
                                                     json.dump(_placeholder, _rf)
+                                                logger.info("[hermes-code] bridge: wrote placeholder result for %s", _call_id)
                                             except Exception as _re:
                                                 logger.warning("[hermes-code] bridge: failed to write placeholder result: %s", _re)
+                                        logger.info("[hermes-code] bridge: streamed tool_call %s to OMP", _call_id)
                                     elif _bt == "assistant_text":
                                         _text = _be.get("text", "")
                                         if _text:
