@@ -88,6 +88,14 @@ class _OpenAIProxy:
     __slots__ = ()
 
     def __call__(self, *args, **kwargs):
+        # Disable SDK-level retries by default. The Hermes gateway already has
+        # its own fallback chain at the api_server level (try next provider on
+        # failure). The OpenAI SDK's default max_retries=2 means 3 total
+        # attempts on timeout, so a single hung provider holds the request for
+        # ~90s at timeout=30s — exceeding Cloudflare's 100s origin timeout
+        # and triggering a 524. Callers that explicitly need SDK retries must
+        # pass max_retries explicitly.
+        kwargs.setdefault("max_retries", 0)
         return _load_openai_cls()(*args, **kwargs)
 
     def __instancecheck__(self, obj):
@@ -2125,6 +2133,7 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         )
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
         async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+    async_kwargs.setdefault("max_retries", 0)
     return AsyncOpenAI(**async_kwargs), model
 
 

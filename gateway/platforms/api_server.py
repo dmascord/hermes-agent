@@ -6420,7 +6420,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     headers = _codex_cloudflare_headers(api_key)
                                 else:
                                     headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
-                                client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
+                                client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers, max_retries=0)
 
                                 if api_mode == "codex_responses":
                                     # Responses API (GPT-5.x): wrap in CodexAuxiliaryClient
@@ -7668,7 +7668,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 headers = _codex_cloudflare_headers(api_key)
                             else:
                                 headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
-                            client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
+                            client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers, max_retries=0)
 
                             if api_mode == "codex_responses":
                                 # Responses API (GPT-5.x): wrap in CodexAuxiliaryClient
