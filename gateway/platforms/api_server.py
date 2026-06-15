@@ -6892,7 +6892,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _bridge_tool_calls.append(_tc)
                                         _tc_chunk = {
                                             "id": completion_id, "object": "chat.completion.chunk",
-                                            "created": created, "model": model_name,
+                                            "created": int(time.time()), "model": model_name,
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
                                         await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
@@ -6912,7 +6912,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             _bridge_final_text += _text
                                             _text_chunk = {
                                                 "id": completion_id, "object": "chat.completion.chunk",
-                                                "created": created, "model": model_name,
+                                                "created": int(time.time()), "model": model_name,
                                                 "choices": [{"index": 0, "delta": {"content": _text}, "finish_reason": None}],
                                             }
                                             await response.write(f"data: {json.dumps(_text_chunk)}\n\n".encode())
