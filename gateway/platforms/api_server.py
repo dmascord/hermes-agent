@@ -6851,6 +6851,17 @@ class APIServerAdapter(BasePlatformAdapter):
                             if _cc_client is not None:
                                 _skip_normal_call = True
                                 logger.info("[hermes-code][req=%s] claude-code-cli bridge starting for model=%s", _req_id, resolved_model)
+                                # ── Create SSE response early so bridge can stream directly ──
+                                _bridge_completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+                                _bridge_sse_headers = {
+                                    "Content-Type": "text/event-stream",
+                                    "Cache-Control": "no-cache",
+                                    "X-Accel-Buffering": "no",
+                                }
+                                if session_id:
+                                    _bridge_sse_headers["X-Hermes-Session-Id"] = session_id
+                                response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
+                                await response.prepare(request)
                                 # Run the bridge generator in a thread, collect events via asyncio queue
                                 _bridge_events: asyncio.Queue = asyncio.Queue()
                                 _bridge_error: list[Exception] = []
@@ -6866,7 +6877,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _bridge_events.put_nowait({"type": "_done"})
                                 _bridge_thread = threading.Thread(target=_run_bridge, daemon=True)
                                 _bridge_thread.start()
-                                # Process events from the bridge
+                                # Process events from the bridge — stream SSE chunks directly
                                 _bridge_final_text = ""
                                 _bridge_usage = {}
                                 _bridge_model = resolved_model
@@ -6877,7 +6888,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                         break
                                     _bt = _be.get("type")
                                     if _bt == "tool_call":
-                                        # Yield tool_call to OMP client
                                         _call_id = _be.get("call_id", "")
                                         _tool_name = _be.get("name", "")
                                         _tool_args = _be.get("arguments", {})
@@ -6891,13 +6901,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                         }
                                         _bridge_tool_calls.append(_tc)
                                         _tc_chunk = {
-                                            "id": completion_id, "object": "chat.completion.chunk",
+                                            "id": _bridge_completion_id, "object": "chat.completion.chunk",
                                             "created": int(time.time()), "model": model_name,
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
                                         await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
-                                        # The bridge blocks waiting for result file.
-                                        # We write a placeholder result so the CLI continues.
                                         if _cc_client._queue_out_dir:
                                             _result_path = os.path.join(_cc_client._queue_out_dir, f"{_call_id}.json")
                                             try:
@@ -6911,7 +6919,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         if _text:
                                             _bridge_final_text += _text
                                             _text_chunk = {
-                                                "id": completion_id, "object": "chat.completion.chunk",
+                                                "id": _bridge_completion_id, "object": "chat.completion.chunk",
                                                 "created": int(time.time()), "model": model_name,
                                                 "choices": [{"index": 0, "delta": {"content": _text}, "finish_reason": None}],
                                             }
@@ -6922,7 +6930,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _bridge_model = _be.get("model", _bridge_model)
                                     elif _bt == "error":
                                         logger.warning("[hermes-code] claude-code-cli bridge error: %s", _be.get("message"))
-                                # Build response_obj for downstream processing
+                                # Build response_obj and finalize SSE
+                                _bridge_finish_reason = "tool_calls" if _bridge_tool_calls else "stop"
                                 _bridge_usage_ns = SimpleNamespace(
                                     prompt_tokens=int(_bridge_usage.get("input_tokens", 0) or 0),
                                     completion_tokens=int(_bridge_usage.get("output_tokens", 0) or 0),
@@ -6934,17 +6943,54 @@ class APIServerAdapter(BasePlatformAdapter):
                                 )
                                 _bridge_choice = SimpleNamespace(
                                     message=_bridge_msg,
-                                    finish_reason="tool_calls" if _bridge_tool_calls else "stop",
+                                    finish_reason=_bridge_finish_reason,
                                 )
                                 response_obj = SimpleNamespace(
                                     choices=[_bridge_choice],
                                     usage=_bridge_usage_ns,
                                     model=_bridge_model,
                                 )
+                                # Write finish chunk and close SSE stream
+                                _bridge_finish_chunk = {
+                                    "id": _bridge_completion_id, "object": "chat.completion.chunk",
+                                    "created": int(time.time()), "model": model_name,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": _bridge_finish_reason}],
+                                    "usage": {
+                                        "prompt_tokens": int(_bridge_usage_ns.prompt_tokens or 0),
+                                        "completion_tokens": int(_bridge_usage_ns.completion_tokens or 0),
+                                        "total_tokens": int(_bridge_usage_ns.total_tokens or 0),
+                                    },
+                                }
+                                await response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
+                                await response.write(b"data: [DONE]\n\n")
+                                await response.write_eof()
                                 logger.info("[hermes-code][req=%s] claude-code-cli bridge completed: text_len=%d tool_calls=%d", _req_id, len(_bridge_final_text), len(_bridge_tool_calls))
-                            else:
-                                logger.warning("[hermes-code][req=%s] claude-code-cli: no client, falling through", _req_id)
-                                continue
+                                # Record success and hooks
+                                try:
+                                    from agent.model_cooldown_db import mark_provider_success
+                                    mark_provider_success(prov, resolved_model, base_url=base_url or "")
+                                except Exception:
+                                    pass
+                                try:
+                                    from agent.model_quality_db import record_success
+                                    record_success(prov, provider_model, base_url=base_url or "", latency_ms=0)
+                                except Exception:
+                                    pass
+                                _invoke_passthrough_hooks(
+                                    "post_api_request",
+                                    task_id="", session_id=session_id or "", platform="api_server",
+                                    model=provider_model, provider=provider_model.split("/")[0],
+                                    base_url=base_url or "", api_mode="",
+                                    api_call_count=_pt_call_count[0],
+                                    finish_reason=_bridge_finish_reason,
+                                    assistant_content_chars=len(_bridge_final_text) if _bridge_final_text else 0,
+                                    assistant_tool_call_count=len(_bridge_tool_calls),
+                                    usage={
+                                        "input_tokens": int(_bridge_usage_ns.prompt_tokens or 0),
+                                        "output_tokens": int(_bridge_usage_ns.completion_tokens or 0),
+                                    },
+                                )
+                                return response
                         else:
                             _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                             _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
