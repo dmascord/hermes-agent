@@ -3507,10 +3507,23 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
         else:
             runtime_kwargs["provider"] = provider_prefix
     else:
-        from hermes_cli.model_normalize import detect_vendor
-        detected_provider = detect_vendor(normalized_model)
-        if detected_provider:
-            runtime_kwargs["provider"] = detected_provider
+        # Special-case external-process providers whose bare model name does
+        # not contain a slash and would otherwise be mis-routed by detect_vendor.
+        if normalized_model == "claude-code-cli":
+            try:
+                from hermes_cli.auth import resolve_external_process_provider_credentials
+                _cc_creds = resolve_external_process_provider_credentials("claude-code-cli")
+                runtime_kwargs["base_url"] = _cc_creds.get("base_url", "claude://codex")
+                runtime_kwargs["api_key"] = _cc_creds.get("api_key", "claude-code-cli")
+            except Exception:
+                runtime_kwargs["base_url"] = "claude://codex"
+                runtime_kwargs["api_key"] = "claude-code-cli"
+            runtime_kwargs["provider"] = "claude-code-cli"
+        else:
+            from hermes_cli.model_normalize import detect_vendor
+            detected_provider = detect_vendor(normalized_model)
+            if detected_provider:
+                runtime_kwargs["provider"] = detected_provider
 
     # Cache the resolved credentials keyed by provider prefix so subsequent
     # calls for other models under the same provider (e.g. github-copilot/gpt-5.4
@@ -5752,11 +5765,10 @@ class APIServerAdapter(BasePlatformAdapter):
         _provider_mode = False
         if model_name == "hermes-agentic-full":
             _toolset_mode = "full"
-        elif model_name == "hermes-agentic-remote":
-            _toolset_mode = "remote"
-        elif model_name == "hermes-code" or "/" in model_name:
-            # Activate passthrough for hermes-code OR any model with / (provider/model format).
-            # Passthrough routes through HERMES_CODE_* env var chain with cooldown support.
+        elif model_name in ("hermes-code", "claude-code-cli") or "/" in model_name:
+            # Activate passthrough for hermes-code, claude-code-cli, OR any model
+            # with / (provider/model format).  Passthrough routes through the
+            # provider-specific handlers with cooldown support.
             _provider_mode = True
         external_tool_mode = "none"
         if isinstance(tools, list) and tools:
@@ -6061,14 +6073,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 if selected_code_model and selected_code_model not in _passthrough_models:
                     _passthrough_models.append(selected_code_model)
-            elif model_name and "/" in model_name and model_name not in _passthrough_models:
-                _passthrough_models.append(model_name)
-                _strict_mode = True  # explicit model — no silent fallback
-                logger.info(
-                    "[hermes-code][req=%s] strict mode: explicit model %s requested, "
-                    "fallback chain will be skipped",
-                    _req_id, model_name,
-                )
+            elif model_name and model_name not in _passthrough_models:
+                if "/" in model_name:
+                    _passthrough_models.append(model_name)
+                    _strict_mode = True  # explicit model — no silent fallback
+                    logger.info(
+                        "[hermes-code][req=%s] strict mode: explicit model %s requested, "
+                        "fallback chain will be skipped",
+                        _req_id, model_name,
+                    )
+                elif model_name in ("claude-code-cli",):
+                    # External-process providers: strict mode, pass through to provider-specific handler
+                    _passthrough_models.append(model_name)
+                    _strict_mode = True
             # Copernican copilot models go next (user's personal API)
             if model_name.startswith("github-copilot") or model_name.startswith("copilot-"):
                 pass  # Already added above
@@ -6217,7 +6234,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Streaming passthrough: collect full response then stream as SSE
             if stream:
                 for provider_model in _passthrough_models:
-                    if "/" not in provider_model:
+                    if "/" not in provider_model and provider_model not in ("claude-code-cli",):
                         continue
 
                     # ── Tool set selection (quality-aware) ──
@@ -7503,7 +7520,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 [t.get("function", {}).get("name", "?") for t in (passthrough_tools or [])[:5]],
             )
             for provider_model in _passthrough_models:
-                if "/" not in provider_model:
+                if "/" not in provider_model and provider_model not in ("claude-code-cli",):
                     continue
 
                 # Check cooldown before attempting this provider
