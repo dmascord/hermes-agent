@@ -117,21 +117,25 @@ def main() -> None:
         if not tool_name:
             continue
         tool_desc = tool_def.get("description", "")
-        # Use a factory to capture the name in a closure
+        # Use a factory to capture the name in a closure.
         def _make_handler(name: str):
-            def handler(arguments: dict) -> str:
-                return _proxy_tool_call(name, arguments)
+            def handler(**kwargs) -> str:
+                return _proxy_tool_call(name, kwargs)
             return handler
 
-        # Register with FastMCP — add_tool takes a Tool object
         from mcp.server.fastmcp.tools import Tool
-        proxy_tool = Tool(
+        proxy_tool = Tool.from_function(
+            _make_handler(tool_name),
             name=tool_name,
             description=tool_desc,
-            parameters=tool_def.get("input_schema", {"type": "object", "properties": {}}),
-            fn=_make_handler(tool_name),
+            structured_output=False,
         )
-        mcp.add_tool(proxy_tool)
+        # FastMCP derives a generic **kwargs schema. Override it with the
+        # actual OpenAI-compatible tool schema provided by the client.
+        proxy_tool.parameters = tool_def.get(
+            "input_schema", {"type": "object", "properties": {}}
+        )
+        mcp._tool_manager._tools[tool_name] = proxy_tool
         logger.info("Registered proxy tool: %s", tool_name)
 
     # Run stdio MCP server
