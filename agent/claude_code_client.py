@@ -828,6 +828,65 @@ class ClaudeCodeClient:
         with self._active_process_lock:
             self._active_process = proc
 
+        mcp_events_lock = threading.Lock()
+        mcp_events: list[dict[str, Any]] = []
+        mcp_seen_call_ids: set[str] = set()
+        mcp_stop = threading.Event()
+
+        def _drain_mcp_events() -> list[dict[str, Any]]:
+            with mcp_events_lock:
+                drained = list(mcp_events)
+                mcp_events.clear()
+            return drained
+
+        def _watch_mcp_queue() -> None:
+            if not self._queue_in_path or not self._queue_out_dir:
+                return
+            offset = 0
+            while not mcp_stop.is_set():
+                try:
+                    if not os.path.exists(self._queue_in_path):
+                        time.sleep(0.05)
+                        continue
+                    with open(self._queue_in_path, "r", encoding="utf-8") as f:
+                        f.seek(offset)
+                        lines = f.readlines()
+                        offset = f.tell()
+                    for raw in lines:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            call = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        call_id = str(call.get("call_id") or "")
+                        if not call_id or call_id in mcp_seen_call_ids:
+                            continue
+                        mcp_seen_call_ids.add(call_id)
+                        event = {
+                            "type": "tool_call",
+                            "call_id": call_id,
+                            "name": str(call.get("tool") or ""),
+                            "arguments": call.get("arguments") or {},
+                        }
+                        with mcp_events_lock:
+                            mcp_events.append(event)
+                        result_path = os.path.join(
+                            self._queue_out_dir, f"{call_id}.json"
+                        )
+                        if not os.path.exists(result_path):
+                            with open(result_path, "w", encoding="utf-8") as f:
+                                json.dump({"content": ""}, f)
+                except Exception as exc:
+                    _logger.warning("bridge: MCP queue monitor error: %s", exc)
+                time.sleep(0.05)
+
+        mcp_thread: threading.Thread | None = None
+        if tools and self._queue_in_path and self._queue_out_dir:
+            mcp_thread = threading.Thread(target=_watch_mcp_queue, daemon=True)
+            mcp_thread.start()
+
         try:
             if proc.stdin:
                 if ndjson_payload:
@@ -852,6 +911,8 @@ class ClaudeCodeClient:
                     continue
                 typ = obj.get("type")
                 if typ == "assistant":
+                    for event in _drain_mcp_events():
+                        yield event
                     msg = obj.get("message", {})
                     content = msg.get("content", [])
                     if not isinstance(content, list):
@@ -893,6 +954,8 @@ class ClaudeCodeClient:
                             if text:
                                 yield {"type": "assistant_text", "text": text}
                 elif typ == "result":
+                    for event in _drain_mcp_events():
+                        yield event
                     result_text = str(obj.get("result") or "")
                     usage = obj.get("usage", {})
                     yield {
@@ -910,12 +973,17 @@ class ClaudeCodeClient:
                     yield {"type": "error", "message": err_text}
 
             proc.wait(timeout=timeout_seconds)
+            for event in _drain_mcp_events():
+                yield event
             if proc.returncode != 0 and proc.stderr:
                 err_text = proc.stderr.read()[:500]
                 if err_text:
                     yield {"type": "error", "message": f"exit {proc.returncode}: {err_text}"}
 
         finally:
+            mcp_stop.set()
+            if mcp_thread is not None:
+                mcp_thread.join(timeout=1.0)
             self.close()
             for _temp_path in (self._tools_manifest_path, self._mcp_config_path,
                                 self._queue_in_path, self._queue_out_dir):
