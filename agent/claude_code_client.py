@@ -31,7 +31,10 @@ _logger = logging.getLogger(__name__)
 
 # Anthropic OAuth constants (decoded from base64: Claude Code clientId)
 _CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_CLAUDE_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+_CLAUDE_TOKEN_URLS = (
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+)
 
 _DEFAULT_TIMEOUT_SECONDS = 300.0  # 5 minutes for print mode
 
@@ -134,42 +137,94 @@ def _claude_oauth_needs_refresh(creds: dict, *, skew_seconds: int = 300) -> bool
 def _claude_oauth_refresh_token(refresh_token: str, *, timeout: float = 15.0) -> dict:
     """Call Anthropic's OAuth token endpoint with a refresh token.
 
-    Mirrors the OMP implementation at
-    ``omp-src/packages/ai/src/utils/oauth/anthropic.ts:refreshAnthropicToken``.
+    Prefer the shared Anthropic adapter implementation so the Claude CLI path
+    uses the same known-good token endpoints and fallback behavior as the
+    native Anthropic OAuth path.  A small local fallback remains for unusual
+    import-time contexts.
+
     Returns a dict with at least ``access_token``, ``refresh_token``,
     ``expires_in`` seconds.  Raises on HTTP failure.
     """
-    body = (
-        f"grant_type=refresh_token"
-        f"&client_id={_CLAUDE_CLIENT_ID}"
-        f"&refresh_token={urllib.parse.quote(refresh_token, safe='')}"
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        _CLAUDE_TOKEN_URL,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "anthropic-sdk-typescript/0.94.0 userOAuthProvider",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Anthropic OAuth refresh returned non-object: {raw[:200]}")
-    access = data.get("access_token")
-    new_refresh = data.get("refresh_token") or refresh_token
-    expires_in = int(data.get("expires_in") or 3600)
-    if not access:
-        raise RuntimeError(f"Anthropic OAuth refresh returned no access_token: {raw[:200]}")
-    return {
-        "access_token": access,
-        "refresh_token": new_refresh,
-        "expires_in": expires_in,
-    }
+    try:
+        from agent.anthropic_adapter import refresh_anthropic_oauth_pure
+
+        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+        expires_at_ms = int(refreshed.get("expires_at_ms") or 0)
+        expires_in = max(1, int((expires_at_ms - int(time.time() * 1000)) / 1000))
+        return {
+            "access_token": refreshed["access_token"],
+            "refresh_token": refreshed.get("refresh_token") or refresh_token,
+            "expires_in": expires_in,
+        }
+    except ImportError:
+        pass
+
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "client_id": _CLAUDE_CLIENT_ID,
+        "refresh_token": refresh_token,
+    }).encode("utf-8")
+    last_error: Exception | None = None
+    for token_url in _CLAUDE_TOKEN_URLS:
+        req = urllib.request.Request(
+            token_url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "claude-cli/hermes (external, cli)",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except Exception as exc:
+            last_error = exc
+            continue
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Anthropic OAuth refresh returned non-object: {raw[:200]}")
+        access = data.get("access_token")
+        new_refresh = data.get("refresh_token") or refresh_token
+        expires_in = int(data.get("expires_in") or 3600)
+        if not access:
+            raise RuntimeError(f"Anthropic OAuth refresh returned no access_token: {raw[:200]}")
+        return {
+            "access_token": access,
+            "refresh_token": new_refresh,
+            "expires_in": expires_in,
+        }
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Anthropic OAuth refresh failed")
+
+
+def _write_claude_credentials_file(creds_path: Path, data: dict[str, Any]) -> None:
+    """Atomically write Claude credentials with owner-only permissions."""
+    os.makedirs(creds_path.parent, exist_ok=True)
+    tmp_path = creds_path.with_name(f"{creds_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, creds_path)
+        os.chmod(creds_path, 0o600)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _credential_expires_at_ms(auth: dict[str, Any]) -> int:
+    try:
+        return int(auth.get("expiresAt") or 0)
+    except Exception:
+        return 0
 
 def _persist_claude_credentials_to_auth_json(
     full_credentials: dict[str, Any],
@@ -231,9 +286,7 @@ def _recover_claude_tokens_from_auth_json() -> bool:
         full_creds = state.get("full_credentials", {})
         if full_creds.get("accessToken") and full_creds.get("refreshToken"):
             data = {"claudeAiOauth": full_creds}
-            os.makedirs(creds_path.parent, exist_ok=True)
-            creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            os.chmod(creds_path, 0o600)
+            _write_claude_credentials_file(creds_path, data)
             expires_ms = state.get("expires_at_ms", 0)
             remaining_h = max(0, (expires_ms / 1000 - time.time()) / 3600)
             _logger.info(
@@ -260,9 +313,7 @@ def _recover_claude_tokens_from_auth_json() -> bool:
                 "expiresAt": state.get("expires_at_ms", 0),
             }
         }
-        os.makedirs(creds_path.parent, exist_ok=True)
-        creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.chmod(creds_path, 0o600)
+        _write_claude_credentials_file(creds_path, data)
         expires_ms = state.get("expires_at_ms", 0)
         remaining_h = max(0, (expires_ms / 1000 - time.time()) / 3600)
         _logger.info(
@@ -300,6 +351,7 @@ def _maybe_refresh_claude_oauth() -> bool:
     # If credentials file is missing, try to recover from:
     # 1. PVC backup location (entrypoint restores from here on startup)
     # 2. auth.json (source of truth)
+    restored_credentials = False
     if not creds_path.exists():
         _logger.info("claude_oauth: .credentials.json missing — checking PVC backup, then auth.json")
         
@@ -313,18 +365,15 @@ def _maybe_refresh_claude_oauth() -> bool:
                 shutil.copy2(pvc_backup, creds_path)
                 os.chmod(creds_path, 0o600)
                 _logger.info("claude_oauth: restored from PVC backup %s", pvc_backup)
-                return True
+                restored_credentials = True
             except Exception as exc:
                 _logger.debug("claude_oauth: PVC backup copy failed: %s", exc)
         
         # Fall back to auth.json recovery
-        if _recover_claude_tokens_from_auth_json():
-            # Credentials restored.  We intentionally skip the HTTP refresh
-            # here — the recovered token is fresh (auth.json is the source of
-            # truth and only written with valid tokens).  Return True so callers
-            # know credentials are now available.
-            return True
-        return False
+        if not restored_credentials:
+            restored_credentials = _recover_claude_tokens_from_auth_json()
+        if not restored_credentials:
+            return False
 
     with _claude_oauth_refresh_lock:
         try:
@@ -335,16 +384,16 @@ def _maybe_refresh_claude_oauth() -> bool:
         auth = data.get("claudeAiOauth", {})
         access_token = auth.get("accessToken", "")
         refresh_token = auth.get("refreshToken", "")
-        expires_at = auth.get("expiresAt", 0)
         if not refresh_token:
             _logger.debug("claude_oauth: no refresh token — cannot refresh")
             return False
         now_ms = int(time.time() * 1000)
+        expires_at = _credential_expires_at_ms(auth)
         remaining_ms = expires_at - now_ms
         # Only refresh if within 5 minutes of expiry (or already expired)
         if remaining_ms > 5 * 60 * 1000:
             _logger.debug("claude_oauth: token still valid for %.0fs — no refresh needed", remaining_ms / 1000)
-            return False
+            return restored_credentials
         try:
             result = _claude_oauth_refresh_token(refresh_token)
         except urllib.error.HTTPError as exc:
@@ -359,7 +408,7 @@ def _maybe_refresh_claude_oauth() -> bool:
                 "error": error_body[:200],
             }
             try:
-                creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                _write_claude_credentials_file(creds_path, data)
             except Exception:
                 pass
             # If the refresh token is dead (invalid_grant), write a tombstone
@@ -388,7 +437,7 @@ def _maybe_refresh_claude_oauth() -> bool:
         try:
             _disk_creds = json.loads(creds_path.read_text(encoding="utf-8"))
             _disk_auth = _disk_creds.get("claudeAiOauth", {})
-            if _disk_auth.get("expiresAt", 0) > auth.get("expiresAt", 0):
+            if _credential_expires_at_ms(_disk_auth) > _credential_expires_at_ms(auth):
                 _logger.warning(
                     "claude_oauth: skipping write — disk has newer tokens (disk=%s, refresh=%s). "
                     "This may indicate a stale backup restoration.",
@@ -399,7 +448,7 @@ def _maybe_refresh_claude_oauth() -> bool:
             _logger.debug("claude_oauth: could not verify disk age: %s", _exc)
 
         try:
-            creds_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            _write_claude_credentials_file(creds_path, data)
         except Exception as exc:
             _logger.warning(
                 "claude_oauth: failed to persist refreshed tokens to %s: %s",
@@ -636,14 +685,16 @@ class ClaudeCodeClient:
         self._queue_out_dir = f"/tmp/hermes_result_{self._session_id}"
         os.makedirs(self._queue_out_dir, exist_ok=True)
         config = {
-            "hermes-tools": {
-                "type": "stdio",
-                "command": "python3",
-                "args": [bridge_script],
-                "env": {
-                    "HERMES_TOOLS_FILE": tools_manifest_path,
-                    "HERMES_QUEUE_IN": self._queue_in_path,
-                    "HERMES_QUEUE_OUT_DIR": self._queue_out_dir,
+            "mcpServers": {
+                "hermes-tools": {
+                    "type": "stdio",
+                    "command": "python3",
+                    "args": [bridge_script],
+                    "env": {
+                        "HERMES_TOOLS_FILE": tools_manifest_path,
+                        "HERMES_QUEUE_IN": self._queue_in_path,
+                        "HERMES_QUEUE_OUT_DIR": self._queue_out_dir,
+                    },
                 },
             }
         }
@@ -651,6 +702,19 @@ class ClaudeCodeClient:
         with os.fdopen(fd, "w") as f:
             json.dump(config, f)
         self._mcp_config_path = config_path
+        return config_path
+
+    def _allowed_tool_names(self, tools: list[dict[str, Any]] | None) -> list[str]:
+        if not tools:
+            return []
+        names: list[str] = []
+        for tool in tools:
+            if not isinstance(tool, dict) or not isinstance(tool.get("function"), dict):
+                continue
+            name = tool["function"].get("name")
+            if name:
+                names.append(f"mcp__hermes-tools__{name}")
+        return names
 
     def run_with_tool_bridge(
         self,
@@ -690,9 +754,7 @@ class ClaudeCodeClient:
             if mcp_config:
                 cmd_args.extend(["--mcp-config", mcp_config])
                 cmd_args.append("--strict-mcp-config")
-            tool_names = [t["function"]["name"] for t in tools
-                          if isinstance(t, dict) and isinstance(t.get("function"), dict)
-                          and t["function"].get("name")]
+            tool_names = self._allowed_tool_names(tools)
             if tool_names:
                 cmd_args.extend(["--allowedTools", ",".join(tool_names)])
 
@@ -877,12 +939,7 @@ class ClaudeCodeClient:
 
         # Add allowed tools (legacy internal tools, should still be allowed)
         if tools:
-            tool_names = []
-            for t in tools:
-                if isinstance(t, dict) and "function" in t:
-                    fn = t.get("function", {})
-                    if isinstance(fn, dict) and fn.get("name"):
-                        tool_names.append(fn["name"])
+            tool_names = self._allowed_tool_names(tools)
             if tool_names:
                 cmd_args.extend(["--allowedTools", ",".join(tool_names)])
 
