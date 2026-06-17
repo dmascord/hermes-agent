@@ -100,6 +100,8 @@ def _proxy_tool_call(tool_name: str, arguments: dict) -> str:
 
 
 class _ProxyToolMetadata:
+    output_schema = None
+
     async def call_fn_with_arg_validation(
         self,
         fn,
