@@ -536,9 +536,11 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        Only syncs tokens for the ``device_code`` singleton entry.  Manual
+        device_code entries (``manual:device_code:<label>``) represent
+        independent accounts and must not adopt the singleton's tokens.
+        Error markers are still cleared for all device_code-sourced entries
+        so a re-auth gives every pool entry a fresh selection chance.
         """
         if self.provider != "openai-codex" or not str(entry.source or "").endswith("device_code"):
             return entry
@@ -553,12 +555,12 @@ class CredentialPool:
                 return entry
             store_access = tokens.get("access_token", "")
             store_refresh = tokens.get("refresh_token", "")
-            # Adopt auth.json tokens when either side differs.  Codex refresh
-            # tokens are single-use too, so a fresh refresh_token from
-            # another process means our entry's pair is consumed/stale.
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
-            if store_access and (
+            # Only adopt auth.json tokens for the singleton device_code entry.
+            # Manual entries have their own accounts — syncing the singleton's
+            # tokens into them would destroy the other accounts' credentials.
+            if entry.source == "device_code" and store_access and (
                 store_access != entry_access
                 or (store_refresh and store_refresh != entry_refresh)
             ):
@@ -583,15 +585,15 @@ class CredentialPool:
                 self._replace_entry(entry, updated)
                 self._persist()
                 return updated
-            # Even when tokens match, if the entry is exhausted and the
-            # cooldown has expired, clear exhaustion so the pool self-heals.
-            if entry.last_status == STATUS_EXHAUSTED and store_access == entry_access:
+            # Even when tokens match or entry is manual, if the entry is
+            # exhausted and the cooldown has expired, clear exhaustion so
+            # the pool self-heals.
+            if entry.last_status == STATUS_EXHAUSTED:
                 reset_at = entry.last_error_reset_at or 0
                 if time.time() >= reset_at:
                     logger.debug(
-                        "Pool entry %s: Codex tokens match auth.json but "
-                        "entry is exhausted with expired cooldown — "
-                        "clearing exhaustion",
+                        "Pool entry %s: Codex entry exhausted with expired "
+                        "cooldown — clearing exhaustion",
                         entry.id,
                     )
                     field_updates = {
@@ -674,8 +676,9 @@ class CredentialPool:
         stale state and can overwrite the fresh pool entry — potentially
         re-seeding a consumed single-use refresh token.
 
-        Applies to any OAuth provider whose singleton lives in auth.json
-        (currently Nous and OpenAI Codex).
+        Only syncs the ``device_code`` singleton back to auth.json.  Manual
+        entries (``manual:device_code:<label>``) represent independent
+        accounts and must NOT overwrite the singleton's tokens.
         """
         if entry.source != "device_code":
             return

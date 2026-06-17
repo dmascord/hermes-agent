@@ -3376,15 +3376,21 @@ def _sync_codex_pool_entries(
         source = entry.get("source")
         if source not in REFRESHABLE_SOURCES:
             continue
-        entry["access_token"] = access_token
-        if refresh_token:
-            entry["refresh_token"] = refresh_token
-        if last_refresh:
-            entry["last_refresh"] = last_refresh
-        # Mirror the absolute expiry so the pool entry can answer
-        # _entry_needs_refresh() without re-decoding the JWT.
-        if _sync_expires_at_ms is not None:
-            entry["expires_at_ms"] = _sync_expires_at_ms
+        # Only sync tokens to the device_code singleton entry.  Manual
+        # device_code entries (manual:device_code:<label>) represent
+        # independent ChatGPT accounts with their own refresh tokens.
+        # Overwriting them with the singleton's tokens destroys the
+        # other accounts' credentials — the core cause of device token
+        # burning.  Error markers are still cleared for all entries so
+        # a re-auth gives every pool entry a fresh selection chance.
+        if source == "device_code":
+            entry["access_token"] = access_token
+            if refresh_token:
+                entry["refresh_token"] = refresh_token
+            if last_refresh:
+                entry["last_refresh"] = last_refresh
+            if _sync_expires_at_ms is not None:
+                entry["expires_at_ms"] = _sync_expires_at_ms
         entry["last_status"] = None
         entry["last_status_at"] = None
         entry["last_error_code"] = None

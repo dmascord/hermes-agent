@@ -1339,60 +1339,9 @@ def resolve_runtime_provider(
                 logger.debug("Nous pool entry agent_key expired/missing, falling through to runtime resolution")
                 pool_api_key = ""
 
-    # For Codex pool entries, each entry carries its own refresh_token.
-    # If the entry's access_token is expired, refresh it using that entry's
-    # refresh_token so the pool can rotate through damien-02, dmascord, and
-    # damien-01 independently (each with their own refresh token).
-    if provider == "openai-codex" and entry is not None and pool_api_key:
-        entry_rt = getattr(entry, "refresh_token", None)
-        if entry_rt:
-            try:
-                from hermes_cli.auth import (
-                    _codex_access_token_is_expiring,
-                    refresh_codex_oauth_pure,
-                )
-                if _codex_access_token_is_expiring(pool_api_key, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS):
-                    refreshed = refresh_codex_oauth_pure(
-                        str(pool_api_key or ""),
-                        str(entry_rt),
-                        timeout_seconds=float(os.getenv("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", "20")),
-                    )
-                    pool_api_key = refreshed["access_token"]
-                    # Persist the refreshed token ONLY to the pool entry on disk.
-                    # We intentionally do NOT call _save_codex_tokens (which would
-                    # overwrite providers["openai-codex"]) — each pool entry manages
-                    # its own refresh token independently so rotation works correctly.
-                    try:
-                        from hermes_cli.auth import write_credential_pool
-                        from dataclasses import replace as _replace
-                        updated_dict = {
-                            "access_token": refreshed["access_token"],
-                            "refresh_token": refreshed.get("refresh_token", entry_rt),
-                            "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        }
-                        for _f in ("id", "label", "auth_type", "priority", "source",
-                                   "base_url", "expires_at", "last_status",
-                                   "last_status_at", "last_error_code", "last_error_reason",
-                                   "last_error_message", "last_error_reset_at",
-                                   "request_count"):
-                            _v = getattr(entry, _f, None)
-                            if _v is not None and _f not in updated_dict:
-                                updated_dict[_f] = _v
-                        updated_entries = []
-                        for _e in pool._entries:
-                            if _e is entry:
-                                updated_entries.append(_replace(entry, **updated_dict).to_dict())
-                            else:
-                                updated_entries.append(_e.to_dict())
-                        write_credential_pool(provider, updated_entries)
-                        for _i, _e in enumerate(pool._entries):
-                            if _e is entry:
-                                pool._entries[_i] = _replace(entry, **updated_dict)
-                                break
-                    except Exception:
-                        pass  # Non-critical
-            except Exception:
-                pass  # Fall through with existing pool_api_key; pool will mark entry exhausted on error
+    # Codex pool entries are already refreshed by pool.select() ->
+    # _available_entries(refresh=True) -> _refresh_entry().  No second
+    # refresh here — doing so would race on single-use refresh tokens.
 
     if entry is not None and pool_api_key:
             return _resolve_runtime_from_pool_entry(

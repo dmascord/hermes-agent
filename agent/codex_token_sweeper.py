@@ -107,6 +107,11 @@ def _sweep_codex_pool_once() -> None:
             )
             pool._replace_entry(entry, updated)
             pool._persist()
+            # Sync refreshed tokens back to auth.json so
+            # _seed_from_singletons() on the next load_pool() sees
+            # fresh state instead of re-seeding stale tokens.
+            if updated.source == "device_code":
+                pool._sync_device_code_entry_to_auth_store(updated)
             refreshed_count += 1
             logger.info(
                 "codex_sweeper: refresh SUCCESS for %s (new token expires_at_ms=%s)",

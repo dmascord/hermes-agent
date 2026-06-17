@@ -7632,6 +7632,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                     logger.warning("[hermes-code] stream %s: rotated credential pool after 401", provider_model)
                                 except Exception as _pool_exc:
                                     logger.warning("[hermes-code] stream %s: credential pool rotate failed: %s", provider_model, _pool_exc)
+                                # Clear the cached runtime kwargs so the next
+                                # passthrough attempt re-resolves credentials
+                                # from the rotated pool instead of reusing the
+                                # stale cached api_key (24h TTL otherwise).
+                                _cb_prov = provider_model.split("/")[0] if "/" in provider_model else ""
+                                if _cb_prov:
+                                    _RUNTIME_KWARGS_CACHE.pop(_cb_prov, None)
+                                    _RUNTIME_KWARGS_CACHE_AT.pop(_cb_prov, None)
+                                    logger.info("[hermes-code] stream %s: cleared runtime kwargs cache for %s after 401", provider_model, _cb_prov)
                         logger.warning("[hermes-code] passthrough stream %s failed: %s", provider_model, exc)
                         passthrough_error = exc
                         logger.debug("[%d] !! stream provider error %s: %s", _req_id, type(exc).__name__, _exc_str[:200])
