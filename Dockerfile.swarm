@@ -72,8 +72,9 @@ RUN rm -f /var/cache/apk/* && apk update && \
 COPY --chown=hermes:hermes . .
 
 # Install the project itself (editable .pth pointer only; deps already present)
-# aiohttp is required by gateway API server but dropped from fresh uv resolution
-RUN uv sync --no-cache && uv pip install --no-cache aiohttp==3.13.3 anthropic==0.49.0
+# aiohttp is required by gateway API server but dropped from fresh uv resolution.
+# mcp is required by the Claude CLI stdio bridge used for Hermes tool calls.
+RUN uv sync --no-cache && uv pip install --no-cache aiohttp==3.13.3 anthropic==0.49.0 mcp==1.26.0 starlette==1.0.1
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Layer 3 — Node.js dependencies (root package.json only)
