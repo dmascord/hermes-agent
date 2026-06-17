@@ -32,6 +32,7 @@ _logger = logging.getLogger(__name__)
 # Anthropic OAuth constants (decoded from base64: Claude Code clientId)
 _CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _CLAUDE_TOKEN_URLS = (
+    "https://api.anthropic.com/v1/oauth/token",
     "https://platform.claude.com/v1/oauth/token",
     "https://console.anthropic.com/v1/oauth/token",
 )
@@ -155,6 +156,7 @@ def _claude_oauth_refresh_token(refresh_token: str, *, timeout: float = 15.0) ->
             "access_token": refreshed["access_token"],
             "refresh_token": refreshed.get("refresh_token") or refresh_token,
             "expires_in": expires_in,
+            "refresh_token_expires_in": refreshed.get("refresh_token_expires_in"),
         }
     except ImportError:
         pass
@@ -174,6 +176,7 @@ def _claude_oauth_refresh_token(refresh_token: str, *, timeout: float = 15.0) ->
                 "Content-Type": "application/x-www-form-urlencoded",
                 "User-Agent": "claude-cli/hermes (external, cli)",
                 "Accept": "application/json",
+                "anthropic-beta": "oauth-2025-04-20",
             },
         )
         try:
@@ -194,6 +197,7 @@ def _claude_oauth_refresh_token(refresh_token: str, *, timeout: float = 15.0) ->
             "access_token": access,
             "refresh_token": new_refresh,
             "expires_in": expires_in,
+            "refresh_token_expires_in": data.get("refresh_token_expires_in"),
         }
     if last_error is not None:
         raise last_error
@@ -465,6 +469,8 @@ def _maybe_refresh_claude_oauth() -> bool:
         auth["accessToken"] = result["access_token"]
         auth["refreshToken"] = result["refresh_token"]
         auth["expiresAt"] = int(time.time() * 1000) + result["expires_in"] * 1000
+        if result.get("refresh_token_expires_in"):
+            auth["refreshTokenExpiresAt"] = int(time.time() * 1000) + int(result["refresh_token_expires_in"]) * 1000
         auth.pop("last_refresh_error", None)
         # Guard against clobbering with stale backups or race conditions:
         # only persist if we are writing a genuinely newer token window.

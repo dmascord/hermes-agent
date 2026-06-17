@@ -935,6 +935,7 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
         content_type = "application/x-www-form-urlencoded"
 
     token_endpoints = [
+        "https://api.anthropic.com/v1/oauth/token",
         "https://platform.claude.com/v1/oauth/token",
         "https://console.anthropic.com/v1/oauth/token",
     ]
@@ -946,6 +947,8 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
             headers={
                 "Content-Type": content_type,
                 "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+                "anthropic-beta": "oauth-2025-04-20",
+                "Accept": "application/json",
             },
             method="POST",
         )
@@ -966,6 +969,7 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
             "access_token": access_token,
             "refresh_token": next_refresh,
             "expires_at_ms": int(time.time() * 1000) + (expires_in * 1000),
+            "refresh_token_expires_in": result.get("refresh_token_expires_in"),
         }
 
     if last_error is not None:
