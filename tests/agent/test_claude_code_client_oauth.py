@@ -71,6 +71,52 @@ def test_recovered_expired_credentials_are_refreshed_before_cli_use(tmp_path, mo
     assert oauth["rateLimitTier"] == "standard"
 
 
+def test_access_only_credentials_restore_refreshable_backup(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(parents=True)
+    expired_ms = int(time.time() * 1000) - 60_000
+    (claude_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "expired-access-only",
+            "expiresAt": expired_ms,
+            "scopes": ["user:inference"],
+        }
+    }), encoding="utf-8")
+
+    backup_dir = home / ".claude_backup"
+    backup_dir.mkdir(parents=True)
+    (backup_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "backup-access",
+            "refreshToken": "backup-refresh",
+            "expiresAt": expired_ms,
+            "scopes": ["user:inference"],
+        }
+    }), encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(ccc, "_resolve_home_dir", lambda: str(home))
+    monkeypatch.setattr(ccc, "_persist_claude_credentials_to_auth_json", lambda **_: None)
+    monkeypatch.setattr(
+        ccc,
+        "_claude_oauth_refresh_token",
+        lambda refresh_token: {
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+            "expires_in": 3600,
+        },
+    )
+
+    assert ccc._maybe_refresh_claude_oauth() is True
+
+    restored = json.loads((claude_dir / ".credentials.json").read_text(encoding="utf-8"))
+    oauth = restored["claudeAiOauth"]
+    assert oauth["accessToken"] == "fresh-access"
+    assert oauth["refreshToken"] == "fresh-refresh"
+    assert oauth["scopes"] == ["user:inference"]
+
+
 def test_mcp_config_uses_claude_code_shape_and_returns_path(tmp_path):
     client = ccc.ClaudeCodeClient(claude_cwd=str(tmp_path))
     manifest = tmp_path / "tools.json"

@@ -226,6 +226,40 @@ def _credential_expires_at_ms(auth: dict[str, Any]) -> int:
     except Exception:
         return 0
 
+
+def _restore_claude_credentials_from_backup(creds_path: Path) -> bool:
+    """Restore refreshable Claude credentials from the PVC backup if present."""
+    backup_roots = []
+    home_env = os.environ.get("HERMES_HOME", "").strip()
+    if home_env:
+        backup_roots.append(Path(home_env))
+    try:
+        resolved_home = Path(_resolve_home_dir())
+        backup_roots.extend([resolved_home, resolved_home.parent])
+    except Exception:
+        pass
+
+    seen: set[Path] = set()
+    for root in backup_roots:
+        pvc_backup = root / ".claude_backup" / ".credentials.json"
+        if pvc_backup in seen:
+            continue
+        seen.add(pvc_backup)
+        if not pvc_backup.exists():
+            continue
+        try:
+            data = json.loads(pvc_backup.read_text(encoding="utf-8"))
+            auth = data.get("claudeAiOauth", {}) if isinstance(data, dict) else {}
+            if not auth.get("accessToken") or not auth.get("refreshToken"):
+                _logger.debug("claude_oauth: backup %s is not refreshable", pvc_backup)
+                continue
+            _write_claude_credentials_file(creds_path, data)
+            _logger.info("claude_oauth: restored refreshable credentials from PVC backup %s", pvc_backup)
+            return True
+        except Exception as exc:
+            _logger.debug("claude_oauth: PVC backup restore failed from %s: %s", pvc_backup, exc)
+    return False
+
 def _persist_claude_credentials_to_auth_json(
     full_credentials: dict[str, Any],
     expires_at_ms: int,
@@ -356,18 +390,7 @@ def _maybe_refresh_claude_oauth() -> bool:
         _logger.info("claude_oauth: .credentials.json missing — checking PVC backup, then auth.json")
         
         # First try PVC backup (most reliable — survives pod restarts)
-        home_env = os.environ.get("HERMES_HOME", _resolve_home_dir())
-        pvc_backup = Path(home_env) / ".claude_backup" / ".credentials.json"
-        if pvc_backup.exists():
-            try:
-                import shutil
-                os.makedirs(creds_path.parent, exist_ok=True)
-                shutil.copy2(pvc_backup, creds_path)
-                os.chmod(creds_path, 0o600)
-                _logger.info("claude_oauth: restored from PVC backup %s", pvc_backup)
-                restored_credentials = True
-            except Exception as exc:
-                _logger.debug("claude_oauth: PVC backup copy failed: %s", exc)
+        restored_credentials = _restore_claude_credentials_from_backup(creds_path)
         
         # Fall back to auth.json recovery
         if not restored_credentials:
@@ -385,8 +408,19 @@ def _maybe_refresh_claude_oauth() -> bool:
         access_token = auth.get("accessToken", "")
         refresh_token = auth.get("refreshToken", "")
         if not refresh_token:
-            _logger.debug("claude_oauth: no refresh token — cannot refresh")
-            return False
+            _logger.info("claude_oauth: credentials have no refresh token — checking backup, then auth.json")
+            if _restore_claude_credentials_from_backup(creds_path) or _recover_claude_tokens_from_auth_json():
+                try:
+                    data = json.loads(creds_path.read_text(encoding="utf-8"))
+                    auth = data.get("claudeAiOauth", {})
+                    access_token = auth.get("accessToken", "")
+                    refresh_token = auth.get("refreshToken", "")
+                except Exception as exc:
+                    _logger.debug("claude_oauth: failed to read restored credentials: %s", exc)
+                    return False
+            if not refresh_token:
+                _logger.debug("claude_oauth: no refresh token — cannot refresh")
+                return False
         now_ms = int(time.time() * 1000)
         expires_at = _credential_expires_at_ms(auth)
         remaining_ms = expires_at - now_ms
