@@ -925,6 +925,11 @@ class ClaudeCodeClient:
                             call_id = part.get("id", uuid.uuid4().hex)
                             tool_name = part.get("name", "")
                             tool_input = part.get("input", {})
+                            if (
+                                tool_name == "ToolSearch"
+                                or tool_name.startswith("mcp__hermes-tools__")
+                            ):
+                                continue
                             # Yield the tool_call, caller will .send(result)
                             result = yield {
                                 "type": "tool_call",
