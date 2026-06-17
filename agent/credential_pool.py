@@ -417,6 +417,7 @@ class CredentialPool:
         self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
+        self._last_refresh_error: Optional[Exception] = None
 
     def has_credentials(self) -> bool:
         return bool(self._entries)
@@ -828,6 +829,7 @@ class CredentialPool:
                 return entry
         except Exception as exc:
             logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            self._last_refresh_error = exc
             # For anthropic claude_code entries: the refresh token may have been
             # consumed by another process. Check if ~/.claude/.credentials.json
             # has a newer token pair and retry once.
@@ -891,6 +893,7 @@ class CredentialPool:
             self._mark_exhausted(entry, None)
             return None
 
+        self._last_refresh_error = None
         updated = replace(
             updated,
             last_status=STATUS_OK,
@@ -997,20 +1000,36 @@ class CredentialPool:
                         model=entry.model or "*",
                         credential_id=entry.label,
                     )
-                    if remaining <= 0:
-                        # Cooldown expired — clear the exhausted status
-                        cleared = replace(
-                            entry,
-                            last_status=STATUS_OK,
-                            last_status_at=None,
-                            last_error_code=None,
-                            last_error_reason=None,
-                            last_error_message=None,
-                            last_error_reset_at=None,
+                    if remaining > 0:
+                        # Cooldown still active — keep the entry skipped
+                        continue
+                    elif remaining == 0:
+                        # model_cooldown_remaining returns 0.0 both when
+                        # there is no cooldown record AND when an existing
+                        # cooldown has just expired.  Only clear if we know
+                        # there WAS a cooldown (i.e. the function returned
+                        # a positive value on a previous call).  Without
+                        # this guard, entries with no cooldown record get
+                        # their local last_error_reset_at cleared
+                        # prematurely.  We detect this by checking the
+                        # entry's own last_error_reset_at — if it's in the
+                        # future, the cooldown DB has no authority to clear.
+                        local_reset = _parse_absolute_timestamp(
+                            getattr(entry, "last_error_reset_at", None)
                         )
-                        self._replace_entry(entry, cleared)
-                        entry = cleared
-                        cleared_any = True
+                        if local_reset is None or time.time() >= local_reset:
+                            cleared = replace(
+                                entry,
+                                last_status=STATUS_OK,
+                                last_status_at=None,
+                                last_error_code=None,
+                                last_error_reason=None,
+                                last_error_message=None,
+                                last_error_reset_at=None,
+                            )
+                            self._replace_entry(entry, cleared)
+                            entry = cleared
+                            cleared_any = True
                 except Exception:
                     pass  # best-effort — continue with local status check
 
@@ -1351,7 +1370,35 @@ class CredentialPool:
         refreshed = self._refresh_entry(entry, force=True)
         if refreshed is not None:
             self._current_id = refreshed.id
-        return refreshed
+            return refreshed
+        # Terminal OAuth refresh failure — the refresh token is permanently
+        # invalid.  Quarantine the device_code entry so it is not retried.
+        if (
+            self.provider == "openai-codex"
+            and entry.source == "device_code"
+            and self._last_refresh_error is not None
+        ):
+            try:
+                from hermes_cli.auth import _is_terminal_codex_oauth_refresh_error
+                if _is_terminal_codex_oauth_refresh_error(self._last_refresh_error):
+                    # Remove the dead device_code entry from the pool
+                    self._entries = [e for e in self._entries if e is not entry]
+                    self._current_id = None
+                    self._persist()
+                    # Clear auth.json tokens so _seed_from_singletons()
+                    # doesn't resurrect the dead entry on next pool load
+                    try:
+                        from hermes_cli.auth import _clear_auth_store_provider
+                        _clear_auth_store_provider(self.provider)
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "codex_pool: quarantined device_code entry %s after terminal refresh failure: %s",
+                        entry.id, self._last_refresh_error,
+                    )
+            except Exception:
+                pass
+        return None
 
     def reset_statuses(self) -> int:
         count = 0

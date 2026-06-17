@@ -1097,12 +1097,6 @@ def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
-    # EXTREME DEBUGGING: Track who wipes the store
-    with open("/home/tusker/.hermes/auth-save-trace.log", "a") as f:
-        f.write(f"[{datetime.now().isoformat()}] Auth Save: keys={list(auth_store.keys())} pool_len={len(auth_store.get('credential_pool', {}))}\n")
-        import traceback
-        f.write("".join(traceback.format_stack(limit=10)))
-        f.write("\n---\n")
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
