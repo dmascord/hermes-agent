@@ -21,6 +21,7 @@ import time
 import logging
 import uuid
 from pathlib import Path
+from typing import Any
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("claude-mcp-bridge")
@@ -98,6 +99,20 @@ def _proxy_tool_call(tool_name: str, arguments: dict) -> str:
     return json.dumps({"error": f"timeout waiting for tool result ({RESULT_TIMEOUT}s)"})
 
 
+class _ProxyToolMetadata:
+    async def call_fn_with_arg_validation(
+        self,
+        fn,
+        is_async: bool,
+        arguments: dict[str, Any],
+        context: dict[str, Any] | None = None,
+    ) -> Any:
+        return fn(**(arguments or {}))
+
+    def convert_result(self, result: Any) -> Any:
+        return result
+
+
 def main() -> None:
     tools = _load_tools()
     if not tools:
@@ -131,10 +146,11 @@ def main() -> None:
             structured_output=False,
         )
         # FastMCP derives a generic **kwargs schema. Override it with the
-        # actual OpenAI-compatible tool schema provided by the client.
+        # actual OpenAI-compatible tool schema and matching validation metadata.
         proxy_tool.parameters = tool_def.get(
             "input_schema", {"type": "object", "properties": {}}
         )
+        proxy_tool.fn_metadata = _ProxyToolMetadata()
         mcp._tool_manager._tools[tool_name] = proxy_tool
         logger.info("Registered proxy tool: %s", tool_name)
 
