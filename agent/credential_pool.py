@@ -1905,39 +1905,43 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 },
             )
 
-        if not active_sources:
-            pool_entries = (
-                auth_store.get("credential_pool", {})
-                if isinstance(auth_store.get("credential_pool"), dict)
-                else {}
-            ).get("openai-codex")
-            if isinstance(pool_entries, list):
-                for entry in pool_entries:
-                    raw_source = str(entry.get("source") or "").strip().lower()
-                    if raw_source.startswith("manual:device_code"):
-                        access = entry.get("access_token") or ""
-                        if access:
-                            # Preserve the entry's existing source (may already
-                            # be label-unique) so _upsert_entry doesn't collapse
-                            # it with another entry sharing the same prefix.
-                            unique_source = raw_source
-                            active_sources.add(unique_source)
-                            changed |= _upsert_entry(
-                                entries,
-                                provider,
-                                unique_source,
-                                {
-                                    "source": unique_source,
-                                    "auth_type": AUTH_TYPE_OAUTH,
-                                    "access_token": access,
-                                    "refresh_token": entry.get("refresh_token") or "",
-                                    "base_url": entry.get("base_url")
-                                    or "https://chatgpt.com/backend-api/codex",
-                                    "last_refresh": entry.get("last_refresh"),
-                                    "expires_at_ms": entry.get("expires_at_ms"),
-                                    "label": str(entry.get("label") or unique_source),
-                                },
-                            )
+        # Always load manual device_code entries from the pool file, regardless
+        # of whether the singleton is present.  Each manual entry represents an
+        # independent ChatGPT account with its own refresh token.  The old guard
+        # ``if not active_sources:`` prevented loading when the singleton existed,
+        # silently dropping all manual entries on every pool reload.
+        pool_entries = (
+            auth_store.get("credential_pool", {})
+            if isinstance(auth_store.get("credential_pool"), dict)
+            else {}
+        ).get("openai-codex")
+        if isinstance(pool_entries, list):
+            for entry in pool_entries:
+                raw_source = str(entry.get("source") or "").strip().lower()
+                if raw_source.startswith("manual:device_code"):
+                    access = entry.get("access_token") or ""
+                    if access:
+                        # Preserve the entry's existing source (may already
+                        # be label-unique) so _upsert_entry doesn't collapse
+                        # it with another entry sharing the same prefix.
+                        unique_source = raw_source
+                        active_sources.add(unique_source)
+                        changed |= _upsert_entry(
+                            entries,
+                            provider,
+                            unique_source,
+                            {
+                                "source": unique_source,
+                                "auth_type": AUTH_TYPE_OAUTH,
+                                "access_token": access,
+                                "refresh_token": entry.get("refresh_token") or "",
+                                "base_url": entry.get("base_url")
+                                or "https://chatgpt.com/backend-api/codex",
+                                "last_refresh": entry.get("last_refresh"),
+                                "expires_at_ms": entry.get("expires_at_ms"),
+                                "label": str(entry.get("label") or unique_source),
+                            },
+                        )
     return changed, active_sources
 
 
