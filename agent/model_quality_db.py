@@ -125,6 +125,11 @@ _QUALITY_SEED_ENTRIES: List[Tuple[str, str, float]] = [
     ("claude-code-cli", "sonnet", 90.0),
     ("claude-code-cli", "opus", 90.0),
     ("claude-code-cli", "haiku", 85.0),
+    ("openai-codex", "gpt-5.5", 90.0),
+    ("openai-codex", "gpt-5.4", 90.0),
+    ("openai-codex", "gpt-5.4-mini", 85.0),
+    ("openai-codex", "gpt-5.3-codex", 85.0),
+    ("openai-codex", "gpt-5.3-codex-spark", 80.0),
 ]
 
 

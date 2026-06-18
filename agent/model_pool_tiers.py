@@ -48,6 +48,11 @@ _MODEL_TIERS: Dict[str, ModelTier] = {
     "opencode-go/deepseek-v4-pro": ModelTier.TIER0_LARGE_RELIABLE,
     "opencode-go/qwen3.6-plus": ModelTier.TIER0_LARGE_RELIABLE,
     "google/gemini-2.5-flash": ModelTier.TIER0_LARGE_RELIABLE,
+    "openai-codex/gpt-5.5": ModelTier.TIER0_LARGE_RELIABLE,
+    "openai-codex/gpt-5.4": ModelTier.TIER0_LARGE_RELIABLE,
+    "openai-codex/gpt-5.4-mini": ModelTier.TIER0_LARGE_RELIABLE,
+    "openai-codex/gpt-5.3-codex": ModelTier.TIER0_LARGE_RELIABLE,
+    "openai-codex/gpt-5.3-codex-spark": ModelTier.TIER0_LARGE_RELIABLE,
 
     # Tier 1: Medium context + reliable tools
     "zai/glm-4.7": ModelTier.TIER1_MEDIUM_RELIABLE,
