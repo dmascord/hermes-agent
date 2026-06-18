@@ -10604,6 +10604,47 @@ class APIServerAdapter(BasePlatformAdapter):
                         pass
 
             _t_create = time.time()
+            # MiMoCode CLI dispatch — intercept before standard agent creation
+            if provider_mode and self._model_name in ("mimocode-cli",):
+                try:
+                    from hermes_cli.auth import resolve_external_process_provider_credentials
+                    _mc_creds = resolve_external_process_provider_credentials("mimocode-cli")
+                    from agent.mimocode_code_client import MiMoCodeClient
+                    _mc_client = MiMoCodeClient(
+                        api_key=_mc_creds.get("api_key", "mimocode-cli"),
+                        base_url=_mc_creds.get("base_url", "mimocode://codex"),
+                        command=_mc_creds.get("command"),
+                        args=_mc_creds.get("args"),
+                    )
+                    messages = [{"role": "user", "content": user_message}]
+                    if conversation_history:
+                        for msg in conversation_history:
+                            messages.insert(0, msg)
+                    if ephemeral_system_prompt:
+                        messages.insert(0, {"role": "system", "content": ephemeral_system_prompt})
+                    result_obj = _mc_client._create_chat_completion(
+                        model=self._model_name,
+                        messages=messages,
+                        tools=tools,
+                    )
+                    result = {
+                        "final_response": result_obj.choices[0].message.content or "",
+                        "tool_calls": [
+                            {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+                            for tc in (result_obj.choices[0].message.tool_calls or [])
+                        ],
+                        "messages": [],
+                    }
+                    usage = {
+                        "input_tokens": getattr(result_obj.usage, "prompt_tokens", 0),
+                        "output_tokens": getattr(result_obj.usage, "completion_tokens", 0),
+                        "total_tokens": getattr(result_obj.usage, "total_tokens", 0),
+                    }
+                    logger.info("[hermes-code] mimocode-cli completed: text_len=%d", len(result.get("final_response", "")))
+                    return result, usage
+                except Exception as exc:
+                    logger.warning("[hermes-code] mimocode-cli error: %s", exc)
+                    return {"final_response": "", "tool_calls": [], "messages": []}, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
