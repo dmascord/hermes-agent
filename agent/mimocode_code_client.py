@@ -25,6 +25,12 @@ _logger = logging.getLogger(__name__)
 MIMOCODE_BASE_URL = "mimocode://codex"
 DEFAULT_TIMEOUT_SECONDS = 300.0
 
+MODEL_MAP = {
+    "mimocode-cli": "mimo/mimo-auto",
+    "mimo-auto": "mimo/mimo-auto",
+    "mimo": "mimo/mimo-auto",
+}
+
 
 def _resolve_command() -> str:
     return (
@@ -102,9 +108,12 @@ class MiMoCodeClient:
 
         prompt = "\n\n".join(user_parts) if user_parts else ""
 
+        # Map model name to valid MiMoCode format
+        model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
+
         cmd = [self._command] + self._args
-        if model:
-            cmd += ["--model", model]
+        if model_name:
+            cmd += ["--model", model_name]
         if prompt:
             cmd += [prompt]
 
@@ -242,9 +251,10 @@ class MiMoCodeClient:
         with open(config_file, "w") as f:
             json.dump(mcp_config, f)
 
+        model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
         cmd = [self._command] + self._args
-        if model:
-            cmd += ["--model", model]
+        if model_name:
+            cmd += ["--model", model_name]
         cmd += ["--mcp-config", config_file]
         if prompt:
             cmd += [prompt]
