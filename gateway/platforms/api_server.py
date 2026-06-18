@@ -3474,24 +3474,12 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
             runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
             runtime_kwargs["provider"] = "zai"
         elif provider_prefix == "xiaomi":
-            # Xiaomi MiMo — standard API key auth or free-tier bootstrap
-            api_key = os.getenv("XIAOMI_API_KEY", "")
-            if api_key:
-                # Standard API key auth
-                base_url = os.getenv("XIAOMI_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1")
-                runtime_kwargs["base_url"] = base_url
-                runtime_kwargs["api_key"] = api_key
-            else:
-                # Free-tier bootstrap auth (mimo-auto)
-                try:
-                    from agent.xiaomi_free_auth import bootstrap_jwt, get_chat_url
-                    jwt = bootstrap_jwt()
-                    runtime_kwargs["base_url"] = get_chat_url()
-                    runtime_kwargs["api_key"] = jwt
-                except Exception as exc:
-                    logger.warning("xiaomi free-tier bootstrap failed: %s", exc)
-                    runtime_kwargs["base_url"] = os.getenv("XIAOMI_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1")
-                    runtime_kwargs["api_key"] = ""
+            # Xiaomi MiMo — API key auth (standard endpoint)
+            # Free-tier bootstrap auth is available via mimo CLI but
+            # the endpoint restricts direct API access by IP/region.
+            base_url = os.getenv("XIAOMI_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1")
+            runtime_kwargs["base_url"] = base_url
+            runtime_kwargs["api_key"] = os.getenv("XIAOMI_API_KEY", "")
             runtime_kwargs["provider"] = "xiaomi"
         elif provider_prefix == "nous":
             # Nous API — routes nous/* models (e.g. nvidia/nemotron-3-ultra:free)
