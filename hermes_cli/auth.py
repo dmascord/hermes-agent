@@ -237,6 +237,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="claude://codex",
         base_url_env_var="HERMES_CLAUDE_CODE_BASE_URL",
     ),
+    "mimocode-cli": ProviderConfig(
+        id="mimocode-cli",
+        name="MiMoCode CLI",
+        auth_type="external_process",
+        inference_base_url="mimocode://codex",
+        base_url_env_var="HERMES_MIMOCODE_BASE_URL",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -5990,6 +5997,16 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "json"]
         api_key = "claude-code-cli"
         check_scheme = "claude://"
+    elif provider_id == "mimocode-cli":
+        command = (
+            os.getenv("HERMES_MIMOCODE_COMMAND", "").strip()
+            or os.getenv("MIMOCODE_CLI_PATH", "").strip()
+            or "mimo"
+        )
+        raw_args = os.getenv("HERMES_MIMOCODE_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["run", "--format", "json", "--pure"]
+        api_key = "mimocode-cli"
+        check_scheme = "mimocode://"
     else:
         raise AuthError(
             f"External process provider '{provider_id}' not supported.",
@@ -6012,6 +6029,13 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
                 "Install Claude Code CLI: npm install -g @anthropic-ai/claude-code",
                 provider=provider_id,
                 code="missing_claude_code_cli",
+            )
+        elif provider_id == "mimocode-cli":
+            raise AuthError(
+                f"Could not find the MiMoCode command '{command}'. "
+                "Install MiMoCode CLI: npm install -g @mimo-ai/cli",
+                provider=provider_id,
+                code="missing_mimocode_cli",
             )
 
     return {

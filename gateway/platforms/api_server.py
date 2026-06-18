@@ -3207,9 +3207,6 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                 )
         elif provider_prefix == "claude-code-cli":
             # External process provider — Claude Code CLI subprocess.
-            # The actual subprocess invocation happens in the non-streaming
-            # passthrough path. Here we just mark the provider so the
-            # dispatch can take the ClaudeCodeClient route.
             try:
                 from hermes_cli.auth import resolve_external_process_provider_credentials
                 _cc_creds = resolve_external_process_provider_credentials("claude-code-cli")
@@ -3223,6 +3220,21 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                 runtime_kwargs["base_url"] = "claude://codex"
                 runtime_kwargs["api_key"] = "claude-code-cli"
                 runtime_kwargs["provider"] = "claude-code-cli"
+        elif provider_prefix == "mimocode-cli":
+            # External process provider — MiMoCode CLI subprocess.
+            try:
+                from hermes_cli.auth import resolve_external_process_provider_credentials
+                _mc_creds = resolve_external_process_provider_credentials("mimocode-cli")
+                runtime_kwargs["base_url"] = _mc_creds.get("base_url", "mimocode://codex")
+                runtime_kwargs["api_key"] = _mc_creds.get("api_key", "mimocode-cli")
+                runtime_kwargs["provider"] = "mimocode-cli"
+            except Exception as _mc_exc:
+                logging.getLogger(__name__).warning(
+                    "[hermes-code] mimocode-cli credential resolution failed: %s", _mc_exc,
+                )
+                runtime_kwargs["base_url"] = "mimocode://codex"
+                runtime_kwargs["api_key"] = "mimocode-cli"
+                runtime_kwargs["provider"] = "mimocode-cli"
         elif provider_prefix == "openai":
             openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
             openai_base = os.getenv("OPENAI_BASE_URL", "").strip()
@@ -3524,6 +3536,16 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                 runtime_kwargs["base_url"] = "claude://codex"
                 runtime_kwargs["api_key"] = "claude-code-cli"
             runtime_kwargs["provider"] = "claude-code-cli"
+        elif normalized_model == "mimocode-cli":
+            try:
+                from hermes_cli.auth import resolve_external_process_provider_credentials
+                _mc_creds = resolve_external_process_provider_credentials("mimocode-cli")
+                runtime_kwargs["base_url"] = _mc_creds.get("base_url", "mimocode://codex")
+                runtime_kwargs["api_key"] = _mc_creds.get("api_key", "mimocode-cli")
+            except Exception:
+                runtime_kwargs["base_url"] = "mimocode://codex"
+                runtime_kwargs["api_key"] = "mimocode-cli"
+            runtime_kwargs["provider"] = "mimocode-cli"
         else:
             from hermes_cli.model_normalize import detect_vendor
             detected_provider = detect_vendor(normalized_model)
@@ -5770,10 +5792,9 @@ class APIServerAdapter(BasePlatformAdapter):
         _provider_mode = False
         if model_name == "hermes-agentic-full":
             _toolset_mode = "full"
-        elif model_name in ("hermes-code", "claude-code-cli") or "/" in model_name:
-            # Activate passthrough for hermes-code, claude-code-cli, OR any model
-            # with / (provider/model format).  Passthrough routes through the
-            # provider-specific handlers with cooldown support.
+        elif model_name in ("hermes-code", "claude-code-cli", "mimocode-cli") or "/" in model_name:
+            # Activate passthrough for hermes-code, claude-code-cli, mimocode-cli,
+            # OR any model with / (provider/model format).
             _provider_mode = True
         external_tool_mode = "none"
         if isinstance(tools, list) and tools:
@@ -6087,7 +6108,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "fallback chain will be skipped",
                         _req_id, model_name,
                     )
-                elif model_name in ("claude-code-cli",):
+                elif model_name in ("claude-code-cli", "mimocode-cli"):
                     # External-process providers: strict mode, pass through to provider-specific handler
                     _passthrough_models.append(model_name)
                     _strict_mode = True
@@ -7003,6 +7024,122 @@ class APIServerAdapter(BasePlatformAdapter):
                                     },
                                 )
                                 return response
+                        elif prov == "mimocode-cli":
+                            # MiMoCode CLI — JSON event mode.
+                            logger.info("[hermes-code][req=%s] mimocode-cli dispatch: prov=%s base_url=%s", _req_id, prov, base_url)
+                            try:
+                                from hermes_cli.auth import resolve_external_process_provider_credentials
+                                _mc_creds = resolve_external_process_provider_credentials("mimocode-cli")
+                                from agent.mimocode_code_client import MiMoCodeClient
+                                _mc_client = MiMoCodeClient(
+                                    api_key=_mc_creds.get("api_key", "mimocode-cli"),
+                                    base_url=_mc_creds.get("base_url", "mimocode://codex"),
+                                    command=_mc_creds.get("command"),
+                                    args=_mc_creds.get("args"),
+                                )
+                            except Exception as _mc_exc:
+                                logger.warning("[hermes-code][req=%s] mimocode-cli credential resolution failed: %s", _req_id, _mc_exc)
+                                _mc_client = None
+                            if _mc_client is not None:
+                                _skip_normal_call = True
+                                logger.info("[hermes-code][req=%s] mimocode-cli starting for model=%s", _req_id, resolved_model)
+                                _bridge_completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+                                _bridge_sse_headers = {
+                                    "Content-Type": "text/event-stream",
+                                    "Cache-Control": "no-cache",
+                                    "X-Accel-Buffering": "no",
+                                }
+                                if session_id:
+                                    _bridge_sse_headers["X-Hermes-Session-Id"] = session_id
+                                response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
+                                await response.prepare(request)
+                                _bridge_events: asyncio.Queue = asyncio.Queue()
+                                _bridge_error: list[Exception] = []
+                                def _run_mc_bridge(_c=_mc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                                    try:
+                                        gen = _c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools)
+                                        for event in gen:
+                                            _bridge_events.put_nowait(event)
+                                    except Exception as exc:
+                                        _bridge_error.append(exc)
+                                        _bridge_events.put_nowait({"type": "error", "message": str(exc)})
+                                    finally:
+                                        _bridge_events.put_nowait({"type": "_done"})
+                                _bridge_thread = threading.Thread(target=_run_mc_bridge, daemon=True)
+                                _bridge_thread.start()
+                                _bridge_final_text = ""
+                                _bridge_usage = {}
+                                _bridge_model = resolved_model
+                                _bridge_tool_calls: list[dict] = []
+                                while True:
+                                    _be = await _bridge_events.get()
+                                    if _be is None or _be.get("type") == "_done":
+                                        break
+                                    _bt = _be.get("type")
+                                    if _bt == "tool_call":
+                                        _call_id = _be.get("call_id", "")
+                                        _tool_name = _be.get("name", "")
+                                        _tool_args = _be.get("arguments", {})
+                                        _tc = {
+                                            "id": _call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": _tool_name,
+                                                "arguments": json.dumps(_tool_args),
+                                            },
+                                        }
+                                        _bridge_tool_calls.append(_tc)
+                                        _tc_chunk = {
+                                            "id": _bridge_completion_id, "object": "chat.completion.chunk",
+                                            "created": int(time.time()), "model": model_name,
+                                            "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
+                                        }
+                                        await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                    elif _bt in ("text", "assistant_text"):
+                                        _chunk_text = _be.get("text", "")
+                                        _bridge_final_text += _chunk_text
+                                        _tc_chunk = {
+                                            "id": _bridge_completion_id, "object": "chat.completion.chunk",
+                                            "created": int(time.time()), "model": model_name,
+                                            "choices": [{"index": 0, "delta": {"content": _chunk_text}, "finish_reason": None}],
+                                        }
+                                        await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                    elif _bt == "error":
+                                        logger.warning("[hermes-code] mimocode-cli bridge error: %s", _be.get("message"))
+                                    elif _bt == "final":
+                                        _bridge_usage = _be.get("usage", {})
+                                        _bridge_model = _be.get("model", resolved_model)
+                                _bridge_finish_reason = "tool_calls" if _bridge_tool_calls else "stop"
+                                _bridge_usage_ns = SimpleNamespace(
+                                    prompt_tokens=_bridge_usage.get("input_tokens", 0),
+                                    completion_tokens=_bridge_usage.get("output_tokens", 0),
+                                    total_tokens=_bridge_usage.get("total_tokens", 0),
+                                )
+                                _bridge_finish_chunk = {
+                                    "id": _bridge_completion_id, "object": "chat.completion.chunk",
+                                    "created": int(time.time()), "model": _bridge_model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": _bridge_finish_reason}],
+                                    "usage": {
+                                        "prompt_tokens": int(_bridge_usage_ns.prompt_tokens or 0),
+                                        "completion_tokens": int(_bridge_usage_ns.completion_tokens or 0),
+                                        "total_tokens": int(_bridge_usage_ns.total_tokens or 0),
+                                    },
+                                }
+                                await response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
+                                await response.write(b"data: [DONE]\n\n")
+                                await response.write_eof()
+                                logger.info("[hermes-code][req=%s] mimocode-cli completed: text_len=%d tool_calls=%d", _req_id, len(_bridge_final_text), len(_bridge_tool_calls))
+                                try:
+                                    from agent.model_cooldown_db import mark_provider_success
+                                    mark_provider_success(prov, resolved_model, base_url=base_url or "")
+                                except Exception:
+                                    pass
+                                try:
+                                    from agent.model_quality_db import record_success
+                                    record_success(prov, provider_model, base_url=base_url or "", latency_ms=0)
+                                except Exception:
+                                    pass
+                                return response
                         else:
                             _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                             _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
@@ -7262,7 +7399,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             # the final answer as text.  Don't penalise it for text-only —
                             # the "tool calls" happened inside the subprocess.
                             _is_claude_code = provider_model.startswith("claude-code-cli")
-                            if not _is_claude_code and not tool_calls_out:
+                            _is_mimocode = provider_model.startswith("mimocode-cli")
+                            if not _is_claude_code and not _is_mimocode and not tool_calls_out:
                                 logger.warning(
                                     "[hermes-code] %s returned text-only (no tool calls) despite tools being provided, "
                                     "returning text and marking as bad tool-caller",
@@ -8289,7 +8427,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         # the final answer as text.  Don't penalise it for text-only —
                         # the "tool calls" happened inside the subprocess.
                         _is_claude_code_ns = provider_model.startswith("claude-code-cli")
-                        if _is_claude_code_ns:
+                        _is_mimocode_ns = provider_model.startswith("mimocode-cli")
+                        if _is_claude_code_ns or _is_mimocode_ns:
                             logger.info(
                                 "[hermes-code] claude-code-cli: text-only response accepted (CLI executes tools internally)",
                                 provider_model,
