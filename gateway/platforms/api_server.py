@@ -10081,6 +10081,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_choice=tool_choice,
                 external_tool_mode=external_tool_mode,
                 user_model=None,
+                request_model=model_name,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -10561,6 +10562,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_choice: Optional[str] = None,
         external_tool_mode: str = "none",
         user_model: Optional[str] = None,
+        request_model: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -10605,7 +10607,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             _t_create = time.time()
             # MiMoCode CLI dispatch — intercept before standard agent creation
-            if provider_mode and self._model_name in ("mimocode-cli",):
+            if provider_mode and request_model in ("mimocode-cli",):
                 try:
                     from hermes_cli.auth import resolve_external_process_provider_credentials
                     _mc_creds = resolve_external_process_provider_credentials("mimocode-cli")
@@ -10623,7 +10625,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     if ephemeral_system_prompt:
                         messages.insert(0, {"role": "system", "content": ephemeral_system_prompt})
                     result_obj = _mc_client._create_chat_completion(
-                        model=self._model_name,
+                        model=request_model,
                         messages=messages,
                         tools=tools,
                     )
