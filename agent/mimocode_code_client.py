@@ -1,7 +1,9 @@
 """OpenAI-compatible shim that forwards Hermes requests to `mimo run`.
 
-Each request runs MiMoCode in JSON event mode, collects text and tool
-events, and converts them back into the minimal shape Hermes expects.
+Supports two modes:
+1. Simple mode: runs `mimo run --format json` and parses JSON events.
+2. MCP bridge mode: runs `mimo run --mcp-config <config>` with a proxy
+   that lets Hermes intercept and execute tool calls.
 """
 
 from __future__ import annotations
@@ -11,15 +13,16 @@ import logging
 import os
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 _logger = logging.getLogger(__name__)
 
 MIMOCODE_BASE_URL = "mimocode://codex"
-
 DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
@@ -35,11 +38,7 @@ def _resolve_args() -> list[str]:
     raw = os.getenv("HERMES_MIMOCODE_ARGS", "").strip()
     if raw:
         return shlex.split(raw)
-    return [
-        "run",
-        "--format", "json",
-        "--pure",
-    ]
+    return ["run", "--format", "json", "--pure"]
 
 
 def _resolve_home_dir() -> str:
@@ -86,9 +85,7 @@ class MiMoCodeClient:
         tools: list[dict[str, Any]] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> Any:
-        """Run `mimo run` in JSON mode and return a SimpleNamespace mimicking
-        an OpenAI ChatCompletion response."""
-        # Build the prompt from messages — extract system + user content
+        """Simple mode: run `mimo run --format json` and parse events."""
         instructions = ""
         user_parts = []
         for msg in messages:
@@ -112,16 +109,11 @@ class MiMoCodeClient:
             cmd += [prompt]
 
         env = _build_subprocess_env()
-
         _logger.info("[mimocode-cli] running: %s", " ".join(cmd[:8]))
 
         proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=False,
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, text=False,
         )
 
         try:
@@ -135,11 +127,9 @@ class MiMoCodeClient:
             stderr = stderr_bytes.decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"MiMoCode CLI exited {proc.returncode}: {stderr}")
 
-        # Parse JSON events from stdout
         text_parts = []
         tool_calls = []
         usage = {}
-        total_tokens = 0
 
         for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
             line = line.strip()
@@ -174,7 +164,6 @@ class MiMoCodeClient:
                 }
 
         content_text = "\n".join(text_parts) if text_parts else ""
-
         message = SimpleNamespace(
             role="assistant",
             content=content_text if not tool_calls else None,
@@ -191,46 +180,136 @@ class MiMoCodeClient:
         tools: list[dict[str, Any]] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ):
-        """Generator that yields events for tool-call bridging.
+        """MCP bridge mode: run with MCP proxy for tool interception.
 
-        Yields dicts with type: text, tool_call, tool_result, or final.
+        Yields events: text, tool_call, tool_result, final.
         """
-        # For MiMoCode, the CLI handles tools internally, so we just run
-        # the full request and yield the results.
-        result = self._create_chat_completion(
-            model=model,
-            messages=messages,
-            tools=tools,
-            timeout=timeout,
+        # Build the prompt from messages
+        instructions = ""
+        user_parts = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+                )
+            if role == "system":
+                instructions = str(content).strip()
+            elif role in ("user", "developer"):
+                user_parts.append(str(content).strip())
+
+        prompt = "\n\n".join(user_parts) if user_parts else ""
+
+        # Create temp files for MCP bridge communication
+        session_id = f"hermes_{int(time.time())}_{os.getpid()}"
+        tools_file = tempfile.mktemp(suffix=".json", prefix="hermes_tools_")
+        queue_in = f"/tmp/hermes_queue_{session_id}.in"
+        queue_out_dir = f"/tmp/hermes_result_{session_id}"
+
+        # Write tools manifest
+        os.makedirs(queue_out_dir, exist_ok=True)
+        tool_schemas = []
+        if tools:
+            for tool in tools:
+                if tool.get("type") == "function":
+                    func = tool.get("function", {})
+                    tool_schemas.append({
+                        "name": func.get("name", ""),
+                        "description": func.get("description", ""),
+                        "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
+                    })
+        with open(tools_file, "w") as f:
+            json.dump(tool_schemas, f)
+
+        # Create MCP config
+        bridge_script = str(Path(__file__).parent / "mimocode_mcp_bridge.py")
+        mcp_config = {
+            "mcpServers": {
+                "hermes-tools": {
+                    "type": "stdio",
+                    "command": sys.executable,
+                    "args": [bridge_script],
+                    "env": {
+                        "HERMES_TOOLS_FILE": tools_file,
+                        "HERMES_QUEUE_IN": queue_in,
+                        "HERMES_QUEUE_OUT_DIR": queue_out_dir,
+                    },
+                }
+            }
+        }
+        config_file = tempfile.mktemp(suffix=".json", prefix="mimocode_mcp_")
+        with open(config_file, "w") as f:
+            json.dump(mcp_config, f)
+
+        cmd = [self._command] + self._args
+        if model:
+            cmd += ["--model", model]
+        cmd += ["--mcp-config", config_file]
+        if prompt:
+            cmd += [prompt]
+
+        env = _build_subprocess_env()
+        _logger.info("[mimocode-cli] MCP bridge: %s", " ".join(cmd[:6]))
+
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, text=False,
         )
 
-        # Yield text content
-        if result.choices[0].message.content:
-            yield {
-                "type": "assistant_text",
-                "text": result.choices[0].message.content,
-            }
+        try:
+            # Read stdout line by line for streaming
+            for raw_line in proc.stdout:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-        # Yield tool calls
-        if result.choices[0].message.tool_calls:
-            for tc in result.choices[0].message.tool_calls:
-                yield {
-                    "type": "tool_call",
-                    "call_id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "arguments": json.loads(tc["function"]["arguments"]),
-                }
+                etype = event.get("type", "")
+                part = event.get("part", {})
 
-        # Yield final
-        usage = {}
-        if hasattr(result, "usage") and result.usage:
-            usage = {
-                "input_tokens": getattr(result.usage, "prompt_tokens", 0),
-                "output_tokens": getattr(result.usage, "completion_tokens", 0),
-                "total_tokens": getattr(result.usage, "total_tokens", 0),
-            }
-        yield {
-            "type": "final",
-            "model": model,
-            "usage": usage,
-        }
+                if etype == "text":
+                    yield {"type": "text", "text": part.get("text", "")}
+                elif etype == "tool_use":
+                    tool_name = part.get("tool", "unknown")
+                    call_id = part.get("callID", "")
+                    tool_input = part.get("state", {}).get("input", {})
+
+                    yield {
+                        "type": "tool_call",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "arguments": tool_input if isinstance(tool_input, dict) else {},
+                    }
+                elif etype == "step_finish":
+                    tokens = part.get("tokens", {})
+                    yield {
+                        "type": "final",
+                        "model": model,
+                        "usage": {
+                            "input_tokens": tokens.get("input", 0),
+                            "output_tokens": tokens.get("output", 0),
+                            "total_tokens": tokens.get("total", 0),
+                        },
+                    }
+
+        except Exception as exc:
+            _logger.error("[mimocode-cli] MCP bridge error: %s", exc)
+            yield {"type": "error", "message": str(exc)}
+        finally:
+            proc.kill()
+            proc.wait()
+            # Cleanup temp files
+            for f in [tools_file, config_file]:
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
+            try:
+                import shutil
+                shutil.rmtree(queue_out_dir, ignore_errors=True)
+            except Exception:
+                pass
