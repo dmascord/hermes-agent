@@ -6260,7 +6260,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Streaming passthrough: collect full response then stream as SSE
             if stream:
                 for provider_model in _passthrough_models:
-                    if "/" not in provider_model and provider_model not in ("claude-code-cli",):
+                    if "/" not in provider_model and provider_model not in ("claude-code-cli", "mimocode-cli"):
                         continue
 
                     # ── Tool set selection (quality-aware) ──
@@ -7816,7 +7816,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 [t.get("function", {}).get("name", "?") for t in (passthrough_tools or [])[:5]],
             )
             for provider_model in _passthrough_models:
-                if "/" not in provider_model and provider_model not in ("claude-code-cli",):
+                if "/" not in provider_model and provider_model not in ("claude-code-cli", "mimocode-cli"):
                     continue
 
                 # Check cooldown before attempting this provider
