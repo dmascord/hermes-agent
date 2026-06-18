@@ -6947,7 +6947,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             except Exception as _re:
                                                 logger.warning("[hermes-code] bridge: failed to write placeholder result: %s", _re)
                                         logger.info("[hermes-code] bridge: streamed tool_call %s to OMP", _call_id)
-                                    elif _bt == "assistant_text":
+                                    elif _bt in ("text", "assistant_text"):
                                         _text = _be.get("text", "")
                                         if _text:
                                             _bridge_final_text += _text
@@ -8323,7 +8323,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         },
                                     }
                                     _bridge_tool_calls_ns.append(_tc)
-                                elif _bt == "assistant_text":
+                                elif _bt in ("text", "assistant_text"):
                                     _bridge_final_text_ns += _be.get("text", "")
                                 elif _bt == "final":
                                     _bridge_final_text_ns = _be.get("text", _bridge_final_text_ns)
