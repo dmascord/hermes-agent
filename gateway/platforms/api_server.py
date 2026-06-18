@@ -8285,6 +8285,68 @@ class APIServerAdapter(BasePlatformAdapter):
                                 pass
                         else:
                             continue
+                    elif prov == "mimocode-cli":
+                        # MiMoCode CLI — JSON event mode (non-streaming).
+                        logger.info("[hermes-code][req=%s] mimocode-cli ns dispatch: prov=%s", _req_id, prov)
+                        try:
+                            from hermes_cli.auth import resolve_external_process_provider_credentials
+                            _mc_creds_ns = resolve_external_process_provider_credentials("mimocode-cli")
+                            from agent.mimocode_code_client import MiMoCodeClient
+                            _mc_client_ns = MiMoCodeClient(
+                                api_key=_mc_creds_ns.get("api_key", "mimocode-cli"),
+                                base_url=_mc_creds_ns.get("base_url", "mimocode://codex"),
+                                command=_mc_creds_ns.get("command"),
+                                args=_mc_creds_ns.get("args"),
+                            )
+                        except Exception as _mc_exc:
+                            logger.warning("[hermes-code][req=%s] mimocode-cli credential resolution failed: %s", _req_id, _mc_exc)
+                            _mc_client_ns = None
+                        if _mc_client_ns is not None:
+                            _skip_normal_call = True
+                            _bridge_final_text_ns = ""
+                            _bridge_usage_ns = {}
+                            _bridge_model_ns = resolved_model
+                            _bridge_tool_calls_ns = []
+                            def _run_mc_bridge_ns(_c=_mc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                                events = list(_c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools))
+                                return events
+                            _ns_events = await _ns_loop.run_in_executor(None, _run_mc_bridge_ns)
+                            for _be in _ns_events:
+                                _bt = _be.get("type")
+                                if _bt == "tool_call":
+                                    _tc = {
+                                        "id": _be.get("call_id", ""),
+                                        "type": "function",
+                                        "function": {
+                                            "name": _be.get("name", ""),
+                                            "arguments": json.dumps(_be.get("arguments", {})),
+                                        },
+                                    }
+                                    _bridge_tool_calls_ns.append(_tc)
+                                elif _bt == "assistant_text":
+                                    _bridge_final_text_ns += _be.get("text", "")
+                                elif _bt == "final":
+                                    _bridge_final_text_ns = _be.get("text", _bridge_final_text_ns)
+                                    _bridge_usage_ns = _be.get("usage", {})
+                                    _bridge_model_ns = _be.get("model", _bridge_model_ns)
+                                elif _bt == "error":
+                                    logger.warning("[hermes-code] mimocode-cli ns error: %s", _be.get("message"))
+                            _usage_ns_obj = SimpleNamespace(
+                                prompt_tokens=int(_bridge_usage_ns.get("input_tokens", 0) or 0),
+                                completion_tokens=int(_bridge_usage_ns.get("output_tokens", 0) or 0),
+                                total_tokens=int((_bridge_usage_ns.get("input_tokens", 0) or 0) + (_bridge_usage_ns.get("output_tokens", 0) or 0)),
+                            )
+                            response_obj = SimpleNamespace(
+                                choices=[SimpleNamespace(
+                                    message=SimpleNamespace(content=_bridge_final_text_ns, tool_calls=_bridge_tool_calls_ns if _bridge_tool_calls_ns else None),
+                                    finish_reason="tool_calls" if _bridge_tool_calls_ns else "stop",
+                                )],
+                                usage=_usage_ns_obj,
+                                model=_bridge_model_ns,
+                            )
+                            logger.info("[hermes-code][req=%s] mimocode-cli ns completed: text_len=%d tool_calls=%d", _req_id, len(_bridge_final_text_ns), len(_bridge_tool_calls_ns))
+                        else:
+                            continue
                     else:
                         _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
                         _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
