@@ -9884,7 +9884,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _toolset_mode = "full"
         elif model_name == "hermes-agentic-remote":
             _toolset_mode = "remote"
-        elif model_name == "hermes-code" or "/" in model_name:
+        elif model_name in ("hermes-code", "claude-code-cli", "mimocode-cli") or "/" in model_name:
             _provider_mode = True
 
         external_tool_mode = "none"
