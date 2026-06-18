@@ -732,6 +732,8 @@ _SWARM_CHEAP_MODEL_HINTS = (
     "opencode-zen/minimax-m2.5-free",
     "opencode-zen/hy3-preview-free",
     "ollama/qwen3-coder-next",
+    # Xiaomi free tier (MiMo Auto) — zero cost
+    "xiaomi/mimo-auto",
     # Xiaomi low-cost flash model (fast, lower-capacity)
     "xiaomi/mimo-v2-flash",
 )
@@ -3472,10 +3474,24 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
             runtime_kwargs["api_key"] = os.getenv("ZAI_API_KEY", "")
             runtime_kwargs["provider"] = "zai"
         elif provider_prefix == "xiaomi":
-            # Xiaomi MiMo uses regional token-plan endpoints
-            base_url = os.getenv("XIAOMI_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1")
-            runtime_kwargs["base_url"] = base_url
-            runtime_kwargs["api_key"] = os.getenv("XIAOMI_API_KEY", "")
+            # Xiaomi MiMo — standard API key auth or free-tier bootstrap
+            api_key = os.getenv("XIAOMI_API_KEY", "")
+            if api_key:
+                # Standard API key auth
+                base_url = os.getenv("XIAOMI_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1")
+                runtime_kwargs["base_url"] = base_url
+                runtime_kwargs["api_key"] = api_key
+            else:
+                # Free-tier bootstrap auth (mimo-auto)
+                try:
+                    from agent.xiaomi_free_auth import bootstrap_jwt, get_chat_url
+                    jwt = bootstrap_jwt()
+                    runtime_kwargs["base_url"] = get_chat_url()
+                    runtime_kwargs["api_key"] = jwt
+                except Exception as exc:
+                    logger.warning("xiaomi free-tier bootstrap failed: %s", exc)
+                    runtime_kwargs["base_url"] = os.getenv("XIAOMI_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1")
+                    runtime_kwargs["api_key"] = ""
             runtime_kwargs["provider"] = "xiaomi"
         elif provider_prefix == "nous":
             # Nous API — routes nous/* models (e.g. nvidia/nemotron-3-ultra:free)
