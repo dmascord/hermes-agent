@@ -297,9 +297,9 @@ def record_success(
         # Record event
         conn.execute(
             "INSERT INTO model_events (provider, model, event_type, latency_ms, created_at) VALUES (?, ?, 'success', ?, ?)",
-            (provider, model, latency_ms, now),
+            (provider, stored_model, latency_ms, now),
         )
-        _gc_events(conn, provider, model)
+        _gc_events(conn, provider, stored_model)
         conn.commit()
 
 
@@ -347,9 +347,9 @@ def record_failure(
             )
         conn.execute(
             "INSERT INTO model_events (provider, model, event_type, latency_ms, error_code, error_message, created_at) VALUES (?, ?, 'failure', ?, ?, ?, ?)",
-            (provider, model, latency_ms, error_code, error_message[:500], now),
+            (provider, stored_model, latency_ms, error_code, error_message[:500], now),
         )
-        _gc_events(conn, provider, model)
+        _gc_events(conn, provider, stored_model)
         conn.commit()
 
 
@@ -399,9 +399,9 @@ def record_text_only(
             )
         conn.execute(
             "INSERT INTO model_events (provider, model, event_type, latency_ms, created_at) VALUES (?, ?, 'text_only', ?, ?)",
-            (provider, model, latency_ms, now),
+            (provider, stored_model, latency_ms, now),
         )
-        _gc_events(conn, provider, model)
+        _gc_events(conn, provider, stored_model)
         conn.commit()
 
 
@@ -509,10 +509,12 @@ def get_model_events(
 def reset_model(provider: str, model: str, base_url: str = "") -> None:
     """Reset metrics for a specific model."""
     key = _make_key(provider, model, base_url)
+    stored_model = model.split("/", 1)[1] if "/" in model else model
     with _LOCK:
         conn = _get_conn()
         conn.execute("DELETE FROM model_metrics WHERE key=?", (key,))
-        conn.execute("DELETE FROM model_events WHERE provider=? AND model=?", (provider, model))
+        conn.execute("DELETE FROM model_events WHERE provider=? AND model IN (?, ?)",
+                     (provider, model, stored_model))
         conn.commit()
 
 
