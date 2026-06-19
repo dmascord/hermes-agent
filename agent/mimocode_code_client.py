@@ -281,9 +281,7 @@ class MiMoCodeClient:
         prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
 
-        # --pure disables external plugins (MCP). Strip it when using MCP bridge.
-        _args = [a for a in self._args if a != "--pure"]
-        cmd = [self._command] + _args
+        cmd = [self._command] + self._args
         if model_name:
             cmd += ["--model", model_name]
 
@@ -299,7 +297,7 @@ class MiMoCodeClient:
         _logger.info("[mimocode-cli] running: %s cwd=%s", " ".join(cmd[:8]), cwd)
 
         proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env, text=False,
             cwd=cwd,
         )
