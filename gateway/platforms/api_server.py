@@ -4914,6 +4914,19 @@ class APIServerAdapter(BasePlatformAdapter):
             if hmac.compare_digest(token, self._api_key):
                 return None  # Auth OK
 
+        if not auth_header:
+            reason = "missing Authorization header"
+        elif not auth_header.startswith("Bearer "):
+            reason = f"malformed Authorization header (got '{auth_header[:20]}...')"
+        else:
+            reason = "wrong token"
+        logger.warning(
+            "Auth failure: %s from %s — %s %s",
+            reason,
+            request.remote,
+            request.method,
+            request.path,
+        )
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
