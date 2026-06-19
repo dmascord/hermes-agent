@@ -174,12 +174,16 @@ class MiMoCodeClient:
                 }
 
         content_text = "\n".join(text_parts) if text_parts else ""
+        # The CLI handles tool execution internally — it runs bash/read/etc.
+        # and produces a final text answer.  If we got both text and tool_calls,
+        # the text is the real answer (CLI already executed the tools).
+        # Only return tool_calls when there's no final text (caller must execute).
         message = SimpleNamespace(
             role="assistant",
-            content=content_text if not tool_calls else None,
-            tool_calls=tool_calls if tool_calls else None,
+            content=content_text if content_text else None,
+            tool_calls=tool_calls if tool_calls and not content_text else None,
         )
-        choices = [SimpleNamespace(index=0, message=message, finish_reason="stop" if not tool_calls else "tool_calls")]
+        choices = [SimpleNamespace(index=0, message=message, finish_reason="stop")]
         return SimpleNamespace(choices=choices, usage=SimpleNamespace(**usage), model=model)
 
     def run_with_tool_bridge(
