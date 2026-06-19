@@ -186,8 +186,34 @@ class MiMoCodeClient:
         _logger.info("[mimocode-cli] MCP workspace: %s tools=%s", workspace, mcp_tool_names)
         return workspace
 
+    def _execute_tool(self, tool_name: str, arguments: dict) -> str:
+        """Execute a tool call and return the result."""
+        # Strip mcp_ prefix to get the real tool name
+        real_name = tool_name[4:] if tool_name.startswith("mcp_") else tool_name
+
+        if real_name == "bash":
+            import subprocess as sp
+            cmd = arguments.get("command", "")
+            try:
+                result = sp.run(
+                    ["sh", "-c", cmd],
+                    capture_output=True, text=True, timeout=120,
+                )
+                output = result.stdout
+                if result.returncode != 0:
+                    output += f"\n[exit code {result.returncode}]"
+                    if result.stderr:
+                        output += f"\n{result.stderr}"
+                return output.strip()
+            except sp.TimeoutExpired:
+                return "[timeout: command took too long]"
+            except Exception as exc:
+                return f"[error executing command: {exc}]"
+
+        return f"[tool {tool_name} not implemented in gateway]"
+
     def _watch_mcp_queue(self, stop_event: threading.Event) -> None:
-        """Monitor the MCP queue file and write placeholder results."""
+        """Monitor the MCP queue file and execute tool calls."""
         if not self._queue_in_path or not self._queue_out_dir:
             return
         offset = 0
@@ -211,9 +237,12 @@ class MiMoCodeClient:
                             continue
                         result_path = os.path.join(self._queue_out_dir, f"{call_id}.json")
                         if not os.path.exists(result_path):
+                            tool_name = str(call.get("tool") or "")
+                            arguments = call.get("arguments") or {}
+                            output = self._execute_tool(tool_name, arguments)
                             with open(result_path, "w", encoding="utf-8") as f:
-                                json.dump({"content": ""}, f)
-                            _logger.info("[mimocode-cli] wrote placeholder for %s", call_id)
+                                json.dump({"content": output}, f)
+                            _logger.info("[mimocode-cli] executed %s for %s", tool_name, call_id)
             except Exception as exc:
                 _logger.warning("[mimocode-cli] watcher error: %s", exc)
             time.sleep(0.05)
