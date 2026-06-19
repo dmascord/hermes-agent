@@ -186,6 +186,38 @@ class MiMoCodeClient:
         _logger.info("[mimocode-cli] MCP workspace: %s tools=%s", workspace, mcp_tool_names)
         return workspace
 
+    def _watch_mcp_queue(self, stop_event: threading.Event) -> None:
+        """Monitor the MCP queue file and write placeholder results."""
+        if not self._queue_in_path or not self._queue_out_dir:
+            return
+        offset = 0
+        while not stop_event.is_set():
+            try:
+                if os.path.exists(self._queue_in_path):
+                    with open(self._queue_in_path, "r", encoding="utf-8") as f:
+                        f.seek(offset)
+                        lines = f.readlines()
+                        offset = f.tell()
+                    for raw in lines:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            call = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        call_id = str(call.get("call_id") or "")
+                        if not call_id:
+                            continue
+                        result_path = os.path.join(self._queue_out_dir, f"{call_id}.json")
+                        if not os.path.exists(result_path):
+                            with open(result_path, "w", encoding="utf-8") as f:
+                                json.dump({"content": ""}, f)
+                            _logger.info("[mimocode-cli] wrote placeholder for %s", call_id)
+            except Exception as exc:
+                _logger.warning("[mimocode-cli] watcher error: %s", exc)
+            time.sleep(0.05)
+
     def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
         instructions = ""
         user_parts = []
@@ -215,8 +247,7 @@ class MiMoCodeClient:
         When tools are provided:
         - Creates temp workspace with MCP bridge (server named "mcp")
         - Agent permission denies all built-in tools, allows only mcp_* tools
-        - Model is forced to use MCP-proxied tools exclusively
-        - Tool calls are proxied through file queue to gateway
+        - Uses streaming reader with watcher thread to handle MCP tool results
         """
         prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
@@ -242,13 +273,100 @@ class MiMoCodeClient:
             cwd=cwd,
         )
 
+        text_parts = []
+        tool_calls = []
+        usage = {}
+
         try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            if tools and self._queue_in_path and self._queue_out_dir:
+                # MCP mode: read stdout line-by-line with watcher thread for tool results
+                watcher_stop = threading.Event()
+                watcher_thread = threading.Thread(
+                    target=self._watch_mcp_queue, args=(watcher_stop,), daemon=True
+                )
+                watcher_thread.start()
+
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    raw_line = proc.stdout.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    etype = event.get("type", "")
+                    part = event.get("part", {})
+
+                    if etype == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif etype == "tool_use":
+                        tool_input = part.get("state", {}).get("input", {})
+                        tool_calls.append({
+                            "id": part.get("callID", f"call_{len(tool_calls)}"),
+                            "type": "function",
+                            "function": {
+                                "name": part.get("tool", "unknown"),
+                                "arguments": json.dumps(tool_input) if isinstance(tool_input, dict) else str(tool_input),
+                            },
+                        })
+                    elif etype == "step_finish":
+                        tokens = part.get("tokens", {})
+                        usage = {
+                            "prompt_tokens": tokens.get("input", 0),
+                            "completion_tokens": tokens.get("output", 0),
+                            "total_tokens": tokens.get("total", 0),
+                        }
+
+                watcher_stop.set()
+                watcher_thread.join(timeout=2)
+                proc.wait(timeout=10)
+            else:
+                # Simple mode: no tools, just read all output
+                stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+
+                if proc.returncode != 0:
+                    stderr = stderr_bytes.decode("utf-8", errors="replace")[:500]
+                    raise RuntimeError(f"MiMoCode CLI exited {proc.returncode}: {stderr}")
+
+                for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    etype = event.get("type", "")
+                    part = event.get("part", {})
+
+                    if etype == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif etype == "tool_use":
+                        tool_input = part.get("state", {}).get("input", {})
+                        tool_calls.append({
+                            "id": part.get("callID", f"call_{len(tool_calls)}"),
+                            "type": "function",
+                            "function": {
+                                "name": part.get("tool", "unknown"),
+                                "arguments": json.dumps(tool_input) if isinstance(tool_input, dict) else str(tool_input),
+                            },
+                        })
+                    elif etype == "step_finish":
+                        tokens = part.get("tokens", {})
+                        usage = {
+                            "prompt_tokens": tokens.get("input", 0),
+                            "completion_tokens": tokens.get("output", 0),
+                            "total_tokens": tokens.get("total", 0),
+                        }
+        finally:
             proc.kill()
             proc.wait()
-            raise TimeoutError(f"MiMoCode CLI timed out after {timeout}s")
-        finally:
             if cwd:
                 try:
                     import shutil
@@ -256,49 +374,7 @@ class MiMoCodeClient:
                 except Exception:
                     pass
 
-        if proc.returncode != 0:
-            stderr = stderr_bytes.decode("utf-8", errors="replace")[:500]
-            raise RuntimeError(f"MiMoCode CLI exited {proc.returncode}: {stderr}")
-
-        text_parts = []
-        tool_calls = []
-        usage = {}
-
-        for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            etype = event.get("type", "")
-            part = event.get("part", {})
-
-            if etype == "text":
-                text_parts.append(part.get("text", ""))
-            elif etype == "tool_use":
-                tool_input = part.get("state", {}).get("input", {})
-                tool_calls.append({
-                    "id": part.get("callID", f"call_{len(tool_calls)}"),
-                    "type": "function",
-                    "function": {
-                        "name": part.get("tool", "unknown"),
-                        "arguments": json.dumps(tool_input) if isinstance(tool_input, dict) else str(tool_input),
-                    },
-                })
-            elif etype == "step_finish":
-                tokens = part.get("tokens", {})
-                usage = {
-                    "prompt_tokens": tokens.get("input", 0),
-                    "completion_tokens": tokens.get("output", 0),
-                    "total_tokens": tokens.get("total", 0),
-                }
-
         content_text = "\n".join(text_parts) if text_parts else ""
-        # When both text and tool_calls exist, the text is the real answer
-        # (CLI already executed the tools internally via MCP)
         message = SimpleNamespace(
             role="assistant",
             content=content_text if content_text else None,
