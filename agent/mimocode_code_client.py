@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -83,16 +84,10 @@ class MiMoCodeClient:
         self.base_url = base_url
         self._command = command or _resolve_command()
         self._args = args or _resolve_args()
+        self._queue_in_path: str | None = None
+        self._queue_out_dir: str | None = None
 
-    def _create_chat_completion(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
-    ) -> Any:
-        """Simple mode: run `mimo run --format json` and parse events."""
+    def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
         instructions = ""
         user_parts = []
         for msg in messages:
@@ -106,10 +101,18 @@ class MiMoCodeClient:
                 instructions = str(content).strip()
             elif role in ("user", "developer"):
                 user_parts.append(str(content).strip())
+        return "\n\n".join(user_parts) if user_parts else ""
 
-        prompt = "\n\n".join(user_parts) if user_parts else ""
-
-        # Map model name to valid MiMoCode format
+    def _create_chat_completion(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> Any:
+        """Simple mode: run `mimo run --format json` and parse events."""
+        prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
 
         cmd = [self._command] + self._args
@@ -119,7 +122,7 @@ class MiMoCodeClient:
             cmd += [prompt]
 
         env = _build_subprocess_env()
-        _logger.info("[mimocode-cli] running: %s", " ".join(cmd[:8]))
+        _logger.info("[mimocode-cli] simple mode: %s", " ".join(cmd[:8]))
 
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -174,10 +177,6 @@ class MiMoCodeClient:
                 }
 
         content_text = "\n".join(text_parts) if text_parts else ""
-        # The CLI handles tool execution internally — it runs bash/read/etc.
-        # and produces a final text answer.  If we got both text and tool_calls,
-        # the text is the real answer (CLI already executed the tools).
-        # Only return tool_calls when there's no final text (caller must execute).
         message = SimpleNamespace(
             role="assistant",
             content=content_text if content_text else None,
@@ -185,6 +184,44 @@ class MiMoCodeClient:
         )
         choices = [SimpleNamespace(index=0, message=message, finish_reason="stop")]
         return SimpleNamespace(choices=choices, usage=SimpleNamespace(**usage), model=model)
+
+    def _write_tools_manifest(self, tools: list[dict[str, Any]]) -> str:
+        """Write tools manifest to a temp file. Returns the path."""
+        path = tempfile.mktemp(suffix=".json", prefix="hermes_tools_")
+        tool_schemas = []
+        for tool in tools:
+            if tool.get("type") == "function":
+                func = tool.get("function", {})
+                tool_schemas.append({
+                    "name": func.get("name", ""),
+                    "description": func.get("description", ""),
+                    "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
+                })
+        with open(path, "w") as f:
+            json.dump(tool_schemas, f)
+        return path
+
+    def _build_mcp_config(self, tools_manifest: str) -> str:
+        """Write MCP config and return the path."""
+        bridge_script = str(Path(__file__).parent / "mimocode_mcp_bridge.py")
+        mcp_config = {
+            "mcpServers": {
+                "hermes-tools": {
+                    "type": "stdio",
+                    "command": sys.executable,
+                    "args": [bridge_script],
+                    "env": {
+                        "HERMES_TOOLS_FILE": tools_manifest,
+                        "HERMES_QUEUE_IN": self._queue_in_path or "",
+                        "HERMES_QUEUE_OUT_DIR": self._queue_out_dir or "",
+                    },
+                }
+            }
+        }
+        path = tempfile.mktemp(suffix=".json", prefix="mimocode_mcp_")
+        with open(path, "w") as f:
+            json.dump(mcp_config, f)
+        return path
 
     def run_with_tool_bridge(
         self,
@@ -196,86 +233,121 @@ class MiMoCodeClient:
     ):
         """MCP bridge mode: run with MCP proxy for tool interception.
 
-        Yields events: text, tool_call, tool_result, final.
+        Yields a sequence of dicts:
+          {"type": "tool_call", "call_id": ..., "name": ..., "arguments": ...}
+          {"type": "text", "text": ...}
+          {"type": "final", "model": ..., "usage": ...}
+          {"type": "error", "message": ...}
+
+        Mirrors the Claude Code CLI bridge pattern: the mimo CLI is spawned
+        with --mcp-config pointing to mimocode_mcp_bridge.py.  A background
+        thread monitors the inbound queue file for tool calls from the MCP
+        proxy, yielding them as events.  The caller writes placeholder results
+        to the output directory so the MCP proxy unblocks.
         """
-        # Build the prompt from messages
-        instructions = ""
-        user_parts = []
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
-                )
-            if role == "system":
-                instructions = str(content).strip()
-            elif role in ("user", "developer"):
-                user_parts.append(str(content).strip())
-
-        prompt = "\n\n".join(user_parts) if user_parts else ""
-
-        # Create temp files for MCP bridge communication
-        session_id = f"hermes_{int(time.time())}_{os.getpid()}"
-        tools_file = tempfile.mktemp(suffix=".json", prefix="hermes_tools_")
-        queue_in = f"/tmp/hermes_queue_{session_id}.in"
-        queue_out_dir = f"/tmp/hermes_result_{session_id}"
-
-        # Write tools manifest
-        os.makedirs(queue_out_dir, exist_ok=True)
-        tool_schemas = []
-        if tools:
-            for tool in tools:
-                if tool.get("type") == "function":
-                    func = tool.get("function", {})
-                    tool_schemas.append({
-                        "name": func.get("name", ""),
-                        "description": func.get("description", ""),
-                        "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
-                    })
-        with open(tools_file, "w") as f:
-            json.dump(tool_schemas, f)
-
-        # Create MCP config
-        bridge_script = str(Path(__file__).parent / "mimocode_mcp_bridge.py")
-        mcp_config = {
-            "mcpServers": {
-                "hermes-tools": {
-                    "type": "stdio",
-                    "command": sys.executable,
-                    "args": [bridge_script],
-                    "env": {
-                        "HERMES_TOOLS_FILE": tools_file,
-                        "HERMES_QUEUE_IN": queue_in,
-                        "HERMES_QUEUE_OUT_DIR": queue_out_dir,
-                    },
-                }
-            }
-        }
-        config_file = tempfile.mktemp(suffix=".json", prefix="mimocode_mcp_")
-        with open(config_file, "w") as f:
-            json.dump(mcp_config, f)
-
+        prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
+
+        # Set up MCP bridge communication channels
+        session_id = f"hermes_{int(time.time())}_{os.getpid()}"
+        self._queue_in_path = f"/tmp/hermes_queue_{session_id}.in"
+        self._queue_out_dir = f"/tmp/hermes_result_{session_id}"
+        os.makedirs(self._queue_out_dir, exist_ok=True)
+
+        tools_manifest = self._write_tools_manifest(tools or [])
+        mcp_config = self._build_mcp_config(tools_manifest)
+
         # --pure disables external plugins (MCP).  Strip it when using MCP bridge.
         _args = [a for a in self._args if a != "--pure"]
         cmd = [self._command] + _args
         if model_name:
             cmd += ["--model", model_name]
-        cmd += ["--mcp-config", config_file]
+        cmd += ["--mcp-config", mcp_config]
         if prompt:
             cmd += [prompt]
 
         env = _build_subprocess_env()
         _logger.info("[mimocode-cli] MCP bridge: %s", " ".join(cmd[:6]))
 
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env=env, text=False,
-        )
+        # Truncate queue file
+        try:
+            if os.path.exists(self._queue_in_path):
+                os.unlink(self._queue_in_path)
+        except Exception:
+            pass
 
         try:
-            # Read stdout line by line for streaming
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=env, text=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Could not start mimo command '{self._command}'. "
+                "Install MiMoCode CLI: npm install -g @mimo-ai/cli"
+            ) from exc
+
+        # Queue monitor thread — watches $HERMES_QUEUE_IN for tool calls
+        # from the MCP bridge proxy, yielding them as events.
+        mcp_events_lock = threading.Lock()
+        mcp_events: list[dict[str, Any]] = []
+        mcp_seen_call_ids: set[str] = set()
+        mcp_stop = threading.Event()
+
+        def _drain_mcp_events() -> list[dict[str, Any]]:
+            with mcp_events_lock:
+                drained = list(mcp_events)
+                mcp_events.clear()
+            return drained
+
+        def _watch_mcp_queue() -> None:
+            if not self._queue_in_path or not self._queue_out_dir:
+                return
+            offset = 0
+            while not mcp_stop.is_set():
+                try:
+                    if not os.path.exists(self._queue_in_path):
+                        time.sleep(0.05)
+                        continue
+                    with open(self._queue_in_path, "r", encoding="utf-8") as f:
+                        f.seek(offset)
+                        lines = f.readlines()
+                        offset = f.tell()
+                    for raw in lines:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            call = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        call_id = str(call.get("call_id") or "")
+                        if not call_id or call_id in mcp_seen_call_ids:
+                            continue
+                        mcp_seen_call_ids.add(call_id)
+                        event = {
+                            "type": "tool_call",
+                            "call_id": call_id,
+                            "name": str(call.get("tool") or ""),
+                            "arguments": call.get("arguments") or {},
+                        }
+                        with mcp_events_lock:
+                            mcp_events.append(event)
+                        # Write empty placeholder so MCP proxy unblocks
+                        result_path = os.path.join(self._queue_out_dir, f"{call_id}.json")
+                        if not os.path.exists(result_path):
+                            with open(result_path, "w", encoding="utf-8") as f:
+                                json.dump({"content": ""}, f)
+                except Exception as exc:
+                    _logger.warning("[mimocode-cli] MCP queue monitor error: %s", exc)
+                time.sleep(0.05)
+
+        mcp_thread: threading.Thread | None = None
+        if tools and self._queue_in_path and self._queue_out_dir:
+            mcp_thread = threading.Thread(target=_watch_mcp_queue, daemon=True)
+            mcp_thread.start()
+
+        try:
             for raw_line in proc.stdout:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -285,16 +357,19 @@ class MiMoCodeClient:
                 except json.JSONDecodeError:
                     continue
 
+                # Drain any pending MCP queue events before processing stdout
+                for ev in _drain_mcp_events():
+                    yield ev
+
                 etype = event.get("type", "")
                 part = event.get("part", {})
 
                 if etype == "text":
                     yield {"type": "text", "text": part.get("text", "")}
                 elif etype == "tool_use":
+                    call_id = part.get("callID", uuid.uuid4().hex)
                     tool_name = part.get("tool", "unknown")
-                    call_id = part.get("callID", "")
                     tool_input = part.get("state", {}).get("input", {})
-
                     yield {
                         "type": "tool_call",
                         "call_id": call_id,
@@ -313,20 +388,36 @@ class MiMoCodeClient:
                         },
                     }
 
+            proc.wait(timeout=timeout)
+
+            # Drain any remaining MCP queue events
+            for ev in _drain_mcp_events():
+                yield ev
+
+            if proc.returncode != 0 and proc.stderr:
+                err_text = proc.stderr.read()[:500]
+                if err_text:
+                    yield {"type": "error", "message": f"exit {proc.returncode}: {err_text}"}
+
         except Exception as exc:
             _logger.error("[mimocode-cli] MCP bridge error: %s", exc)
             yield {"type": "error", "message": str(exc)}
         finally:
-            proc.kill()
-            proc.wait()
+            mcp_stop.set()
+            if mcp_thread is not None:
+                mcp_thread.join(timeout=1.0)
             # Cleanup temp files
-            for f in [tools_file, config_file]:
+            for _path in [tools_manifest, mcp_config, self._queue_in_path]:
+                if _path and os.path.exists(_path):
+                    try:
+                        os.unlink(_path)
+                    except Exception:
+                        pass
+            if self._queue_out_dir and os.path.isdir(self._queue_out_dir):
                 try:
-                    os.unlink(f)
+                    import shutil
+                    shutil.rmtree(self._queue_out_dir, ignore_errors=True)
                 except Exception:
                     pass
-            try:
-                import shutil
-                shutil.rmtree(queue_out_dir, ignore_errors=True)
-            except Exception:
-                pass
+            self._queue_in_path = None
+            self._queue_out_dir = None

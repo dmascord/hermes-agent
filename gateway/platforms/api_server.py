@@ -7025,7 +7025,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                 )
                                 return response
                         elif prov == "mimocode-cli":
-                            # MiMoCode CLI — JSON event mode.
+                            # MiMoCode CLI — MCP bridge mode (mirrors claude-code-cli).
+                            # Uses run_with_tool_bridge generator to handle
+                            # multi-turn tool calling via the MCP proxy.
                             logger.info("[hermes-code][req=%s] mimocode-cli dispatch: prov=%s base_url=%s", _req_id, prov, base_url)
                             try:
                                 from hermes_cli.auth import resolve_external_process_provider_credentials
@@ -7042,7 +7044,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _mc_client = None
                             if _mc_client is not None:
                                 _skip_normal_call = True
-                                logger.info("[hermes-code][req=%s] mimocode-cli starting for model=%s tools=%d", _req_id, resolved_model, len(passthrough_tools or []))
+                                logger.info("[hermes-code][req=%s] mimocode-cli bridge starting for model=%s tools=%d", _req_id, resolved_model, len(passthrough_tools or []))
                                 _bridge_completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
                                 _bridge_sse_headers = {
                                     "Content-Type": "text/event-stream",
@@ -7054,26 +7056,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
                                 await response.prepare(request)
                                 _bridge_events: asyncio.Queue = asyncio.Queue()
-                                def _run_mc_simple(_c=_mc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools, _q=_bridge_events):
+                                _bridge_error: list[Exception] = []
+                                def _run_mc_bridge(_c=_mc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
                                     try:
-                                        resp = _c._create_chat_completion(model=_m, messages=_msgs, tools=_tools)
-                                        if hasattr(resp, 'choices') and resp.choices:
-                                            msg = resp.choices[0].message
-                                            if getattr(msg, 'content', None):
-                                                _q.put_nowait({"type": "text", "text": msg.content})
-                                            if getattr(msg, 'tool_calls', None):
-                                                for tc in msg.tool_calls:
-                                                    _q.put_nowait({"type": "tool_call", "call_id": tc.get("id", ""), "name": tc["function"]["name"], "arguments": json.loads(tc["function"]["arguments"])})
-                                            _q.put_nowait({"type": "final", "model": _m, "usage": {
-                                                "input_tokens": getattr(getattr(resp, 'usage', None), 'prompt_tokens', 0) or 0,
-                                                "output_tokens": getattr(getattr(resp, 'usage', None), 'completion_tokens', 0) or 0,
-                                                "total_tokens": getattr(getattr(resp, 'usage', None), 'total_tokens', 0) or 0,
-                                            }})
+                                        gen = _c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools)
+                                        for event in gen:
+                                            _bridge_events.put_nowait(event)
                                     except Exception as exc:
-                                        _q.put_nowait({"type": "error", "message": str(exc)})
+                                        _bridge_error.append(exc)
+                                        _bridge_events.put_nowait({"type": "error", "message": str(exc)})
                                     finally:
-                                        _q.put_nowait({"type": "_done"})
-                                threading.Thread(target=_run_mc_simple, daemon=True).start()
+                                        _bridge_events.put_nowait({"type": "_done"})
+                                _bridge_thread = threading.Thread(target=_run_mc_bridge, daemon=True)
+                                _bridge_thread.start()
                                 _bridge_final_text = ""
                                 _bridge_usage = {}
                                 _bridge_model = resolved_model
@@ -7102,6 +7097,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
                                         await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                        # Write placeholder result to unblock the MCP bridge proxy
+                                        if _mc_client._queue_out_dir:
+                                            _result_path = os.path.join(_mc_client._queue_out_dir, f"{_call_id}.json")
+                                            try:
+                                                _placeholder = {"content": f"[Tool {_tool_name} called with {_tool_args}]"}
+                                                with open(_result_path, "w") as _rf:
+                                                    json.dump(_placeholder, _rf)
+                                                logger.info("[hermes-code] mimocode-cli bridge: wrote placeholder result for %s", _call_id)
+                                            except Exception as _re:
+                                                logger.warning("[hermes-code] mimocode-cli bridge: failed to write placeholder result: %s", _re)
                                     elif _bt in ("text", "assistant_text"):
                                         _chunk_text = _be.get("text", "")
                                         _bridge_final_text += _chunk_text
@@ -8293,8 +8298,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         else:
                             continue
                     elif prov == "mimocode-cli":
-                        # MiMoCode CLI — JSON event mode (non-streaming).
-                        logger.info("[hermes-code][req=%s] mimocode-cli ns dispatch: prov=%s", _req_id, prov)
+                        # MiMoCode CLI — MCP bridge mode (non-streaming, mirrors claude-code-cli).
+                        logger.info("[hermes-code][req=%s] mimocode-cli ns bridge dispatch: prov=%s", _req_id, prov)
                         try:
                             from hermes_cli.auth import resolve_external_process_provider_credentials
                             _mc_creds_ns = resolve_external_process_provider_credentials("mimocode-cli")
@@ -8313,24 +8318,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             _bridge_final_text_ns = ""
                             _bridge_usage_ns = {}
                             _bridge_model_ns = resolved_model
-                            _bridge_tool_calls_ns = []
-                            _ns_resp = await _ns_loop.run_in_executor(
-                                None,
-                                lambda: _mc_client_ns._create_chat_completion(model=resolved_model, messages=passthrough_messages, tools=passthrough_tools),
-                            )
-                            _ns_events = []
-                            if hasattr(_ns_resp, 'choices') and _ns_resp.choices:
-                                _msg = _ns_resp.choices[0].message
-                                if getattr(_msg, 'content', None):
-                                    _ns_events.append({"type": "text", "text": _msg.content})
-                                if getattr(_msg, 'tool_calls', None):
-                                    for _tc in _msg.tool_calls:
-                                        _ns_events.append({"type": "tool_call", "call_id": _tc.get("id", ""), "name": _tc["function"]["name"], "arguments": json.loads(_tc["function"]["arguments"])})
-                                _ns_events.append({"type": "final", "model": resolved_model, "usage": {
-                                    "input_tokens": getattr(getattr(_ns_resp, 'usage', None), 'prompt_tokens', 0) or 0,
-                                    "output_tokens": getattr(getattr(_ns_resp, 'usage', None), 'completion_tokens', 0) or 0,
-                                    "total_tokens": getattr(getattr(_ns_resp, 'usage', None), 'total_tokens', 0) or 0,
-                                }})
+                            _bridge_tool_calls_ns: list[dict] = []
+                            def _run_mc_bridge_ns(_c=_mc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                                events = list(_c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools))
+                                return events
+                            _ns_events = await _ns_loop.run_in_executor(None, _run_mc_bridge_ns)
                             for _be in _ns_events:
                                 _bt = _be.get("type")
                                 if _bt == "tool_call":
@@ -8350,7 +8342,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     _bridge_usage_ns = _be.get("usage", {})
                                     _bridge_model_ns = _be.get("model", _bridge_model_ns)
                                 elif _bt == "error":
-                                    logger.warning("[hermes-code] mimocode-cli ns error: %s", _be.get("message"))
+                                    logger.warning("[hermes-code] mimocode-cli ns bridge error: %s", _be.get("message"))
                             _usage_ns_obj = SimpleNamespace(
                                 prompt_tokens=int(_bridge_usage_ns.get("input_tokens", 0) or 0),
                                 completion_tokens=int(_bridge_usage_ns.get("output_tokens", 0) or 0),
@@ -8364,7 +8356,17 @@ class APIServerAdapter(BasePlatformAdapter):
                                 usage=_usage_ns_obj,
                                 model=_bridge_model_ns,
                             )
-                            logger.info("[hermes-code][req=%s] mimocode-cli ns completed: text_len=%d tool_calls=%d", _req_id, len(_bridge_final_text_ns), len(_bridge_tool_calls_ns))
+                            logger.info("[hermes-code][req=%s] mimocode-cli ns bridge completed: text_len=%d tool_calls=%d", _req_id, len(_bridge_final_text_ns), len(_bridge_tool_calls_ns))
+                            try:
+                                from agent.model_cooldown_db import mark_provider_success
+                                mark_provider_success(prov, resolved_model, base_url=base_url or "")
+                            except Exception:
+                                pass
+                            try:
+                                from agent.model_quality_db import record_success
+                                record_success(prov, provider_model, base_url=base_url or "", latency_ms=0)
+                            except Exception:
+                                pass
                         else:
                             continue
                     else:
