@@ -308,6 +308,20 @@ class MiMoCodeClient:
         tool_calls = []
         usage = {}
 
+        # Drain stderr in a background thread to prevent pipe buffer deadlock
+        stderr_lines: list[str] = []
+        def _drain_stderr():
+            try:
+                while True:
+                    chunk = proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    stderr_lines.append(chunk.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         try:
             if tools and self._queue_in_path and self._queue_out_dir:
                 # MCP mode: read stdout line-by-line with watcher thread for tool results
@@ -398,6 +412,9 @@ class MiMoCodeClient:
         finally:
             proc.kill()
             proc.wait()
+            stderr_thread.join(timeout=5)
+            if stderr_lines:
+                _logger.warning("[mimocode-cli] stderr: %s", "".join(stderr_lines)[:500])
             if cwd:
                 try:
                     import shutil
