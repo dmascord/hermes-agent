@@ -33,6 +33,13 @@ MODEL_MAP = {
     "mimo": "mimo/mimo-auto",
 }
 
+# Built-in mimo tools that MCP tools can replace
+BUILTIN_TOOLS = [
+    "bash", "read", "write", "edit", "glob", "grep",
+    "webfetch", "websearch", "codesearch", "lsp",
+    "actor", "skill", "memory", "history", "task", "workflow",
+]
+
 
 def _resolve_command() -> str:
     return (
@@ -88,22 +95,26 @@ class MiMoCodeClient:
         self._queue_out_dir: str | None = None
 
     def _setup_mcp_workspace(self, tools: list[dict[str, Any]]) -> str:
-        """Create a temp workspace with MCP bridge config and agent definition.
+        """Create a temp workspace that forces mimo to use MCP tools only.
+
+        Architecture (from MiMo-Code source analysis):
+        - MCP server named "mcp" → tools become mcp_bash, mcp_read, etc.
+        - Permission { "*": "deny", "mcp_*": "allow" } suppresses built-in tools
+        - Agent prompt instructs model to use MCP-backed tools
 
         Creates:
-        - .mcp.json pointing to mimocode_mcp_bridge.py
-        - .mimocode/agents/hermes.md with tool_allowlist to disable built-in tools
+        - .mcp.json with server named "mcp" (produces mcp_* tool IDs)
+        - .mimocode/agents/hermes.md with permission deny-all + allow mcp_*
         - tools.json manifest for the MCP bridge
-
-        Returns the workspace path to use as CWD for the mimo process.
+        - queue.in and result/ for tool call proxying
         """
         workspace = tempfile.mkdtemp(prefix="hermes_mcp_")
-
-        # Write MCP config
         bridge_script = str(Path(__file__).parent / "mimocode_mcp_bridge.py")
+
+        # Server named "mcp" → tool IDs become mcp_bash, mcp_read, etc.
         mcp_config = {
             "mcpServers": {
-                "hermes-tools": {
+                "mcp": {
                     "type": "stdio",
                     "command": sys.executable,
                     "args": [bridge_script],
@@ -118,42 +129,59 @@ class MiMoCodeClient:
         with open(os.path.join(workspace, ".mcp.json"), "w") as f:
             json.dump(mcp_config, f)
 
-        # Write tools manifest
+        # Build tool schemas with mcp_ prefix names for the bridge
         tool_schemas = []
+        mcp_tool_names = []
         for tool in tools:
             if tool.get("type") == "function":
                 func = tool.get("function", {})
+                original_name = func.get("name", "")
                 tool_schemas.append({
-                    "name": func.get("name", ""),
+                    "name": original_name,
                     "description": func.get("description", ""),
                     "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
                 })
+                mcp_tool_names.append(f"mcp_{original_name}")
+
         with open(os.path.join(workspace, "tools.json"), "w") as f:
             json.dump(tool_schemas, f)
 
-        # Create agent definition with tool_allowlist
+        # Create agent definition
+        # Permission: deny all tools (*), allow only mcp_* prefixed tools
+        # This forces the model to use MCP-proxied tools exclusively
         agent_dir = os.path.join(workspace, ".mimocode", "agents")
         os.makedirs(agent_dir, exist_ok=True)
 
-        tool_names = [t.get("function", {}).get("name", "") for t in tools if t.get("type") == "function"]
-        allowlist_yaml = "\n".join(f"  - {name}" for name in tool_names if name)
+        tool_list = ", ".join(mcp_tool_names)
 
         with open(os.path.join(agent_dir, "hermes.md"), "w") as f:
             f.write("---\n")
             f.write("name: hermes\n")
             f.write("description: Hermes tool proxy agent\n")
+            f.write("permission:\n")
+            f.write("  '*': deny\n")
+            for name in mcp_tool_names:
+                f.write(f"  '{name}': allow\n")
             f.write("tool_allowlist:\n")
-            f.write(allowlist_yaml + "\n")
+            for name in mcp_tool_names:
+                f.write(f"  - {name}\n")
             f.write("---\n\n")
-            f.write("You are a helpful assistant. Use tools when needed.\n")
+            f.write(
+                f"You have access to tools: {tool_list}.\n"
+                "Use these tools to help the user. "
+                "When a task requires running a command, reading a file, "
+                "or any file/code operation, use the appropriate mcp_ prefixed tool.\n"
+            )
 
         # Create queue and result dirs
         os.makedirs(os.path.join(workspace, "result"), exist_ok=True)
+        with open(os.path.join(workspace, "queue.in"), "w"):
+            pass
 
         self._queue_in_path = os.path.join(workspace, "queue.in")
         self._queue_out_dir = os.path.join(workspace, "result")
 
-        _logger.info("[mimocode-cli] MCP workspace: %s tools=%s", workspace, tool_names)
+        _logger.info("[mimocode-cli] MCP workspace: %s tools=%s", workspace, mcp_tool_names)
         return workspace
 
     def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
@@ -180,12 +208,13 @@ class MiMoCodeClient:
         tools: list[dict[str, Any]] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> Any:
-        """Simple mode: run `mimo run --format json` and parse events.
+        """Run mimo CLI and parse events.
 
-        When tools are provided, creates a temporary working directory with:
-        - .mcp.json pointing to mimocode_mcp_bridge.py for MCP tool interception
-        - .mimocode/agents/hermes.md with tool_allowlist to disable built-in tools
-        This forces the mimo CLI to call MCP-proxied tools instead of built-ins.
+        When tools are provided:
+        - Creates temp workspace with MCP bridge (server named "mcp")
+        - Agent permission denies all built-in tools, allows only mcp_* tools
+        - Model is forced to use MCP-proxied tools exclusively
+        - Tool calls are proxied through file queue to gateway
         """
         prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
@@ -196,7 +225,6 @@ class MiMoCodeClient:
 
         cwd = None
         if tools:
-            # Set up MCP bridge workspace for tool interception
             cwd = self._setup_mcp_workspace(tools)
             cmd += ["--agent", "hermes"]
 
@@ -204,7 +232,7 @@ class MiMoCodeClient:
             cmd += [prompt]
 
         env = _build_subprocess_env()
-        _logger.info("[mimocode-cli] simple mode: %s cwd=%s", " ".join(cmd[:8]), cwd)
+        _logger.info("[mimocode-cli] running: %s cwd=%s", " ".join(cmd[:8]), cwd)
 
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -267,6 +295,8 @@ class MiMoCodeClient:
                 }
 
         content_text = "\n".join(text_parts) if text_parts else ""
+        # When both text and tool_calls exist, the text is the real answer
+        # (CLI already executed the tools internally via MCP)
         message = SimpleNamespace(
             role="assistant",
             content=content_text if content_text else None,
@@ -274,44 +304,6 @@ class MiMoCodeClient:
         )
         choices = [SimpleNamespace(index=0, message=message, finish_reason="stop")]
         return SimpleNamespace(choices=choices, usage=SimpleNamespace(**usage), model=model)
-
-    def _write_tools_manifest(self, tools: list[dict[str, Any]]) -> str:
-        """Write tools manifest to a temp file. Returns the path."""
-        path = tempfile.mktemp(suffix=".json", prefix="hermes_tools_")
-        tool_schemas = []
-        for tool in tools:
-            if tool.get("type") == "function":
-                func = tool.get("function", {})
-                tool_schemas.append({
-                    "name": func.get("name", ""),
-                    "description": func.get("description", ""),
-                    "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
-                })
-        with open(path, "w") as f:
-            json.dump(tool_schemas, f)
-        return path
-
-    def _build_mcp_config(self, tools_manifest: str) -> str:
-        """Write MCP config and return the path."""
-        bridge_script = str(Path(__file__).parent / "mimocode_mcp_bridge.py")
-        mcp_config = {
-            "mcpServers": {
-                "hermes-tools": {
-                    "type": "stdio",
-                    "command": sys.executable,
-                    "args": [bridge_script],
-                    "env": {
-                        "HERMES_TOOLS_FILE": tools_manifest,
-                        "HERMES_QUEUE_IN": self._queue_in_path or "",
-                        "HERMES_QUEUE_OUT_DIR": self._queue_out_dir or "",
-                    },
-                }
-            }
-        }
-        path = tempfile.mktemp(suffix=".json", prefix="mimocode_mcp_")
-        with open(path, "w") as f:
-            json.dump(mcp_config, f)
-        return path
 
     def run_with_tool_bridge(
         self,
@@ -323,17 +315,7 @@ class MiMoCodeClient:
     ):
         """MCP bridge mode: run with MCP proxy for tool interception.
 
-        Yields a sequence of dicts:
-          {"type": "tool_call", "call_id": ..., "name": ..., "arguments": ...}
-          {"type": "text", "text": ...}
-          {"type": "final", "model": ..., "usage": ...}
-          {"type": "error", "message": ...}
-
-        Mirrors the Claude Code CLI bridge pattern: the mimo CLI is spawned
-        with --mcp-config pointing to mimocode_mcp_bridge.py.  A background
-        thread monitors the inbound queue file for tool calls from the MCP
-        proxy, yielding them as events.  The caller writes placeholder results
-        to the output directory so the MCP proxy unblocks.
+        Yields events: text, tool_call, final, error.
         """
         prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
@@ -347,7 +329,7 @@ class MiMoCodeClient:
         tools_manifest = self._write_tools_manifest(tools or [])
         mcp_config = self._build_mcp_config(tools_manifest)
 
-        # --pure disables external plugins (MCP).  Strip it when using MCP bridge.
+        # --pure disables external plugins (MCP). Strip it when using MCP bridge.
         _args = [a for a in self._args if a != "--pure"]
         cmd = [self._command] + _args
         if model_name:
@@ -359,7 +341,6 @@ class MiMoCodeClient:
         env = _build_subprocess_env()
         _logger.info("[mimocode-cli] MCP bridge: %s", " ".join(cmd[:6]))
 
-        # Truncate queue file
         try:
             if os.path.exists(self._queue_in_path):
                 os.unlink(self._queue_in_path)
@@ -377,8 +358,6 @@ class MiMoCodeClient:
                 "Install MiMoCode CLI: npm install -g @mimo-ai/cli"
             ) from exc
 
-        # Queue monitor thread — watches $HERMES_QUEUE_IN for tool calls
-        # from the MCP bridge proxy, yielding them as events.
         mcp_events_lock = threading.Lock()
         mcp_events: list[dict[str, Any]] = []
         mcp_seen_call_ids: set[str] = set()
@@ -423,7 +402,6 @@ class MiMoCodeClient:
                         }
                         with mcp_events_lock:
                             mcp_events.append(event)
-                        # Write empty placeholder so MCP proxy unblocks
                         result_path = os.path.join(self._queue_out_dir, f"{call_id}.json")
                         if not os.path.exists(result_path):
                             with open(result_path, "w", encoding="utf-8") as f:
@@ -447,7 +425,6 @@ class MiMoCodeClient:
                 except json.JSONDecodeError:
                     continue
 
-                # Drain any pending MCP queue events before processing stdout
                 for ev in _drain_mcp_events():
                     yield ev
 
@@ -480,7 +457,6 @@ class MiMoCodeClient:
 
             proc.wait(timeout=timeout)
 
-            # Drain any remaining MCP queue events
             for ev in _drain_mcp_events():
                 yield ev
 
@@ -496,7 +472,6 @@ class MiMoCodeClient:
             mcp_stop.set()
             if mcp_thread is not None:
                 mcp_thread.join(timeout=1.0)
-            # Cleanup temp files
             for _path in [tools_manifest, mcp_config, self._queue_in_path]:
                 if _path and os.path.exists(_path):
                     try:
