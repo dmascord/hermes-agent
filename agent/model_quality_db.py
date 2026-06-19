@@ -46,6 +46,7 @@ _connection_lock = threading.Lock()
 _DB_NAME = "model_quality.db"
 _QUALITY_WINDOW = 100  # rolling window for quality score calculation
 _DECAY_HALF_LIFE_HOURS = float(os.getenv("HERMES_QUALITY_DECAY_HALF_LIFE_HOURS", "24"))  # 24h default
+_DECAY_MIN_EVENTS = 10  # minimum events needed for decay scoring (otherwise use cumulative)
 
 
 def _db_path() -> "os.PathLike":
@@ -410,12 +411,9 @@ def record_text_only(
 def get_quality_score(provider: str, model: str, base_url: str = "") -> float:
     """Return the quality score (0-100) for a model, or 50.0 if unknown.
 
-    When base_url is empty, computes a decayed score from recent events
-    (exponential decay with configurable half-life, default 24h) and updates
-    the cached quality_score.  This ensures recent performance matters more
-    than historical failures (e.g. peak-hour rate limiting).
-
-    When base_url is provided, returns the cached score for that endpoint.
+    Uses decayed scoring (exponential decay with configurable half-life) when
+    enough events exist (_DECAY_MIN_EVENTS threshold).  Falls back to cumulative
+    counts for models with sparse event data.
     """
     with _LOCK:
         conn = _get_conn()
@@ -425,18 +423,23 @@ def get_quality_score(provider: str, model: str, base_url: str = "") -> float:
                 "SELECT quality_score FROM model_metrics WHERE key=?", (key,)
             ).fetchone()
             return row["quality_score"] if row else 50.0
-        # No base_url — compute decayed score from events, then return best
+        # No base_url — try decayed score, fall back to cumulative
         stripped = model.split("/", 1)[1] if "/" in model else model
-        result = _compute_decayed_score(provider, stripped, conn)
-        if result is not None:
-            decayed_score = result[3]
-            # Update cached score for all base_urls of this model
-            conn.execute(
-                "UPDATE model_metrics SET quality_score=?, updated_at=? WHERE provider=? AND model=?",
-                (decayed_score, time.time(), provider, stripped),
-            )
-            conn.commit()
-            return decayed_score
+        # Check if we have enough events for meaningful decay
+        event_count = conn.execute(
+            "SELECT COUNT(*) as c FROM model_events WHERE provider=? AND model=?",
+            (provider, stripped),
+        ).fetchone()["c"]
+        if event_count >= _DECAY_MIN_EVENTS:
+            result = _compute_decayed_score(provider, stripped, conn)
+            if result is not None:
+                decayed_score = result[3]
+                conn.execute(
+                    "UPDATE model_metrics SET quality_score=?, updated_at=? WHERE provider=? AND model=?",
+                    (decayed_score, time.time(), provider, stripped),
+                )
+                conn.commit()
+                return decayed_score
         # Fallback to cached score
         rows = conn.execute(
             "SELECT quality_score FROM model_metrics WHERE provider=? AND model=? ORDER BY quality_score DESC",
