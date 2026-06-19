@@ -33,10 +33,12 @@ ENV PYTHONUNBUFFERED=1
 # ripgrep       – used by ripgrep tool
 # nodejs + npm  – agent-browser and camofox are Node.js packages
 # ffmpeg        – audio format conversion (tts_tool, transcription_tools)
+# gcompat      – glibc shim for @mimo-ai/cli native binary (musl-based Alpine)
 RUN apk add --no-cache \
     bash coreutils shadow tini make \
     git openssh-client ripgrep \
-    nodejs npm ffmpeg
+    nodejs npm ffmpeg \
+    gcompat
 
 # Install uv via pip (simpler than extracting from distroless image; uvx is included)
 RUN pip install --no-cache-dir uv
@@ -87,7 +89,7 @@ RUN uv sync --no-cache && uv pip install --no-cache aiohttp==3.13.3 anthropic==0
 # Only the root manifest is needed so that tools/browser_tool.py can resolve
 # agent-browser and @askjo/camofox-browser from node_modules/.bin/ .
 RUN npm install --prefer-offline --no-audit --no-fund && \
-    npm install -g @anthropic-ai/claude-code && \
+    npm install -g @anthropic-ai/claude-code @mimo-ai/cli && \
     npm cache clean --force && \
     rm -rf /root/.cache/camoufox /tmp/camoufox-* && \
     # Remove build-deps: native addons are already compiled; toolchain is ~400 MB
