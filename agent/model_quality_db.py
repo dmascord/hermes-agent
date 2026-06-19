@@ -28,6 +28,7 @@ Schema::
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -44,6 +45,7 @@ _connection_lock = threading.Lock()
 
 _DB_NAME = "model_quality.db"
 _QUALITY_WINDOW = 100  # rolling window for quality score calculation
+_DECAY_HALF_LIFE_HOURS = float(os.getenv("HERMES_QUALITY_DECAY_HALF_LIFE_HOURS", "24"))  # 24h default
 
 
 def _db_path() -> "os.PathLike":
@@ -200,6 +202,54 @@ def _rolling_avg_latency(old_avg: float, old_count: int, new_latency_ms: float) 
     # Exponential moving average with alpha=0.3
     alpha = 0.3
     return alpha * new_latency_ms + (1.0 - alpha) * old_avg
+
+
+def _compute_decayed_score(
+    provider: str,
+    model: str,
+    conn: sqlite3.Connection,
+    half_life_hours: float = _DECAY_HALF_LIFE_HOURS,
+) -> Optional[Tuple[float, float, float, float]]:
+    """Compute decayed success/failure/latency/score from recent events.
+
+    Returns (decayed_success, decayed_failures, decayed_latency_ms, score) or None
+    if no events found.  Exponential decay with configurable half-life.
+    """
+    if "/" in model:
+        model = model.split("/", 1)[1]
+    rows = conn.execute(
+        """SELECT event_type, latency_ms, created_at
+           FROM model_events
+           WHERE provider=? AND model=?
+           ORDER BY created_at DESC LIMIT ?""",
+        (provider, model, _QUALITY_WINDOW),
+    ).fetchall()
+    if not rows:
+        return None
+
+    now = time.time()
+    decay_constant = half_life_hours * 3600.0 / math.log(2.0)
+
+    decayed_success = 0.0
+    decayed_failure = 0.0
+    decayed_lat_sum = 0.0
+    decayed_lat_weight = 0.0
+
+    for row in rows:
+        age = max(0.0, now - row["created_at"])
+        weight = math.exp(-age / decay_constant)
+        etype = row["event_type"]
+        if etype in ("success", "text_only"):
+            decayed_success += weight
+        elif etype == "failure":
+            decayed_failure += weight
+        if row["latency_ms"] and row["latency_ms"] > 0:
+            decayed_lat_sum += row["latency_ms"] * weight
+            decayed_lat_weight += weight
+
+    decayed_latency = decayed_lat_sum / decayed_lat_weight if decayed_lat_weight > 0 else 0.0
+    score = _compute_quality_score(decayed_success, decayed_failure, 0, decayed_latency)
+    return (decayed_success, decayed_failure, decayed_latency, score)
 
 
 # ── Recording ──────────────────────────────────────────────────────────
@@ -360,9 +410,12 @@ def record_text_only(
 def get_quality_score(provider: str, model: str, base_url: str = "") -> float:
     """Return the quality score (0-100) for a model, or 50.0 if unknown.
 
-    When base_url is empty, returns the best (max) score across all base_urls
-    for this provider/model — so chain sorting uses the highest quality any
-    endpoint has achieved, not a blank-entry score of 100.
+    When base_url is empty, computes a decayed score from recent events
+    (exponential decay with configurable half-life, default 24h) and updates
+    the cached quality_score.  This ensures recent performance matters more
+    than historical failures (e.g. peak-hour rate limiting).
+
+    When base_url is provided, returns the cached score for that endpoint.
     """
     with _LOCK:
         conn = _get_conn()
@@ -372,13 +425,22 @@ def get_quality_score(provider: str, model: str, base_url: str = "") -> float:
                 "SELECT quality_score FROM model_metrics WHERE key=?", (key,)
             ).fetchone()
             return row["quality_score"] if row else 50.0
-        # No base_url — find the best score across all endpoints for this model
-        # Strip provider prefix if model already includes it
-        if "/" in model:
-            model = model.split("/", 1)[1]
+        # No base_url — compute decayed score from events, then return best
+        stripped = model.split("/", 1)[1] if "/" in model else model
+        result = _compute_decayed_score(provider, stripped, conn)
+        if result is not None:
+            decayed_score = result[3]
+            # Update cached score for all base_urls of this model
+            conn.execute(
+                "UPDATE model_metrics SET quality_score=?, updated_at=? WHERE provider=? AND model=?",
+                (decayed_score, time.time(), provider, stripped),
+            )
+            conn.commit()
+            return decayed_score
+        # Fallback to cached score
         rows = conn.execute(
             "SELECT quality_score FROM model_metrics WHERE provider=? AND model=? ORDER BY quality_score DESC",
-            (provider, model),
+            (provider, stripped),
         ).fetchall()
         return rows[0]["quality_score"] if rows else 50.0
 
