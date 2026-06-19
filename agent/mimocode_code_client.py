@@ -112,13 +112,15 @@ class MiMoCodeClient:
         bridge_script = str(Path(__file__).parent / "mimocode_mcp_bridge.py")
 
         # Server named "mcp" → tool IDs become mcp_bash, mcp_read, etc.
-        mcp_config = {
-            "mcpServers": {
+        # MCP config goes in .mimocode/mimocode.json (not .mcp.json — mimo CLI reads this format)
+        mimocode_dir = os.path.join(workspace, ".mimocode")
+        os.makedirs(mimocode_dir, exist_ok=True)
+        mimocode_config = {
+            "mcp": {
                 "mcp": {
-                    "type": "stdio",
-                    "command": sys.executable,
-                    "args": [bridge_script],
-                    "env": {
+                    "type": "local",
+                    "command": [sys.executable, bridge_script],
+                    "environment": {
                         "HERMES_TOOLS_FILE": os.path.join(workspace, "tools.json"),
                         "HERMES_QUEUE_IN": os.path.join(workspace, "queue.in"),
                         "HERMES_QUEUE_OUT_DIR": os.path.join(workspace, "result"),
@@ -126,8 +128,8 @@ class MiMoCodeClient:
                 }
             }
         }
-        with open(os.path.join(workspace, ".mcp.json"), "w") as f:
-            json.dump(mcp_config, f)
+        with open(os.path.join(mimocode_dir, "mimocode.json"), "w") as f:
+            json.dump(mimocode_config, f)
 
         # Build tool schemas with mcp_ prefix names for the bridge
         tool_schemas = []
