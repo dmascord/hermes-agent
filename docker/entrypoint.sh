@@ -86,6 +86,32 @@ if [ "$(id -u)" = "0" ]; then
         fi
     done
 
+    # Register hermes-tools MCP server for mimo CLI.
+    # The mimo CLI discovers MCP servers via .mcp.json in the working directory.
+    # This registers a bridge that lets the gateway intercept and proxy tool calls.
+    if command -v mimo >/dev/null 2>&1; then
+        _mcp_dir="${HERMES_HOME}/home"
+        mkdir -p "$_mcp_dir"
+        cat > "${_mcp_dir}/.mcp.json" <<'MCPJSON'
+{
+  "mcpServers": {
+    "hermes-tools": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["/opt/hermes/agent/mimocode_mcp_bridge.py"],
+      "env": {
+        "HERMES_TOOLS_FILE": "/tmp/hermes_tools.json",
+        "HERMES_QUEUE_IN": "/tmp/hermes_queue.in",
+        "HERMES_QUEUE_OUT_DIR": "/tmp/hermes_result"
+      }
+    }
+  }
+}
+MCPJSON
+        chown hermes:hermes "${_mcp_dir}/.mcp.json" 2>/dev/null || true
+        echo "Registered hermes-tools MCP server for mimo CLI"
+    fi
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi
