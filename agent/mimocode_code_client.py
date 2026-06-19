@@ -252,7 +252,9 @@ class MiMoCodeClient:
         prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
 
-        cmd = [self._command] + self._args
+        # --pure disables external plugins (MCP). Strip it when using MCP bridge.
+        _args = [a for a in self._args if a != "--pure"]
+        cmd = [self._command] + _args
         if model_name:
             cmd += ["--model", model_name]
 
