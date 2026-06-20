@@ -71,6 +71,26 @@ class TestPassthroughProviderExhaustion:
     def test_session_limit_assistant_content_is_provider_exhaustion(self):
         assert _is_provider_exhaustion_content("You've hit your session limit · resets 10:10am (UTC)") is True
 
+    def test_auth_failure_assistant_content_is_provider_exhaustion(self):
+        assert _is_provider_exhaustion_content(
+            "Failed to authenticate. API Error: 401 Invalid authentication credentials"
+        ) is True
+
+    def test_normal_rst_stream_content_is_not_provider_exhaustion(self):
+        content = json.dumps({
+            "facts": [{
+                "what": "Persistent ACI capacity issue causing RST_STREAM error when creating a container",
+                "why": "This is task output, not a provider quota or auth failure",
+            }]
+        })
+
+        assert _is_provider_exhaustion_content(content) is False
+
+    def test_auth_failure_message_is_sanitized_for_client(self):
+        exc = RuntimeError("Failed to authenticate. API Error: 401 Invalid authentication credentials")
+
+        assert _sanitize_passthrough_error_for_client(exc) == "provider quota or session limit exhausted"
+
 
 class TestExplicitModelRuntimeAlignment:
     def test_enterprise_copilot_model_prefers_enterprise_runtime(self):

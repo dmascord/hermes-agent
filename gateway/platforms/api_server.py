@@ -215,7 +215,7 @@ def _is_provider_level_quota_error(exc: Exception) -> bool:
 
 
 def _sanitize_passthrough_error_for_client(exc: Exception) -> str:
-    if exc and _is_provider_exhaustion_error(exc):
+    if exc and (_is_provider_exhaustion_error(exc) or _is_provider_exhaustion_content(str(exc))):
         return "provider quota or session limit exhausted"
     return str(exc) if exc else ""
 
@@ -224,7 +224,43 @@ def _is_provider_exhaustion_content(content: Any) -> bool:
     text = str(content or "").strip()
     if not text:
         return False
-    return _is_provider_exhaustion_error(RuntimeError(text))
+    lower = text.lower()
+
+    # Assistant content is much less structured than exceptions, so keep this
+    # deliberately narrower than _is_provider_exhaustion_error(). Generic
+    # markers like "resets" or "limit" can appear in valid task output.
+    if "you've hit your session limit" in lower or "you have hit your session limit" in lower:
+        return True
+    if "session limit" in lower and re.search(r"\b(reset|resets|try again|available again)\b", lower):
+        return True
+
+    auth_markers = (
+        "failed to authenticate",
+        "invalid authentication credentials",
+        "api error: 401",
+        "error code: 401",
+        "401 unauthorized",
+        "401 invalid authentication",
+        "authenticationerror",
+        "unauthorized. api error",
+    )
+    if any(marker in lower for marker in auth_markers):
+        return True
+
+    quota_markers = (
+        "token_quota_exceeded",
+        "quota_exceeded",
+        "rate_limit_exceeded",
+        "too many requests",
+    )
+    if any(marker in lower for marker in quota_markers):
+        return True
+    if "rate limit" in lower and re.search(r"\b(exceeded|reached|hit|retry|try again)\b", lower):
+        return True
+    if "quota" in lower and re.search(r"\b(exceeded|exhausted|reached|hit)\b", lower):
+        return True
+
+    return False
 
 
 def _mark_hermes_code_provider_exhausted(
@@ -7077,8 +7113,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                 }
                                 if session_id:
                                     _bridge_sse_headers["X-Hermes-Session-Id"] = session_id
-                                response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
-                                await response.prepare(request)
                                 # Run the bridge generator in a thread, collect events via asyncio queue
                                 _bridge_events: asyncio.Queue = asyncio.Queue()
                                 _bridge_error: list[Exception] = []
@@ -7100,6 +7134,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _bridge_usage = {}
                                 _bridge_model = resolved_model
                                 _bridge_tool_calls: list[dict] = []
+                                _bridge_sse_chunks: list[dict] = []
                                 while True:
                                     _be = await _bridge_events.get()
                                     if _be is None or _be.get("type") == "_done":
@@ -7123,7 +7158,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "created": int(time.time()), "model": model_name,
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
-                                        await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                        _bridge_sse_chunks.append(_tc_chunk)
                                         # Write placeholder result to unblock the MCP bridge.
                                         # The generator yields tool_call but does NOT expect
                                         # .send() — the bridge thread uses "for event in gen"
@@ -7148,7 +7183,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 "created": int(time.time()), "model": model_name,
                                                 "choices": [{"index": 0, "delta": {"content": _text}, "finish_reason": None}],
                                             }
-                                            await response.write(f"data: {json.dumps(_text_chunk)}\n\n".encode())
+                                            _bridge_sse_chunks.append(_text_chunk)
                                     elif _bt == "final":
                                         _bridge_final_text = _be.get("text", _bridge_final_text)
                                         _bridge_usage = _be.get("usage", {})
@@ -7175,6 +7210,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                     usage=_bridge_usage_ns,
                                     model=_bridge_model,
                                 )
+                                _skip_provider_exhaustion_content(
+                                    provider_model=provider_model,
+                                    runtime_kwargs=runtime_kwargs,
+                                    content=_bridge_final_text,
+                                    stream=True,
+                                )
                                 # Write finish chunk and close SSE stream
                                 _bridge_finish_chunk = {
                                     "id": _bridge_completion_id, "object": "chat.completion.chunk",
@@ -7186,6 +7227,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                         "total_tokens": int(_bridge_usage_ns.total_tokens or 0),
                                     },
                                 }
+                                response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
+                                await response.prepare(request)
+                                for _bridge_sse_chunk in _bridge_sse_chunks:
+                                    await response.write(f"data: {json.dumps(_bridge_sse_chunk)}\n\n".encode())
                                 await response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
                                 await response.write(b"data: [DONE]\n\n")
                                 await response.write_eof()
@@ -7244,8 +7289,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                 }
                                 if session_id:
                                     _bridge_sse_headers["X-Hermes-Session-Id"] = session_id
-                                response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
-                                await response.prepare(request)
                                 _bridge_events: asyncio.Queue = asyncio.Queue()
                                 def _run_mc_simple(_c=_mc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools, _q=_bridge_events):
                                     try:
@@ -7271,6 +7314,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _bridge_usage = {}
                                 _bridge_model = resolved_model
                                 _bridge_tool_calls: list[dict] = []
+                                _bridge_sse_chunks: list[dict] = []
                                 while True:
                                     _be = await _bridge_events.get()
                                     if _be is None or _be.get("type") == "_done":
@@ -7294,7 +7338,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "created": int(time.time()), "model": model_name,
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
-                                        await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                        _bridge_sse_chunks.append(_tc_chunk)
                                         # Write placeholder result to unblock the MCP bridge proxy
                                         if _mc_client._queue_out_dir:
                                             _result_path = os.path.join(_mc_client._queue_out_dir, f"{_call_id}.json")
@@ -7313,7 +7357,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "created": int(time.time()), "model": model_name,
                                             "choices": [{"index": 0, "delta": {"content": _chunk_text}, "finish_reason": None}],
                                         }
-                                        await response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                        _bridge_sse_chunks.append(_tc_chunk)
                                     elif _bt == "error":
                                         logger.warning("[hermes-code] mimocode-cli bridge error: %s", _be.get("message"))
                                     elif _bt == "final":
@@ -7335,6 +7379,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                         "total_tokens": int(_bridge_usage_ns.total_tokens or 0),
                                     },
                                 }
+                                _skip_provider_exhaustion_content(
+                                    provider_model=provider_model,
+                                    runtime_kwargs=runtime_kwargs,
+                                    content=_bridge_final_text,
+                                    stream=True,
+                                )
+                                response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
+                                await response.prepare(request)
+                                for _bridge_sse_chunk in _bridge_sse_chunks:
+                                    await response.write(f"data: {json.dumps(_bridge_sse_chunk)}\n\n".encode())
                                 await response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
                                 await response.write(b"data: [DONE]\n\n")
                                 await response.write_eof()
@@ -8453,6 +8507,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 completion_tokens=int(_bridge_usage_ns.get("output_tokens", 0) or 0),
                                 total_tokens=int((_bridge_usage_ns.get("input_tokens", 0) or 0) + (_bridge_usage_ns.get("output_tokens", 0) or 0)),
                             )
+                            _skip_provider_exhaustion_content(
+                                provider_model=provider_model,
+                                runtime_kwargs=runtime_kwargs,
+                                content=_bridge_final_text_ns,
+                                stream=False,
+                            )
                             response_obj = SimpleNamespace(
                                 choices=[SimpleNamespace(
                                     message=SimpleNamespace(content=_bridge_final_text_ns, tool_calls=_bridge_tool_calls_ns if _bridge_tool_calls_ns else None),
@@ -8539,6 +8599,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 prompt_tokens=int(_bridge_usage_ns.get("input_tokens", 0) or 0),
                                 completion_tokens=int(_bridge_usage_ns.get("output_tokens", 0) or 0),
                                 total_tokens=int((_bridge_usage_ns.get("input_tokens", 0) or 0) + (_bridge_usage_ns.get("output_tokens", 0) or 0)),
+                            )
+                            _skip_provider_exhaustion_content(
+                                provider_model=provider_model,
+                                runtime_kwargs=runtime_kwargs,
+                                content=_bridge_final_text_ns,
+                                stream=False,
                             )
                             response_obj = SimpleNamespace(
                                 choices=[SimpleNamespace(
