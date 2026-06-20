@@ -65,6 +65,8 @@ _MODEL_TIERS: Dict[str, ModelTier] = {
     "opencode-zen/mimo-v2.5-free": ModelTier.TIER2_LARGE_UNRELIABLE,
     "opencode-zen/deepseek-v4-flash-free": ModelTier.TIER2_LARGE_UNRELIABLE,
     "opencode-zen/big-pickle": ModelTier.TIER2_LARGE_UNRELIABLE,
+    "opencode-zen/north-mini-code-free": ModelTier.TIER2_LARGE_UNRELIABLE,
+    "opencode-zen/nemotron-3-ultra-free": ModelTier.TIER2_LARGE_UNRELIABLE,
     "opencode-go/deepseek-v4-flash": ModelTier.TIER2_LARGE_UNRELIABLE,
     "ollama/kimi-k2-thinking": ModelTier.TIER2_LARGE_UNRELIABLE,
     "ollama/qwen3-coder-next": ModelTier.TIER2_LARGE_UNRELIABLE,
@@ -75,8 +77,10 @@ _MODEL_TIERS: Dict[str, ModelTier] = {
     "groq/llama-3.3-70b-versatile": ModelTier.TIER3_SMALL_FAST,
 
     # Tier 4: Limited (free, rate-limited, fragile)
-    "nous/stepfun/step-3.7-flash:free": ModelTier.TIER4_LIMITED,
-    "nous/nvidia/nemotron-3-ultra:free": ModelTier.TIER4_LIMITED,
+    "openrouter/cohere/north-mini-code:free": ModelTier.TIER4_LIMITED,
+    "openrouter/openrouter/owl-alpha": ModelTier.TIER4_LIMITED,
+    "openrouter/poolside/laguna-m.1:free": ModelTier.TIER4_LIMITED,
+    "openrouter/poolside/laguna-xs.2:free": ModelTier.TIER4_LIMITED,
     "arliai/Mistral-Medium-3.5-128B": ModelTier.TIER4_LIMITED,
     "arliai/GLM-4.6-Derestricted-v5": ModelTier.TIER4_LIMITED,
     "arliai/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Derestricted": ModelTier.TIER4_LIMITED,

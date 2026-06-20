@@ -397,6 +397,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2",
         "qwen3-coder",
         "big-pickle",
+        "north-mini-code-free",
+        "nemotron-3-ultra-free",
+        "mimo-v2.5-free",
+        "deepseek-v4-flash-free",
     ],
     "opencode-go": [
         "kimi-k2.6",

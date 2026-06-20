@@ -276,8 +276,26 @@ def _key(provider: str, model: str, base_url: str = "", credential_id: str = "")
 
 
 def _gc_cooldowns(conn: sqlite3.Connection, now: float) -> None:
-    """Remove expired cooldowns and the oldest records when over _MAX_RECORDS."""
+    """Remove expired cooldowns, stale circuit breakers, and the oldest records when over _MAX_RECORDS."""
     conn.execute("DELETE FROM cooldowns WHERE cooldown_until <= ?", (now,))
+    # Prune circuit_breaker entries whose failures have all aged out of the window.
+    cutoff = now - circuit_breaker_window_seconds()
+    stale_cb = conn.execute(
+        "SELECT key, failures FROM circuit_breakers"
+    ).fetchall()
+    for row in stale_cb:
+        try:
+            failures = json.loads(row["failures"]) if row["failures"] else []
+        except (json.JSONDecodeError, TypeError):
+            failures = []
+        active = [ts for ts in failures if isinstance(ts, (int, float)) and ts > cutoff]
+        if not active:
+            conn.execute("DELETE FROM circuit_breakers WHERE key = ?", (row["key"],))
+        elif len(active) < len(failures):
+            conn.execute(
+                "UPDATE circuit_breakers SET failures = ?, updated_at = ? WHERE key = ?",
+                (json.dumps(active), now, row["key"]),
+            )
     # Keep only the _MAX_RECORDS most-recently-updated cooldowns.
     excess = conn.execute(
         "SELECT COUNT(*) FROM cooldowns"
@@ -325,6 +343,7 @@ def mark_model_cooldown(
     with _LOCK:
         conn = _get_conn()
         try:
+            _gc_cooldowns(conn, now)
             conn.execute(
                 """INSERT OR REPLACE INTO cooldowns
                    (key, provider, model, base_url, credential_id,
@@ -406,6 +425,7 @@ def model_cooldown_remaining(provider: str, model: str, *, base_url: str = "", c
 
     with _LOCK:
         conn = _get_conn()
+        _gc_cooldowns(conn, now)
         row = conn.execute(
             "SELECT cooldown_until FROM cooldowns WHERE key = ?",
             (rec_key,),
@@ -446,6 +466,7 @@ def model_cooldown_remaining_for_pool(
 
     with _LOCK:
         conn = _get_conn()
+        _gc_cooldowns(conn, now)
         # ── Pool-level (global) cooldown ──────────────────────────────
         pool_row = conn.execute(
             "SELECT cooldown_until FROM cooldowns"
@@ -552,6 +573,7 @@ def mark_provider_failure(
 
     with _LOCK:
         conn = _get_conn()
+        _gc_cooldowns(conn, now)
         try:
             # Load existing failures.
             row = conn.execute(
