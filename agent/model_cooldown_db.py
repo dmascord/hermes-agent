@@ -307,6 +307,7 @@ def _gc_cooldowns(conn: sqlite3.Connection, now: float) -> None:
             ")",
             (excess,),
         )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
