@@ -220,6 +220,13 @@ def _sanitize_passthrough_error_for_client(exc: Exception) -> str:
     return str(exc) if exc else ""
 
 
+def _is_provider_exhaustion_content(content: Any) -> bool:
+    text = str(content or "").strip()
+    if not text:
+        return False
+    return _is_provider_exhaustion_error(RuntimeError(text))
+
+
 def _mark_hermes_code_provider_exhausted(
     *,
     provider_model: str,
@@ -282,6 +289,31 @@ def _mark_hermes_code_provider_exhausted(
             logger.warning("[hermes-code] %s cooled down for %.0fs after provider exhaustion", provider_model, cooldown_seconds)
     except Exception:
         pass
+
+
+def _skip_provider_exhaustion_content(
+    *,
+    provider_model: str,
+    runtime_kwargs: Optional[Dict[str, Any]],
+    content: Any,
+    stream: bool,
+) -> None:
+    if not _is_provider_exhaustion_content(content):
+        return
+    exc = RuntimeError(str(content).strip())
+    logger.warning(
+        "[hermes-code] %s returned provider-exhaustion text; suppressing content and trying next provider: %.200s",
+        provider_model,
+        str(content).strip(),
+    )
+    _mark_hermes_code_provider_exhausted(
+        provider_model=provider_model,
+        runtime_kwargs=runtime_kwargs,
+        exc=exc,
+        stream=stream,
+    )
+    _invalidate_selectable_pool_cache()
+    raise _CodexPassthroughSkip("provider_exhaustion_content")
 
 
 def _invoke_passthrough_hooks(hook_name: str, **kwargs: Any) -> None:
@@ -6683,6 +6715,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                     finish_reason = "tool_calls"
 
                             # ── Common variables and success marking ──
+                            _skip_provider_exhaustion_content(
+                                provider_model=provider_model,
+                                runtime_kwargs=runtime_kwargs,
+                                content=content_out,
+                                stream=True,
+                            )
                             completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
                             created = int(time.time())
                             _args_preview = [
@@ -7536,6 +7574,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         msg = response_obj.choices[0].message
                         content_out = extract_content_or_reasoning(response_obj).strip()
                         reasoning_content_out = _extract_reasoning_content_from_msg(msg)
+                        _skip_provider_exhaustion_content(
+                            provider_model=provider_model,
+                            runtime_kwargs=runtime_kwargs,
+                            content=content_out,
+                            stream=True,
+                        )
                         tool_calls_raw = getattr(msg, "tool_calls", []) or []
                         # Serialize tool_calls (may be Pydantic models from some providers)
                         tool_calls_out = []
@@ -8180,6 +8224,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             pass
 
                         assistant_msg: Dict[str, Any] = {"role": "assistant"}
+                        _skip_provider_exhaustion_content(
+                            provider_model=provider_model,
+                            runtime_kwargs=locals().get("runtime_kwargs"),
+                            content=response_text,
+                            stream=False,
+                        )
                         if tool_calls:
                             assistant_msg["tool_calls"] = tool_calls
                         if response_text:
@@ -8597,6 +8647,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     msg = response_obj.choices[0].message
                     content = extract_content_or_reasoning(response_obj).strip()
                     reasoning_content = _extract_reasoning_content_from_msg(msg)
+                    _skip_provider_exhaustion_content(
+                        provider_model=provider_model,
+                        runtime_kwargs=runtime_kwargs,
+                        content=content,
+                        stream=False,
+                    )
                     if reasoning_content:
                         logger.debug(
                             "[hermes-code] non-streaming reasoning_content from provider: model=%s rc_len=%d",

@@ -32,6 +32,7 @@ from gateway.platforms.api_server import (
     _align_runtime_with_explicit_model,
     _cooldown_seconds_for_429,
     _derive_chat_session_id,
+    _is_provider_exhaustion_content,
     _is_provider_exhaustion_error,
     _sanitize_passthrough_error_for_client,
     check_api_server_requirements,
@@ -66,6 +67,9 @@ class TestPassthroughProviderExhaustion:
         exc = RuntimeError("You've hit your session limit · resets 5am (UTC)")
 
         assert _sanitize_passthrough_error_for_client(exc) == "provider quota or session limit exhausted"
+
+    def test_session_limit_assistant_content_is_provider_exhaustion(self):
+        assert _is_provider_exhaustion_content("You've hit your session limit · resets 10:10am (UTC)") is True
 
 
 class TestExplicitModelRuntimeAlignment:
