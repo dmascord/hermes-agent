@@ -79,11 +79,12 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     import os as _os
     import re as _re
     import time as _time
+    from datetime import datetime as _datetime, timezone as _timezone, timedelta as _timedelta
 
     # 1. Honour Retry-After header if the underlying HTTP response is attached.
     # Check error body first to determine if this is a weekly/daily quota.
     body = str(exc).lower()
-    _is_quota_limit = any(kw in body for kw in ["weekly", "daily", "usage limit", "limitname"])
+    _is_quota_limit = any(kw in body for kw in ["weekly", "daily", "usage limit", "limitname", "session limit"])
     _max = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
     try:
         retry_after = exc.response.headers.get("Retry-After") or exc.response.headers.get("retry-after")  # type: ignore[union-attr]
@@ -133,9 +134,154 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
         return _raw if _max <= 0 else min(_raw, _max)
     if "hour" in body:
         return 3600.0
+    # ChatGPT/Codex quota errors can say "resets 5am (UTC)" without a
+    # numeric duration. Cool down until the next stated UTC reset time.
+    _utc_reset = _re.search(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?utc\)?", body)
+    if _utc_reset:
+        _hour = int(_utc_reset.group(1))
+        _minute = int(_utc_reset.group(2) or "0")
+        _ampm = _utc_reset.group(3)
+        if _ampm == "pm" and _hour != 12:
+            _hour += 12
+        elif _ampm == "am" and _hour == 12:
+            _hour = 0
+        if 0 <= _hour <= 23 and 0 <= _minute <= 59:
+            _now = _datetime.now(_timezone.utc)
+            _reset_at = _now.replace(hour=_hour, minute=_minute, second=0, microsecond=0)
+            if _reset_at <= _now:
+                _reset_at += _timedelta(days=1)
+            return max(60.0, (_reset_at - _now).total_seconds())
 
     # 4. Generic rate-limit — 10 minutes.
     return 600.0
+
+
+def _exception_status_code(exc: Exception) -> Optional[int]:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if isinstance(response_status, int):
+        return response_status
+    match = re.search(r"\bHTTP\s+(\d{3})\b|\bstatus(?:_code)?[=:]\s*(\d{3})\b", str(exc), re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1) or match.group(2))
+        except Exception:
+            return None
+    return None
+
+
+def _is_provider_exhaustion_error(exc: Exception) -> bool:
+    """Return True for quota/session-limit errors that should fall through."""
+    msg = str(exc or "").lower()
+    status_code = _exception_status_code(exc)
+    if status_code == 429:
+        return True
+    exhaustion_markers = (
+        "session limit",
+        "usage limit",
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "quota_exceeded",
+        "insufficient_quota",
+        "resource_exhausted",
+        "too many requests",
+        "go_usagelimit",
+        "limitname",
+        "resets ",
+        "retry-after",
+        "retry after",
+    )
+    return any(marker in msg for marker in exhaustion_markers)
+
+
+def _is_provider_level_quota_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(
+        marker in msg
+        for marker in (
+            "weekly",
+            "daily",
+            "usage limit",
+            "session limit",
+            "go_usagelimit",
+            "limitname",
+            "practical_brown",
+        )
+    )
+
+
+def _sanitize_passthrough_error_for_client(exc: Exception) -> str:
+    if exc and _is_provider_exhaustion_error(exc):
+        return "provider quota or session limit exhausted"
+    return str(exc) if exc else ""
+
+
+def _mark_hermes_code_provider_exhausted(
+    *,
+    provider_model: str,
+    runtime_kwargs: Optional[Dict[str, Any]],
+    exc: Exception,
+    stream: bool,
+) -> None:
+    provider = provider_model.split("/", 1)[0] if "/" in provider_model else "openai"
+    status_code = _exception_status_code(exc)
+    cooldown_seconds = _cooldown_seconds_for_429(exc)
+    cpool = runtime_kwargs.get("credential_pool") if isinstance(runtime_kwargs, dict) else None
+
+    if cpool is not None:
+        try:
+            cpool.mark_exhausted_and_rotate(
+                status_code=status_code,
+                error_context={
+                    "reason": "provider_exhausted",
+                    "message": str(exc)[:500],
+                },
+            )
+            logger.warning(
+                "[hermes-code] %s: rotated credential pool after provider exhaustion (cooldown_hint=%.0fs)",
+                provider_model,
+                cooldown_seconds,
+            )
+        except Exception as pool_exc:
+            logger.warning("[hermes-code] %s: credential pool rotate failed: %s", provider_model, pool_exc)
+        _RUNTIME_KWARGS_CACHE.pop(provider, None)
+        _RUNTIME_KWARGS_CACHE_AT.pop(provider, None)
+        return
+
+    reason = "hermes_code_stream_provider_exhausted" if stream else "hermes_code_passthrough_provider_exhausted"
+    try:
+        from agent.model_cooldown_db import mark_model_cooldown
+
+        if _is_provider_level_quota_error(exc):
+            for idx in range(1, 50):
+                model = os.environ.get(f"HERMES_CODE_FALLBACK_{idx}", "")
+                if model and model.startswith(provider + "/"):
+                    mark_model_cooldown(
+                        provider=provider,
+                        model=model,
+                        cooldown_seconds=cooldown_seconds,
+                        reason=f"{reason}_provider_quota",
+                    )
+            logger.warning(
+                "[hermes-code] provider-level exhaustion for %s; cooled %s fallbacks for %.0fs",
+                provider_model,
+                provider,
+                cooldown_seconds,
+            )
+        else:
+            mark_model_cooldown(
+                provider=provider,
+                model=provider_model,
+                cooldown_seconds=cooldown_seconds,
+                reason=reason,
+            )
+            logger.warning("[hermes-code] %s cooled down for %.0fs after provider exhaustion", provider_model, cooldown_seconds)
+    except Exception:
+        pass
 
 
 def _invoke_passthrough_hooks(hook_name: str, **kwargs: Any) -> None:
@@ -6739,21 +6885,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                     pass
                             _invalidate_selectable_pool_cache()
                             # Check if this is a rate-limit (429) or auth (401) error; cooldown the provider.
-                            _status_code = getattr(exc, "status_code", None)
-                            _is_rate_limit = _status_code == 429 or "429" in _exc_str
+                            _status_code = _exception_status_code(exc)
+                            _is_rate_limit = _is_provider_exhaustion_error(exc)
                             _is_auth_error = _status_code == 401 or "401" in _exc_str or "unauthorized" in _exc_str or "authentication" in _exc_str
                             if _is_rate_limit:
-                                try:
-                                    from agent.model_cooldown_db import mark_model_cooldown
-                                    mark_model_cooldown(
-                                        provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
-                                        model=provider_model,
-                                        cooldown_seconds=_cooldown_seconds_for_429(exc),
-                                        reason="hermes_code_stream_429",
-                                    )
-                                    logger.warning("[hermes-code] stream %s cooled down for %.0fs after 429", provider_model, _cooldown_seconds_for_429(exc))
-                                except Exception:
-                                    pass
+                                _mark_hermes_code_provider_exhausted(
+                                    provider_model=provider_model,
+                                    runtime_kwargs=locals().get("runtime_kwargs"),
+                                    exc=exc,
+                                    stream=True,
+                                )
                             elif _is_auth_error:
                                 # Auth errors (401) — distinguish permanent from transient.
                                 _is_token_invalidated = "token_invalidated" in _exc_str or "invalidated" in _exc_str
@@ -7721,44 +7862,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                 pass
                         _invalidate_selectable_pool_cache()
                         # Check if this is a rate-limit (429) or auth (401) error; cooldown the provider.
-                        _status_code = getattr(exc, "status_code", None)
-                        _is_rate_limit = _status_code == 429 or "429" in _exc_str
+                        _status_code = _exception_status_code(exc)
+                        _is_rate_limit = _is_provider_exhaustion_error(exc)
                         _is_auth_error = _status_code == 401 or "401" in _exc_str or "unauthorized" in _exc_str or "authentication" in _exc_str
                         if _is_rate_limit:
-                            _cooldown_secs = _cooldown_seconds_for_429(exc)
-                            _prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
-                            # Check if this is a provider-level quota (weekly/daily limit).
-                            # If so, cooldown ALL models from this provider, not just the one that failed.
-                            _is_provider_quota = any(kw in _exc_str for kw in ["weekly", "daily", "usage limit", "go_usagelimit", "practical_brown"])
-                            if _is_provider_quota:
-                                # Provider-level quota — cooldown all models from this provider.
-                                try:
-                                    from agent.model_cooldown_db import mark_model_cooldown
-                                    for _i in range(1, 50):
-                                        _model = os.environ.get(f"HERMES_CODE_FALLBACK_{_i}", "")
-                                        if _model and _model.startswith(_prov + "/"):
-                                            mark_model_cooldown(
-                                                provider=_prov,
-                                                model=_model,
-                                                cooldown_seconds=_cooldown_secs,
-                                                reason="hermes_code_stream_429_provider_quota",
-                                            )
-                                    logger.info("[hermes-code] provider-level quota detected for %s — all %s models cooled down for %.0fs", provider_model, _prov, _cooldown_secs)
-                                except Exception:
-                                    pass
-                            else:
-                                # Model-specific 429 — cooldown just this model.
-                                try:
-                                    from agent.model_cooldown_db import mark_model_cooldown
-                                    mark_model_cooldown(
-                                        provider=_prov,
-                                        model=provider_model,
-                                        cooldown_seconds=_cooldown_secs,
-                                        reason="hermes_code_stream_429",
-                                    )
-                                    logger.info("[hermes-code] stream %s cooled down for %.0fs after 429", provider_model, _cooldown_secs)
-                                except Exception:
-                                    pass
+                            _mark_hermes_code_provider_exhausted(
+                                provider_model=provider_model,
+                                runtime_kwargs=runtime_kwargs,
+                                exc=exc,
+                                stream=True,
+                            )
                         elif _status_code == 400:
                             # 400 errors (bad request). Skip cooldown for prompt-too-long
                             # errors — those are routing/compaction issues, not provider
@@ -7819,7 +7932,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         logger.debug("[%d] !! stream provider error %s: %s", _req_id, type(exc).__name__, _exc_str[:200])
                         continue
 
-                _err_msg = str(passthrough_error) if passthrough_error else "all passthrough providers failed"
+                _err_msg = _sanitize_passthrough_error_for_client(passthrough_error) if passthrough_error else "all passthrough providers failed"
                 if not _err_msg:
                     _err_msg = f"all providers failed ({type(passthrough_error).__name__})"
                     logger.warning(
@@ -8153,25 +8266,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         _invalidate_selectable_pool_cache()
                         # Check if this is a rate-limit error; if so, cooldown the provider
                         _is_rate_limit = False
-                        _status_code = getattr(exc, "status_code", None)
+                        _status_code = _exception_status_code(exc)
                         if _status_code == 429:
                             _is_rate_limit = True
                         elif isinstance(exc, Exception):
                             _exc_str = str(exc).lower()
-                            if "429" in _exc_str or "rate" in _exc_str or "limit" in _exc_str:
+                            if _is_provider_exhaustion_error(exc):
                                 _is_rate_limit = True
                         if _is_rate_limit:
-                            try:
-                                from agent.model_cooldown_db import mark_model_cooldown
-                                mark_model_cooldown(
-                                    provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
-                                    model=provider_model,
-                                    cooldown_seconds=_cooldown_seconds_for_429(exc),
-                                    reason="hermes_code_passthrough_429",
-                                )
-                                logger.info("[hermes-tuple] %s cooled down for %.0fs after 429", provider_model, _cooldown_seconds_for_429(exc))
-                            except Exception:
-                                pass
+                            _mark_hermes_code_provider_exhausted(
+                                provider_model=provider_model,
+                                runtime_kwargs=locals().get("runtime_kwargs"),
+                                exc=exc,
+                                stream=False,
+                            )
                         logger.warning("[hermes-code] passthrough copilot %s failed: %s", provider_model, exc)
                         continue
 
@@ -8718,25 +8826,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     _invalidate_selectable_pool_cache()
                     # Check if this is a rate-limit error; if so, cooldown the provider
                     _is_rate_limit = False
-                    _status_code = getattr(exc, "status_code", None)
+                    _status_code = _exception_status_code(exc)
                     if _status_code == 429:
                         _is_rate_limit = True
                     elif isinstance(exc, Exception):
                         _exc_str = str(exc).lower()
-                        if "429" in _exc_str or "rate" in _exc_str or "limit" in _exc_str:
+                        if _is_provider_exhaustion_error(exc):
                             _is_rate_limit = True
                     if _is_rate_limit:
-                        try:
-                            from agent.model_cooldown_db import mark_model_cooldown
-                            mark_model_cooldown(
-                                provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
-                                model=provider_model,
-                                cooldown_seconds=_cooldown_seconds_for_429(exc),
-                                reason="hermes_code_passthrough_429",
-                            )
-                            logger.info("[hermes-code] %s cooled down for %.0fs after 429", provider_model, _cooldown_seconds_for_429(exc))
-                        except Exception:
-                            pass
+                        _mark_hermes_code_provider_exhausted(
+                            provider_model=provider_model,
+                            runtime_kwargs=runtime_kwargs,
+                            exc=exc,
+                            stream=False,
+                        )
                     elif _status_code == 400:
                         # 400 errors (bad request) — 120s cooldown.
                         try:
@@ -8799,7 +8902,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if passthrough_error or not _pt_call_count[0]:
                 if not passthrough_error:
                     passthrough_error = Exception("no passthrough providers available (all skipped or missing credentials)")
-                _err_msg = str(passthrough_error)
+                _err_msg = _sanitize_passthrough_error_for_client(passthrough_error)
                 if _is_prompt_too_long_error(_err_msg):
                     logger.warning(
                         "[api_server] hermes-code passthrough stopped: prompt too long (~%d tokens). Returning 413.",

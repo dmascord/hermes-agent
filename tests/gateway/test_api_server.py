@@ -30,7 +30,10 @@ from gateway.platforms.api_server import (
     _CORS_HEADERS,
     _call_codex_passthrough,
     _align_runtime_with_explicit_model,
+    _cooldown_seconds_for_429,
     _derive_chat_session_id,
+    _is_provider_exhaustion_error,
+    _sanitize_passthrough_error_for_client,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -49,6 +52,20 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+class TestPassthroughProviderExhaustion:
+    def test_codex_session_limit_is_fallback_exhaustion(self):
+        exc = RuntimeError("codex passthrough HTTP 429: b\"You've hit your session limit · resets 5am (UTC)\"")
+
+        assert _is_provider_exhaustion_error(exc) is True
+        assert _cooldown_seconds_for_429(exc) >= 60.0
+        assert _cooldown_seconds_for_429(exc) <= 24 * 3600.0
+
+    def test_provider_exhaustion_message_is_sanitized_for_client(self):
+        exc = RuntimeError("You've hit your session limit · resets 5am (UTC)")
+
+        assert _sanitize_passthrough_error_for_client(exc) == "provider quota or session limit exhausted"
 
 
 class TestExplicitModelRuntimeAlignment:
