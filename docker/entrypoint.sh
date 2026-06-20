@@ -131,6 +131,21 @@ PY
         fi
     done
 
+    # Ensure all Claude credential files are owned by hermes.
+    # Files written as root (e.g. manual credential pushes via kubectl exec,
+    # entrypoint PVC restore, or _write_claude_credentials_file running
+    # before the gosu drop) block the hermes runtime from reading them.
+    # Checking by name rather than by owner so this also handles files
+    # that were chown'd to a non-hermes user by the host.
+    find "${HERMES_HOME}" /home/tusker -name '.credentials.json' \
+        -exec chown hermes:hermes {} \; \
+        -exec chmod 600 {} \; \
+        2>/dev/null || true
+    find "${HERMES_HOME}" /home/tusker -name '.claude.json' \
+        -exec chown hermes:hermes {} \; \
+        -exec chmod 600 {} \; \
+        2>/dev/null || true
+
     # Register hermes-tools MCP server for mimo CLI.
     # The mimo CLI discovers MCP servers via .mcp.json in the working directory.
     # This registers a bridge that lets the gateway intercept and proxy tool calls.
