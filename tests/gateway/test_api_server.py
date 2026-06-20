@@ -91,6 +91,30 @@ class TestPassthroughProviderExhaustion:
 
         assert _sanitize_passthrough_error_for_client(exc) == "provider quota or session limit exhausted"
 
+    def test_not_logged_in_content_is_provider_exhaustion(self):
+        assert _is_provider_exhaustion_content(
+            "Not logged in · Please run /login"
+        ) is True
+
+    def test_please_run_login_content_is_provider_exhaustion(self):
+        assert _is_provider_exhaustion_content(
+            "Please run /login to authenticate"
+        ) is True
+
+    def test_not_logged_in_error_is_sanitized_for_client(self):
+        """An exception whose str() contains the not-logged-in pattern
+        is sanitized by _sanitize_passthrough_error_for_client because
+        that function falls back to _is_provider_exhaustion_content(str(exc))."""
+        exc = RuntimeError("claude-code-cli: Not logged in · Please run /login")
+
+        assert _is_provider_exhaustion_content(str(exc)) is True
+        assert _sanitize_passthrough_error_for_client(exc) == "provider quota or session limit exhausted"
+
+    def test_normal_login_instruction_is_not_provider_exhaustion(self):
+        """Casual use of 'login' in task output should not be mistaken for an auth error."""
+        content = "First, run the login command to authenticate with the API"
+        assert _is_provider_exhaustion_content(content) is False
+
 
 class TestExplicitModelRuntimeAlignment:
     def test_enterprise_copilot_model_prefers_enterprise_runtime(self):

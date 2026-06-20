@@ -243,6 +243,8 @@ def _is_provider_exhaustion_content(content: Any) -> bool:
         "401 invalid authentication",
         "authenticationerror",
         "unauthorized. api error",
+        "not logged in",
+        "please run /login",
     )
     if any(marker in lower for marker in auth_markers):
         return True
@@ -1975,10 +1977,26 @@ def _call_codex_passthrough(
                                 entry["name"] = name
                             if arguments:
                                 entry["arguments"] = arguments
+            elif etype == "response.failed":
+                resp_obj = data.get("response", {})
+                err_obj = resp_obj.get("error", {}) or {}
+                err_code = err_obj.get("code", "unknown")
+                err_msg = err_obj.get("message", str(resp_obj)[:200])
+                raise RuntimeError(
+                    f"codex passthrough response.failed: {err_code} {err_msg}"
+                )
             elif etype == "response.completed":
                 resp_obj = data.get("response")
                 if resp_obj is not None:
                     usage_obj = resp_obj.get("usage")
+                    # Check if the response itself reports failure status
+                    if resp_obj.get("status") == "failed":
+                        err_obj = resp_obj.get("error", {}) or {}
+                        err_code = err_obj.get("code", "unknown")
+                        err_msg = err_obj.get("message", "no error details")
+                        raise RuntimeError(
+                            f"codex passthrough response completed with status=failed: {err_code} {err_msg}"
+                        )
     content = "".join(content_parts)
 
     tool_calls_out: List[Any] = []
@@ -7135,6 +7153,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _bridge_model = resolved_model
                                 _bridge_tool_calls: list[dict] = []
                                 _bridge_sse_chunks: list[dict] = []
+                                _bridge_error_msg: str | None = None  # track bridge error for content fallback
                                 while True:
                                     _be = await _bridge_events.get()
                                     if _be is None or _be.get("type") == "_done":
@@ -7189,7 +7208,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _bridge_usage = _be.get("usage", {})
                                         _bridge_model = _be.get("model", _bridge_model)
                                     elif _bt == "error":
-                                        logger.warning("[hermes-code] claude-code-cli bridge error: %s", _be.get("message"))
+                                        _bridge_error_msg = _be.get("message", "")
+                                        logger.warning("[hermes-code] claude-code-cli bridge error: %s", _bridge_error_msg)
+                                # If the bridge reported an error and produced no real content, use the error
+                                # message as the response text so downstream exhaustion/error checks catch it.
+                                if _bridge_error_msg and not _bridge_final_text and not _bridge_tool_calls:
+                                    _bridge_final_text = _bridge_error_msg
                                 # Build response_obj and finalize SSE
                                 _bridge_finish_reason = "tool_calls" if _bridge_tool_calls else "stop"
                                 _bridge_usage_ns = SimpleNamespace(
@@ -7315,6 +7339,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _bridge_model = resolved_model
                                 _bridge_tool_calls: list[dict] = []
                                 _bridge_sse_chunks: list[dict] = []
+                                _bridge_error_msg: str | None = None
                                 while True:
                                     _be = await _bridge_events.get()
                                     if _be is None or _be.get("type") == "_done":
@@ -7359,7 +7384,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                         }
                                         _bridge_sse_chunks.append(_tc_chunk)
                                     elif _bt == "error":
-                                        logger.warning("[hermes-code] mimocode-cli bridge error: %s", _be.get("message"))
+                                        _bridge_error_msg = _be.get("message", "")
+                                        logger.warning("[hermes-code] mimocode-cli bridge error: %s", _bridge_error_msg)
                                     elif _bt == "final":
                                         _bridge_usage = _be.get("usage", {})
                                         _bridge_model = _be.get("model", resolved_model)
@@ -7369,6 +7395,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                     completion_tokens=_bridge_usage.get("output_tokens", 0),
                                     total_tokens=_bridge_usage.get("total_tokens", 0),
                                 )
+                                # If the bridge reported an error and produced no real content, use the error
+                                # message as the response text so downstream exhaustion/error checks catch it.
+                                if _bridge_error_msg and not _bridge_final_text and not _bridge_tool_calls:
+                                    _bridge_final_text = _bridge_error_msg
                                 _bridge_finish_chunk = {
                                     "id": _bridge_completion_id, "object": "chat.completion.chunk",
                                     "created": int(time.time()), "model": _bridge_model,
@@ -8478,6 +8508,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             _bridge_usage_ns = {}
                             _bridge_model_ns = resolved_model
                             _bridge_tool_calls_ns: list[dict] = []
+                            _bridge_error_msg_ns: str | None = None
                             def _run_bridge_ns(_c=_cc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
                                 events = list(_c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools))
                                 return events
@@ -8501,7 +8532,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                     _bridge_usage_ns = _be.get("usage", {})
                                     _bridge_model_ns = _be.get("model", _bridge_model_ns)
                                 elif _bt == "error":
-                                    logger.warning("[hermes-code] claude-code-cli ns bridge error: %s", _be.get("message"))
+                                    _bridge_error_msg_ns = _be.get("message", "")
+                                    logger.warning("[hermes-code] claude-code-cli ns bridge error: %s", _bridge_error_msg_ns)
+                            # If the bridge reported an error and produced no real content, use the error
+                            # message as the response text so downstream exhaustion/error checks catch it.
+                            if _bridge_error_msg_ns and not _bridge_final_text_ns and not _bridge_tool_calls_ns:
+                                _bridge_final_text_ns = _bridge_error_msg_ns
                             _usage_ns_obj = SimpleNamespace(
                                 prompt_tokens=int(_bridge_usage_ns.get("input_tokens", 0) or 0),
                                 completion_tokens=int(_bridge_usage_ns.get("output_tokens", 0) or 0),
