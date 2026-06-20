@@ -59,6 +59,7 @@ if [ "$(id -u)" = "0" ]; then
     # The PVC mount persists across pod restarts. Restore into the hermes-owned
     # subprocess HOME so ClaudeCodeClient (running as hermes) can access them.
     if [ -d "${HERMES_HOME}/.claude_backup" ]; then
+        _claude_backup_restored=0
         mkdir -p "${HERMES_HOME}/home/.claude" 2>/dev/null || true
         if [ -f "${HERMES_HOME}/.claude_backup/.credentials.json" ]; then
             if HERMES_HOME="${HERMES_HOME}" python3 - <<'PY'
@@ -102,6 +103,7 @@ PY
                 cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
                 chown hermes:hermes "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
                 chmod 600 "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
+                _claude_backup_restored=1
             else
                 echo "Skipped Claude Code CLI PVC backup restore because newer credentials exist"
             fi
@@ -112,7 +114,9 @@ PY
             chmod 600 "${HERMES_HOME}/home/.claude.json" 2>/dev/null || true
         fi
 
-        echo "Restored Claude Code CLI credentials from PVC backup"
+        if [ "${_claude_backup_restored}" = "1" ]; then
+            echo "Restored Claude Code CLI credentials from PVC backup"
+        fi
     fi
     # Symlink ~/.claude → hermes subprocess home so Claude CLI finds credentials
     # for direct shell invocations. The gateway path resolves HOME via
