@@ -231,6 +231,15 @@ def _credential_expires_at_ms(auth: dict[str, Any]) -> int:
         return 0
 
 
+def _credential_file_expires_at_ms(path: Path) -> int:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        auth = data.get("claudeAiOauth", {}) if isinstance(data, dict) else {}
+        return _credential_expires_at_ms(auth)
+    except Exception:
+        return 0
+
+
 def _restore_claude_credentials_from_backup(creds_path: Path) -> bool:
     """Restore refreshable Claude credentials from the PVC backup if present."""
     backup_roots = []
@@ -256,6 +265,25 @@ def _restore_claude_credentials_from_backup(creds_path: Path) -> bool:
             auth = data.get("claudeAiOauth", {}) if isinstance(data, dict) else {}
             if not auth.get("accessToken") or not auth.get("refreshToken"):
                 _logger.debug("claude_oauth: backup %s is not refreshable", pvc_backup)
+                continue
+            backup_expires_ms = _credential_expires_at_ms(auth)
+            active_expires_ms = _credential_file_expires_at_ms(creds_path) if creds_path.exists() else 0
+            _auth_json_creds, auth_json_expires_ms = _auth_json_claude_credentials()
+            if active_expires_ms and active_expires_ms > backup_expires_ms:
+                _logger.info(
+                    "claude_oauth: refusing to restore older PVC backup over active credentials "
+                    "(backup=%s, active=%s)",
+                    backup_expires_ms,
+                    active_expires_ms,
+                )
+                continue
+            if auth_json_expires_ms and auth_json_expires_ms > backup_expires_ms:
+                _logger.info(
+                    "claude_oauth: refusing to restore older PVC backup over auth.json credentials "
+                    "(backup=%s, auth_json=%s)",
+                    backup_expires_ms,
+                    auth_json_expires_ms,
+                )
                 continue
             _write_claude_credentials_file(creds_path, data)
             _logger.info("claude_oauth: restored refreshable credentials from PVC backup %s", pvc_backup)
@@ -367,6 +395,42 @@ def _recover_claude_tokens_from_auth_json() -> bool:
         return False
 
 
+def _auth_json_claude_credentials() -> tuple[dict[str, Any], int]:
+    """Return Claude Code full credentials from auth.json, plus expiry ms."""
+    try:
+        from hermes_cli.auth import (
+            _load_auth_store,
+            _load_provider_state,
+            _auth_store_lock,
+        )
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            state = _load_provider_state(auth_store, "claude-code-cli") or {}
+        full_creds = state.get("full_credentials", {})
+        if not isinstance(full_creds, dict):
+            return {}, 0
+        if not full_creds.get("accessToken") or not full_creds.get("refreshToken"):
+            return {}, 0
+        try:
+            expires_ms = int(state.get("expires_at_ms") or full_creds.get("expiresAt") or 0)
+        except Exception:
+            expires_ms = 0
+        return full_creds, expires_ms
+    except Exception as exc:
+        _logger.debug("claude_oauth: failed to inspect auth.json credentials: %s", exc)
+        return {}, 0
+
+
+def _recover_newer_claude_tokens_from_auth_json(current_expires_ms: int = 0) -> bool:
+    """Recover auth.json credentials when they are newer than active disk creds."""
+    full_creds, expires_ms = _auth_json_claude_credentials()
+    if not full_creds:
+        return False
+    if expires_ms and current_expires_ms and expires_ms <= current_expires_ms:
+        return False
+    return _recover_claude_tokens_from_auth_json()
+
+
 def _maybe_refresh_claude_oauth() -> bool:
     """Refresh the Claude OAuth token if it's expired.
 
@@ -391,14 +455,15 @@ def _maybe_refresh_claude_oauth() -> bool:
     # 2. auth.json (source of truth)
     restored_credentials = False
     if not creds_path.exists():
-        _logger.info("claude_oauth: .credentials.json missing — checking PVC backup, then auth.json")
-        
-        # First try PVC backup (most reliable — survives pod restarts)
-        restored_credentials = _restore_claude_credentials_from_backup(creds_path)
-        
-        # Fall back to auth.json recovery
+        _logger.info("claude_oauth: .credentials.json missing — checking auth.json, then PVC backup")
+
+        # auth.json is Hermes' source of truth and may contain fresher tokens
+        # than the pod-start PVC backup, which can lag after rotations.
+        restored_credentials = _recover_claude_tokens_from_auth_json()
+
+        # Fall back to PVC backup only when auth.json has no usable state.
         if not restored_credentials:
-            restored_credentials = _recover_claude_tokens_from_auth_json()
+            restored_credentials = _restore_claude_credentials_from_backup(creds_path)
         if not restored_credentials:
             return False
 
@@ -412,8 +477,9 @@ def _maybe_refresh_claude_oauth() -> bool:
         access_token = auth.get("accessToken", "")
         refresh_token = auth.get("refreshToken", "")
         if not refresh_token:
-            _logger.info("claude_oauth: credentials have no refresh token — checking backup, then auth.json")
-            if _restore_claude_credentials_from_backup(creds_path) or _recover_claude_tokens_from_auth_json():
+            _logger.info("claude_oauth: credentials have no refresh token — checking auth.json, then backup")
+            if _recover_claude_tokens_from_auth_json() or _restore_claude_credentials_from_backup(creds_path):
+                restored_credentials = True
                 try:
                     data = json.loads(creds_path.read_text(encoding="utf-8"))
                     auth = data.get("claudeAiOauth", {})
@@ -428,6 +494,22 @@ def _maybe_refresh_claude_oauth() -> bool:
         now_ms = int(time.time() * 1000)
         expires_at = _credential_expires_at_ms(auth)
         remaining_ms = expires_at - now_ms
+        if _recover_newer_claude_tokens_from_auth_json(expires_at):
+            restored_credentials = True
+            try:
+                data = json.loads(creds_path.read_text(encoding="utf-8"))
+                auth = data.get("claudeAiOauth", {})
+                refresh_token = auth.get("refreshToken", "")
+                expires_at = _credential_expires_at_ms(auth)
+                remaining_ms = expires_at - now_ms
+                _logger.info(
+                    "claude_oauth: replaced stale active credentials with newer auth.json credentials "
+                    "(expires_in=%.0fs)",
+                    remaining_ms / 1000,
+                )
+            except Exception as exc:
+                _logger.debug("claude_oauth: failed to read newer auth.json credentials: %s", exc)
+                return False
         # Only refresh if within 5 minutes of expiry (or already expired)
         if remaining_ms > 5 * 60 * 1000:
             _logger.debug("claude_oauth: token still valid for %.0fs — no refresh needed", remaining_ms / 1000)

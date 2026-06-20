@@ -61,9 +61,50 @@ if [ "$(id -u)" = "0" ]; then
     if [ -d "${HERMES_HOME}/.claude_backup" ]; then
         mkdir -p "${HERMES_HOME}/home/.claude" 2>/dev/null || true
         if [ -f "${HERMES_HOME}/.claude_backup/.credentials.json" ]; then
-            cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
-            chown hermes:hermes "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
-            chmod 600 "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
+            if HERMES_HOME="${HERMES_HOME}" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+home = Path(os.environ["HERMES_HOME"])
+backup = home / ".claude_backup" / ".credentials.json"
+active = home / "home" / ".claude" / ".credentials.json"
+auth_json = home / "auth.json"
+
+def expires_from_credentials(path: Path) -> int:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        oauth = data.get("claudeAiOauth", {}) if isinstance(data, dict) else {}
+        return int(oauth.get("expiresAt") or 0)
+    except Exception:
+        return 0
+
+def expires_from_auth_json(path: Path) -> int:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        providers = data.get("providers", {}) if isinstance(data, dict) else {}
+        state = providers.get("claude-code-cli", {}) if isinstance(providers, dict) else {}
+        full = state.get("full_credentials", {}) if isinstance(state, dict) else {}
+        if not full.get("accessToken") or not full.get("refreshToken"):
+            return 0
+        return int(state.get("expires_at_ms") or full.get("expiresAt") or 0)
+    except Exception:
+        return 0
+
+backup_expires = expires_from_credentials(backup)
+active_expires = expires_from_credentials(active)
+auth_expires = expires_from_auth_json(auth_json)
+
+if (active_expires and active_expires > backup_expires) or (auth_expires and auth_expires > backup_expires):
+    raise SystemExit(1)
+PY
+            then
+                cp -f "${HERMES_HOME}/.claude_backup/.credentials.json" "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
+                chown hermes:hermes "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
+                chmod 600 "${HERMES_HOME}/home/.claude/.credentials.json" 2>/dev/null || true
+            else
+                echo "Skipped Claude Code CLI PVC backup restore because newer credentials exist"
+            fi
         fi
         if [ -f "${HERMES_HOME}/.claude_backup/claude.json" ]; then
             cp -f "${HERMES_HOME}/.claude_backup/claude.json" "${HERMES_HOME}/home/.claude.json" 2>/dev/null || true
