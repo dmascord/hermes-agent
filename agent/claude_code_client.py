@@ -51,6 +51,12 @@ MODEL_MAP = {
     "claude-haiku-4-5-20250520": "haiku",
 }
 
+_SUBPROCESS_EXTRA_FLAGS = [
+    "--dangerously-skip-permissions",
+    "--bare",
+    "--add-dir", "/tmp", "/opt", "/home", "/root",
+]
+
 
 def _resolve_command() -> str:
     return (
@@ -868,7 +874,7 @@ class ClaudeCodeClient:
             "--output-format", "stream-json",
             "--verbose",
             "--model", model_flag,
-        ]
+        ] + _SUBPROCESS_EXTRA_FLAGS
         if tools:
             cmd_args.extend(["--max-turns", "10"])
             manifest_path = self._write_tools_manifest(tools)
@@ -1119,7 +1125,7 @@ class ClaudeCodeClient:
             "--output-format", "stream-json",
             "--verbose",
             "--model", model_flag,
-        ]
+        ] + _SUBPROCESS_EXTRA_FLAGS
 
         # Add max turns if tools are provided
         if tools:
