@@ -3232,11 +3232,11 @@ class AIAgent:
 
             _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
             if hasattr(_socket, "TCP_KEEPIDLE"):
-                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
-                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
-                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 60))
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 15))
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 4))
             elif hasattr(_socket, "TCP_KEEPALIVE"):
-                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 60))
             # When a custom transport is provided, httpx won't auto-read proxy
             # from env vars (allow_env_proxies = trust_env and transport is None).
             # Explicitly read proxy settings while still honoring NO_PROXY for

@@ -3634,11 +3634,11 @@ def _build_keepalive_http_client() -> Any:
             (_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1),
         ]
         if hasattr(_socket, "TCP_KEEPIDLE"):
-            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
-            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
-            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 60))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 15))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 4))
         elif hasattr(_socket, "TCP_KEEPALIVE"):
-            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 60))
 
         return _httpx.Client(
             transport=_httpx.HTTPTransport(socket_options=_sock_opts),
@@ -3666,11 +3666,11 @@ def _inject_keepalive_transport(client: Any) -> None:
             (_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1),
         ]
         if hasattr(_socket, "TCP_KEEPIDLE"):
-            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
-            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
-            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 60))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 15))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 4))
         elif hasattr(_socket, "TCP_KEEPALIVE"):
-            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+            _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 60))
 
         keepalive_transport = _httpx.HTTPTransport(socket_options=_sock_opts)
 
