@@ -53,7 +53,6 @@ MODEL_MAP = {
 
 _SUBPROCESS_EXTRA_FLAGS = [
     "--dangerously-skip-permissions",
-    "--bare",
     "--add-dir", "/tmp", "/opt", "/home", "/root",
 ]
 
@@ -73,7 +72,7 @@ def _resolve_args() -> list[str]:
     """
     raw = os.getenv("HERMES_CLAUDE_CODE_ARGS", "").strip()
     if not raw:
-        return ["-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--bare", "--add-dir", "/tmp", "/opt", "/home", "/root"]
+        return ["-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--add-dir", "/tmp", "/opt", "/home", "/root"]
     return shlex.split(raw)
 
 

@@ -10,7 +10,6 @@ def test_subprocess_extra_flags_constant():
     """_SUBPROCESS_EXTRA_FLAGS contains the sandbox-bypass flags."""
     assert ccc._SUBPROCESS_EXTRA_FLAGS == [
         "--dangerously-skip-permissions",
-        "--bare",
         "--add-dir", "/tmp", "/opt", "/home", "/root",
     ]
 
