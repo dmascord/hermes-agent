@@ -336,13 +336,19 @@ def _skip_provider_exhaustion_content(
     content: Any,
     stream: bool,
 ) -> None:
+    text = str(content or "").strip()
+    logger.warning(
+        "[hermes-code] %s _skip_provider_exhaustion_content: text_len=%d text=%.1000s",
+        provider_model,
+        len(text),
+        text,
+    )
     if not _is_provider_exhaustion_content(content):
         return
-    exc = RuntimeError(str(content).strip())
+    exc = RuntimeError(text)
     logger.warning(
-        "[hermes-code] %s returned provider-exhaustion text; suppressing content and trying next provider: %.200s",
+        "[hermes-code] %s matched provider-exhaustion pattern; suppressing content and trying next provider",
         provider_model,
-        str(content).strip(),
     )
     _mark_hermes_code_provider_exhausted(
         provider_model=provider_model,

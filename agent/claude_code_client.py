@@ -1312,6 +1312,8 @@ class ClaudeCodeClient:
             err_thread.join(timeout=1)
 
             stderr_text = "".join(error_lines)
+            if stderr_text:
+                _logger.warning("[claude-code-client] stderr: %.1000s", stderr_text)
             if proc.returncode != 0:
                 # Non-zero exit — always treat as failure, even if stderr is
                 # empty (could be a crash or无声 error). Surface the stderr
