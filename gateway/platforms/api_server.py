@@ -7234,6 +7234,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                     usage=_bridge_usage_ns,
                                     model=_bridge_model,
                                 )
+                                if _bridge_final_text:
+                                    logger.warning("[hermes-code] claude-code-cli bridge raw text: %.500s", _bridge_final_text)
                                 _skip_provider_exhaustion_content(
                                     provider_model=provider_model,
                                     runtime_kwargs=runtime_kwargs,
@@ -8543,6 +8545,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 completion_tokens=int(_bridge_usage_ns.get("output_tokens", 0) or 0),
                                 total_tokens=int((_bridge_usage_ns.get("input_tokens", 0) or 0) + (_bridge_usage_ns.get("output_tokens", 0) or 0)),
                             )
+                            if _bridge_final_text_ns:
+                                logger.warning("[hermes-code] claude-code-cli ns bridge raw text: %.500s", _bridge_final_text_ns)
                             _skip_provider_exhaustion_content(
                                 provider_model=provider_model,
                                 runtime_kwargs=runtime_kwargs,
