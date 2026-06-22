@@ -959,12 +959,6 @@ class ClaudeCodeClient:
                         }
                         with mcp_events_lock:
                             mcp_events.append(event)
-                        result_path = os.path.join(
-                            self._queue_out_dir, f"{call_id}.json"
-                        )
-                        if not os.path.exists(result_path):
-                            with open(result_path, "w", encoding="utf-8") as f:
-                                json.dump({"content": ""}, f)
                 except Exception as exc:
                     _logger.warning("bridge: MCP queue monitor error: %s", exc)
                 time.sleep(0.05)

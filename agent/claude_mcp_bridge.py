@@ -112,6 +112,8 @@ class _ProxyToolMetadata:
         return fn(**(arguments or {}))
 
     def convert_result(self, result: Any) -> Any:
+        if isinstance(result, str):
+            return [{"type": "text", "text": result}]
         return result
 
 

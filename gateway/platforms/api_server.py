@@ -8595,22 +8595,43 @@ class APIServerAdapter(BasePlatformAdapter):
                             _bridge_model_ns = resolved_model
                             _bridge_tool_calls_ns: list[dict] = []
                             _bridge_error_msg_ns: str | None = None
+                            _ns_events_q: asyncio.Queue = asyncio.Queue()
                             def _run_bridge_ns(_c=_cc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
-                                events = list(_c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools))
-                                return events
-                            _ns_events = await _ns_loop.run_in_executor(None, _run_bridge_ns)
-                            for _be in _ns_events:
+                                try:
+                                    for event in _c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools):
+                                        _ns_events_q.put_nowait(event)
+                                except Exception as exc:
+                                    _ns_events_q.put_nowait({"type": "error", "message": str(exc)})
+                                finally:
+                                    _ns_events_q.put_nowait({"type": "_done"})
+                            _ns_bridge_thread = threading.Thread(target=_run_bridge_ns, daemon=True)
+                            _ns_bridge_thread.start()
+                            while True:
+                                _be = await _ns_events_q.get()
+                                if _be is None or _be.get("type") == "_done":
+                                    break
                                 _bt = _be.get("type")
                                 if _bt == "tool_call":
+                                    _call_id = _be.get("call_id", "")
+                                    _tool_name = _be.get("name", "")
+                                    _tool_args = _be.get("arguments", {})
                                     _tc = {
-                                        "id": _be.get("call_id", ""),
+                                        "id": _call_id,
                                         "type": "function",
                                         "function": {
-                                            "name": _be.get("name", ""),
-                                            "arguments": json.dumps(_be.get("arguments", {})),
+                                            "name": _tool_name,
+                                            "arguments": json.dumps(_tool_args),
                                         },
                                     }
                                     _bridge_tool_calls_ns.append(_tc)
+                                    if _cc_client_ns._queue_out_dir:
+                                        _result_path = os.path.join(_cc_client_ns._queue_out_dir, f"{_call_id}.json")
+                                        try:
+                                            _placeholder = {"content": f"[Tool {_tool_name} called with {_tool_args}]"}
+                                            with open(_result_path, "w") as _rf:
+                                                json.dump(_placeholder, _rf)
+                                        except Exception as _re:
+                                            logger.warning("[hermes-code] ns bridge: failed to write placeholder result: %s", _re)
                                 elif _bt == "assistant_text":
                                     _bridge_final_text_ns += _be.get("text", "")
                                 elif _bt == "final":
