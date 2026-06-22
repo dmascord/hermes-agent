@@ -6364,12 +6364,23 @@ class APIServerAdapter(BasePlatformAdapter):
             # External providers reject unknown fields — strip before sending to any API.
             if passthrough_tools:
                 passthrough_tools = _strip_from_client_tools(passthrough_tools)
-            # For mimocode-cli passthrough, the CLI's MCP server registers tools with
-            # an "mcp_" prefix (mcp_bash, mcp_read, mcp_write) and the agent.md denies
-            # built-in tools — so client-supplied tool names must be rewritten with
-            # that prefix before the request reaches mimocode-cli. The MCP bridge's
-            # _execute_tool strips the prefix back when executing.
-            if passthrough_tools and model_name in ("mimocode-cli", "mimocode-cli/mimocode-cli"):
+            # The CLI subprocesses (mimocode-cli, claude-code-cli) each prefix MCP
+            # tool names differently in their agent/MCP config — and the agent.md
+            # permission filter only admits the prefixed form, so client tool names
+            # MUST be rewritten before the request reaches the CLI. The MCP bridge
+            # strips the prefix back when executing.
+            #   mimocode-cli:  mcp_<name>           (single underscore, mimo's MCP server)
+            #   claude-code-cli: mcp__hermes-tools__<name>  (FastMCP convention)
+            #   everything else: no rewrite needed
+            if passthrough_tools and model_name in (
+                "mimocode-cli", "mimocode-cli/mimocode-cli",
+                "claude-code-cli", "claude-code-cli/claude-code-cli",
+                "claude-code-cli/sonnet",  # legacy
+            ):
+                if model_name.startswith("claude-code-cli"):
+                    _PREFIX = "mcp__hermes-tools__"
+                else:
+                    _PREFIX = "mcp_"
                 def _mcp_prefix_tools(tools: Any) -> Any:
                     if not isinstance(tools, list):
                         return tools
@@ -6378,9 +6389,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         if isinstance(t, dict):
                             t2 = dict(t)
                             fn = t2.get("function")
-                            if isinstance(fn, dict) and fn.get("name") and not fn["name"].startswith("mcp_"):
+                            if isinstance(fn, dict) and fn.get("name") and not fn["name"].startswith("mcp"):
                                 fn2 = dict(fn)
-                                fn2["name"] = "mcp_" + fn2["name"]
+                                fn2["name"] = _PREFIX + fn2["name"]
                                 t2["function"] = fn2
                             out.append(t2)
                         else:
@@ -7269,11 +7280,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                     if _bt == "tool_call":
                                         _call_id = _be.get("call_id", "")
                                         _tool_name = _be.get("name", "")
-                                        # Strip mcp_ prefix on the way back to the client —
+                                        # Strip MCP prefix on the way back to the client —
                                         # hermes is the boundary that translates between
-                                        # client-friendly names and mimo's mcp_-prefixed IDs.
-                                        if _tool_name.startswith("mcp_"):
-                                            _tool_name = _tool_name[4:]
+                                        # client-friendly names and the CLI's mcp_-prefixed IDs.
+                                        # claude-code uses mcp__hermes-tools__<name>;
+                                        # mimocode uses mcp_<name>.
+                                        if _tool_name.startswith("mcp__hermes-tools__"):
+                                            _tool_name = _tool_name[len("mcp__hermes-tools__"):]
+                                        elif _tool_name.startswith("mcp_"):
+                                            _tool_name = _tool_name[len("mcp_"):]
                                         _tool_args = _be.get("arguments", {})
                                         _tc = {
                                             "id": _call_id,
@@ -8642,11 +8657,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 if _bt == "tool_call":
                                     _call_id = _be.get("call_id", "")
                                     _tool_name = _be.get("name", "")
-                                    # Strip mcp_ prefix on the way back to the client —
-                                    # hermes is the boundary that translates between
-                                    # client-friendly names and mimo's mcp_-prefixed IDs.
-                                    if _tool_name.startswith("mcp_"):
-                                        _tool_name = _tool_name[4:]
+                                    # Strip MCP prefix on the way back to the client.
+                                    # claude-code uses mcp__hermes-tools__<name>;
+                                    # mimocode uses mcp_<name>.
+                                    if _tool_name.startswith("mcp__hermes-tools__"):
+                                        _tool_name = _tool_name[len("mcp__hermes-tools__"):]
+                                    elif _tool_name.startswith("mcp_"):
+                                        _tool_name = _tool_name[len("mcp_"):]
                                     _tool_args = _be.get("arguments", {})
                                     _tc = {
                                         "id": _call_id,
@@ -8748,12 +8765,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 if getattr(_msg, 'tool_calls', None):
                                     for _tc in _msg.tool_calls:
                                         _tc_name = _tc["function"]["name"]
-                                        # Strip mcp_ prefix on the way back to the client —
-                                        # the client sent plain "bash"/"read"/"write" and expects
-                                        # plain names back. The MCP bridge added the prefix for
-                                        # the mimo CLI; hermes is the boundary that translates.
-                                        if _tc_name.startswith("mcp_"):
-                                            _tc_name = _tc_name[4:]
+                                        # Strip MCP prefix on the way back to the client.
+                                        # claude-code uses mcp__hermes-tools__<name>;
+                                        # mimocode uses mcp_<name>.
+                                        if _tc_name.startswith("mcp__hermes-tools__"):
+                                            _tc_name = _tc_name[len("mcp__hermes-tools__"):]
+                                        elif _tc_name.startswith("mcp_"):
+                                            _tc_name = _tc_name[len("mcp_"):]
                                         _ns_events.append({"type": "tool_call", "call_id": _tc.get("id", ""), "name": _tc_name, "arguments": json.loads(_tc["function"]["arguments"])})
                                 _ns_events.append({"type": "final", "model": resolved_model, "usage": {
                                     "input_tokens": getattr(getattr(_ns_resp, 'usage', None), 'prompt_tokens', 0) or 0,
