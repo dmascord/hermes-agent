@@ -601,6 +601,7 @@ class _CodexCompletionsAdapter:
             collected_output_items: List[Any] = []
             collected_text_deltas: List[str] = []
             has_function_calls = False
+            _final_response = None  # set if SITA returns non-SSE JSON
             print(f"[HTTP_LOG] REQUEST provider=copilot model={model} url={self._client.base_url}/responses messages={len(input_msgs)}", flush=True)
             # HACK: OpenAI SDK's responses.stream() adds ".stream" suffix to the URL,
             # but chatgpt.com/backend-api/codex does NOT have a /responses.stream route.
@@ -624,7 +625,21 @@ class _CodexCompletionsAdapter:
                         _text = _line.decode("utf-8", errors="replace").strip()
                     else:
                         _text = str(_line).strip()
+                    # Some endpoints (notably SITA's /responses when not in SSE
+                    # mode) return a single JSON object as one line, not SSE
+                    # events prefixed with "data: ". Detect that case and parse
+                    # the whole line as the response.
                     if not _text.startswith("data: "):
+                        if _text.startswith("{") and not collected_output_items:
+                            try:
+                                _obj = json.loads(_text)
+                                # Treat the whole response as one final object —
+                                # extract output items and any usage it carries.
+                                for _it in _obj.get("output", []) or []:
+                                    collected_output_items.append(_it)
+                                _final_response = _obj
+                            except json.JSONDecodeError:
+                                pass
                         continue
                     try:
                         _data = json.loads(_text[6:])
@@ -642,7 +657,15 @@ class _CodexCompletionsAdapter:
                     elif "function_call" in _etype:
                         has_function_calls = True
                 # Synthesize a final response object from collected items
-                final = SimpleNamespace(output=collected_output_items)
+                # If we captured a whole JSON response (non-SSE), use its
+                # usage too so the caller sees prompt/completion tokens.
+                _final_kwargs = {"output": collected_output_items}
+                try:
+                    if _final_response is not None:
+                        _final_kwargs["usage"] = _final_response.get("usage")
+                except NameError:
+                    pass
+                final = SimpleNamespace(**_final_kwargs)
                 _stream_elapsed = time.time() - _adapter_start
                 print(f"[HTTP_LOG] RESPONSE_OK provider=copilot model={model} elapsed={_stream_elapsed:.2f}s stream=true", flush=True)
         except Exception as _codex_exc:
@@ -707,10 +730,17 @@ class _CodexCompletionsAdapter:
 
         resp_usage = getattr(final, "usage", None)
         if resp_usage:
+            # usage can be either a SimpleNamespace (from SSE) or a dict
+            # (from non-SSE JSON capture). Handle both shapes.
+            def _uget(obj, key, default=0):
+                val = getattr(obj, key, None)
+                if val is None and isinstance(obj, dict):
+                    val = obj.get(key, default)
+                return val if val is not None else default
             usage = SimpleNamespace(
-                prompt_tokens=getattr(resp_usage, "input_tokens", 0),
-                completion_tokens=getattr(resp_usage, "output_tokens", 0),
-                total_tokens=getattr(resp_usage, "total_tokens", 0),
+                prompt_tokens=_uget(resp_usage, "input_tokens", 0),
+                completion_tokens=_uget(resp_usage, "output_tokens", 0),
+                total_tokens=_uget(resp_usage, "total_tokens", 0),
             )
 
         content = "".join(text_parts).strip() or None
