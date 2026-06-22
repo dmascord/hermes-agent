@@ -922,7 +922,7 @@ def _resolve_role_alias(model: str) -> str | None:
 _SWARM_PREMIUM_MODEL_HINTS = (
     # GHE Copilot Enterprise — strongest models, requires copilot-integration-id header
     # (automatically set by copilot_request_headers() for copilot-api.* base URLs).
-    # Claude via /v1/messages, GPT-5 via /v1/responses, GPT-4o via /chat/completions.
+    # Claude via /v1/messages, GPT-5 via /v1.responses, GPT-4o via /chat/completions.
     "github-copilot-enterprise/claude-sonnet-4.6",
     "github-copilot-enterprise/gpt-5.4",
     # zai/minimax fallbacks
@@ -2153,9 +2153,15 @@ def _build_env_fallback_chain(prefix: str) -> List[Dict[str, Any]]:
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     chain: List[Dict[str, Any]] = []
+    # Auto-block mimocode-cli from env-driven fallback chains until timeout
+    # issues are resolved. Users can re-enable by setting HERMES_SWARM_ALLOW_MIMOCODE=1.
+    _allow_mimocode = os.getenv("HERMES_SWARM_ALLOW_MIMOCODE", "").strip().lower() in ("1", "true", "yes")
     for idx in range(1, 33):
         raw_model = os.getenv(f"{prefix}_{idx}", "").strip()
         if not raw_model:
+            continue
+        if not _allow_mimocode and raw_model.startswith("mimocode-cli"):
+            logger.info("[swarm] blocking mimocode-cli from fallback chain (set HERMES_SWARM_ALLOW_MIMOCODE=1 to re-enable)")
             continue
         provider, resolved_model = _fallback_provider_for_model(raw_model)
         if not provider or not resolved_model:
@@ -2194,7 +2200,14 @@ def _build_swarm_model_pool(*, estimated_tokens: int = 0, routing_hint: Optional
             deduped.append(model)
     fallback_chain = deduped
     blocked = {m.strip() for m in os.getenv("HERMES_SWARM_BLOCKED_MODELS", "").split(",") if m.strip()}
-    fallback_chain = [m for m in fallback_chain if m not in blocked and "\n" not in m and "HERMES_SWARM_" not in m]
+    # Auto-block mimocode-cli until timeout issues are resolved.
+    # Users can re-enable by adding "mimocode-cli" to HERMES_SWARM_ALLOWED_BLOCKED_MODELS.
+    if not os.getenv("HERMES_SWARM_ALLOW_MIMOCODE", "").strip().lower() in ("1", "true", "yes"):
+        blocked.add("mimocode-cli")
+        blocked.add("mimocode-cli/mimo-auto")
+        blocked.add("mimocode-cli/mimo")
+        blocked.add("mimocode-cli/mimo-auto")
+    fallback_chain = [m for m in fallback_chain if m not in blocked and "\n" not in m and "HERMES_SWARM_" not in m] 
 
     large_context_fallbacks: List[str] = []
     for idx in range(1, 17):
@@ -2879,6 +2892,13 @@ def _hermes_code_model_is_selectable(model: str) -> bool:
             return not (remaining and remaining > 0)
         except Exception:
             return False
+
+    if prefix == "mimocode-cli":
+        # Auto-disabled while subprocess timeouts are being investigated.
+        # Re-enable with HERMES_SWARM_ALLOW_MIMOCODE=1.
+        if not os.getenv("HERMES_SWARM_ALLOW_MIMOCODE", "").strip().lower() in ("1", "true", "yes"):
+            return False
+        return _swarm_model_is_available(raw)
 
     return _swarm_model_is_available(raw)
 
