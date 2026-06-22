@@ -114,6 +114,17 @@ class TestPassthroughProviderExhaustion:
         """Casual use of 'login' in task output should not be mistaken for an auth error."""
         content = "First, run the login command to authenticate with the API"
         assert _is_provider_exhaustion_content(content) is False
+    def test_synthetic_runtime_error_cooldown_is_capped(self):
+        """Synthetic RuntimeError from _skip_provider_exhaustion_content()
+        has no HTTP response.  The cooldown must be conservative (<= 1h),
+        not 15 h like the old body-parsing path produced."""
+        exc = RuntimeError(
+            "You've hit your session limit \u00b7 resets 3:10pm (UTC)"
+        )
+        # No .response attr = synthetic path
+        cd = _cooldown_seconds_for_429(exc)
+        assert cd <= 3600.0, f"synthetic cooldown too long: {cd}s"
+        assert cd >= 60.0
 
 
 class TestExplicitModelRuntimeAlignment:
