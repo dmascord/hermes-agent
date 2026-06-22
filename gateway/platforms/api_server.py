@@ -8632,7 +8632,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 json.dump(_placeholder, _rf)
                                         except Exception as _re:
                                             logger.warning("[hermes-code] ns bridge: failed to write placeholder result: %s", _re)
-                                elif _bt == "assistant_text":
+                                elif _bt in ("text", "assistant_text"):
                                     _bridge_final_text_ns += _be.get("text", "")
                                 elif _bt == "final":
                                     _bridge_final_text_ns = _be.get("text", _bridge_final_text_ns)
