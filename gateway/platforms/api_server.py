@@ -81,6 +81,10 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     import time as _time
     from datetime import datetime as _datetime, timezone as _timezone, timedelta as _timedelta
 
+    has_response = getattr(exc, "response", None) is not None
+    status_code = _exception_status_code(exc)
+    is_http_429 = status_code == 429
+
     # 1. Honour Retry-After header if the underlying HTTP response is attached.
     # Check error body first to determine if this is a weekly/daily quota.
     body = str(exc).lower()
@@ -108,8 +112,30 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     except Exception:
         pass
 
+    # Synthetic RuntimeError(text) calls from _skip_provider_exhaustion_content()
+    # do not carry HTTP headers. Keep those cooldowns conservative instead of
+    # interpreting arbitrary assistant text as an exact reset window.
+    if not has_response and not is_http_429:
+        if "weekly" in body or "week" in body:
+            return 24 * 3600.0
+        if "daily" in body or "day" in body or "session limit" in body:
+            return 3600.0
+        _reset_match = _re.search(r'(?:reset in|retry in|retry_after|remaining)[:\s]*(\d+)\s*(second|minute|hour|day|week)s?', body)
+        if _reset_match:
+            _amount = int(_reset_match.group(1))
+            _unit = _reset_match.group(2)
+            _multipliers = {"second": 1, "minute": 60, "hour": 3600}
+            _raw = _amount * _multipliers.get(_unit, 3600)
+            return _raw if _max <= 0 else min(_raw, _max)
+        _hour_match = _re.search(r'(\d+)\s*-?\s*hour', body)
+        if _hour_match:
+            _raw = max(3600.0, int(_hour_match.group(1)) * 3600.0)
+            return _raw if _max <= 0 else min(_raw, _max)
+        if "hour" in body:
+            return 3600.0
+        return 600.0
 
-    # Look for "reset in X" or "X remaining" patterns in the error body.
+    # 3. For real HTTP errors, parse body hints more aggressively.
     # Common formats: "reset in 5 days", "5 days remaining", "retry in 24 hours"
     _reset_match = _re.search(r'(?:reset in|retry in|retry_after|remaining)[:\s]*(\d+)\s*(second|minute|hour|day|week)s?', body)
     if _reset_match:
