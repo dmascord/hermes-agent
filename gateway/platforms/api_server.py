@@ -115,10 +115,26 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     # Synthetic RuntimeError(text) calls from _skip_provider_exhaustion_content()
     # do not carry HTTP headers. Keep those cooldowns conservative instead of
     # interpreting arbitrary assistant text as an exact reset window.
+    #
+    # Bare substring matches on "weekly"/"day" are false-positive prone (any
+    # message containing "this week" or "yesterday" would match). Require a
+    # quota/limit context keyword before treating the body as a multi-day
+    # rate-limit signal, and log the body so future false positives are
+    # diagnosable from logs.
+    _quota_kw = ("quota", "limit", "exceeded", "exhausted", "reset", "tokens")
+    _has_quota_ctx = any(kw in body for kw in _quota_kw)
     if not has_response and not is_http_429:
-        if "weekly" in body or "week" in body:
+        if _has_quota_ctx and ("weekly" in body or "week" in body):
+            logger.warning(
+                "[_cooldown_seconds_for_429] non-HTTP 24h cooldown (weekly hint) body=%r",
+                body[:400],
+            )
             return 24 * 3600.0
-        if "daily" in body or "day" in body or "session limit" in body:
+        if _has_quota_ctx and ("daily" in body or "session limit" in body):
+            logger.warning(
+                "[_cooldown_seconds_for_429] non-HTTP 1h cooldown (daily hint) body=%r",
+                body[:400],
+            )
             return 3600.0
         _reset_match = _re.search(r'(?:reset in|retry in|retry_after|remaining)[:\s]*(\d+)\s*(second|minute|hour|day|week)s?', body)
         if _reset_match:
@@ -146,11 +162,19 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
         # Only cap hourly limits — weekly/daily limits should be respected.
         return _raw if _max <= 0 else min(_raw, _max)
 
-    if "weekly" in body or "week" in body:
+    if _has_quota_ctx and ("weekly" in body or "week" in body):
         # Weekly limit — respect the full window, don't cap it.
+        logger.warning(
+            "[_cooldown_seconds_for_429] HTTP 7-day cooldown (weekly hint) body=%r",
+            body[:400],
+        )
         return 7 * 24 * 3600.0
-    if "daily" in body or "day" in body:
+    if _has_quota_ctx and ("daily" in body or "day" in body):
         # Daily limit — respect the full window, don't cap it.
+        logger.warning(
+            "[_cooldown_seconds_for_429] HTTP 24h cooldown (daily hint) body=%r",
+            body[:400],
+        )
         return 24 * 3600.0
     # "5 hour", "5-hour", "5hour" etc.
     _hour_match = _re.search(r'(\d+)\s*-?\s*hour', body)
