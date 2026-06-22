@@ -618,7 +618,12 @@ class _CodexCompletionsAdapter:
                 for _line in _resp.iter_lines():
                     if not _line:
                         continue
-                    _text = _line.decode("utf-8", errors="replace").strip()
+                    # httpx iter_lines() returns str in newer versions; in older
+                    # versions it returns bytes. Normalize to str before decoding.
+                    if isinstance(_line, bytes):
+                        _text = _line.decode("utf-8", errors="replace").strip()
+                    else:
+                        _text = str(_line).strip()
                     if not _text.startswith("data: "):
                         continue
                     try:
