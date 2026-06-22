@@ -554,6 +554,39 @@ def _cb_key(provider: str, model: str, base_url: str = "") -> str:
     return _CIRCUIT_BREAKER_KEY_PREFIX + _key(provider, model, base_url, credential_id="")
 
 
+def _is_transient_failure(reason: str) -> bool:
+    """Return True for failure reasons that reflect network/transient issues
+    (TCP reset, read timeout, Cloudflare 524) rather than provider health.
+
+    Transient failures should still be recorded so the failure window is
+    accurate, but they should NOT trip the circuit breaker on their own —
+    a 3-failures-in-5-min threshold that lumps transient TCP resets together
+    with provider quota exhaustion incorrectly cooldowns a working model
+    after one bad network blip.
+    """
+    r = (reason or "").lower()
+    transient_markers = (
+        "timed out",
+        "timeout",
+        "connection reset",
+        "reset by peer",
+        "broken pipe",
+        "connection aborted",
+        "connection refused",
+        "bad file descriptor",
+        "eof",
+        "stream ended",
+        "first event",
+        "upstream timeout",
+        "upstream gateway timeout",
+        "cloudflare 524",
+        "cloudflare 5",
+        "passthrough_error",
+        "transient",
+    )
+    return any(marker in r for marker in transient_markers)
+
+
 def mark_provider_failure(
     provider: str,
     model: str,
@@ -571,6 +604,7 @@ def mark_provider_failure(
     cooldown_seconds = circuit_breaker_cooldown_seconds()
     cutoff = now - circuit_breaker_window_seconds()
     cooldown_applied = False
+    transient = _is_transient_failure(reason)
 
     with _LOCK:
         conn = _get_conn()
@@ -591,7 +625,12 @@ def mark_provider_failure(
 
             # Prune outside window and append.
             failures = [ts for ts in failures if isinstance(ts, (int, float)) and ts > cutoff]
-            failures.append(now)
+            # For transient failures, record but don't append to the
+            # circuit-breaker count.  The reason is recorded on the row
+            # so the operator can see the failure happened, but it does
+            # not contribute to tripping the breaker.
+            if not transient:
+                failures.append(now)
             count = len(failures)
 
             # UPSERT circuit breaker row.
@@ -607,8 +646,8 @@ def mark_provider_failure(
                 ),
             )
 
-            # Circuit breaker trip.
-            if count >= threshold and cooldown_seconds > 0:
+            # Circuit breaker trip — only on non-transient failures.
+            if not transient and count >= threshold and cooldown_seconds > 0:
                 cooldown_key = _key(provider_n, model_n, base_url, credential_id="")
                 conn.execute(
                     """INSERT OR REPLACE INTO cooldowns
@@ -656,24 +695,63 @@ def mark_provider_success(
         return
     now = time.time()
     cbk = _cb_key(provider_n, model_n, base_url)
+    # Key used by mark_model_cooldown() — same identity, no credential_id.
+    cooldown_key = _key(provider_n, model_n, base_url, credential_id="")
 
     with _LOCK:
         conn = _get_conn()
+        # Clear the circuit breaker failures (existing behaviour).
         row = conn.execute(
             "SELECT failures FROM circuit_breakers WHERE key = ?", (cbk,)
         ).fetchone()
-        if row is None:
-            return
-        try:
-            failures = json.loads(row["failures"])
-        except (json.JSONDecodeError, TypeError):
-            failures = []
-        if isinstance(failures, list) and failures:
-            conn.execute(
-                "UPDATE circuit_breakers SET failures = '[]', updated_at = ? WHERE key = ?",
-                (now, cbk),
+        cb_changed = False
+        if row is not None:
+            try:
+                failures = json.loads(row["failures"])
+            except (json.JSONDecodeError, TypeError):
+                failures = []
+            if isinstance(failures, list) and failures:
+                conn.execute(
+                    "UPDATE circuit_breakers SET failures = '[]', updated_at = ? WHERE key = ?",
+                    (now, cbk),
+                )
+                cb_changed = True
+        # Also clear transient cooldowns in the cooldowns table for this
+        # provider/model.  Without this, a model that hit 3 transient
+        # failures (TCP reset, brief 524) gets a 5-minute circuit-breaker
+        # cooldown that the very next successful call cannot clear.
+        # We only clear cooldowns whose reason indicates a transient /
+        # circuit-breaker trigger — quota/usage-limit cooldowns are left
+        # alone because the next successful call doesn't reset the quota
+        # window on the upstream provider.
+        cd_rows = conn.execute(
+            "SELECT cooldown_until, reason FROM cooldowns WHERE key = ?",
+            (cooldown_key,),
+        ).fetchall()
+        cd_changed = False
+        if cd_rows:
+            _transient_reasons = (
+                "circuit_breaker:",
+                "passthrough_error",
+                "hermes_code_stream_",
+                "transient_",
             )
+            for cd_row in cd_rows:
+                _reason = str(cd_row["reason"] or "").lower()
+                _is_transient = any(t in _reason for t in _transient_reasons)
+                if _is_transient:
+                    conn.execute(
+                        "DELETE FROM cooldowns WHERE key = ?",
+                        (cooldown_key,),
+                    )
+                    cd_changed = True
+        if cb_changed or cd_changed:
             conn.commit()
+            if cd_changed:
+                logger.info(
+                    "provider success cleared transient cooldowns provider=%s model=%s",
+                    provider_n, model_n,
+                )
 
 
 def provider_failure_count(
