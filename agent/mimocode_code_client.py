@@ -170,16 +170,17 @@ class MiMoCodeClient:
             f.write("---\n\n")
             f.write(
                 "You are running through the hermes-agent gateway "
-                "(https://hermes.tusker.net.au), which proxies your responses to the user. "
-                "The user's Mac workspace IS fully accessible to you via the MCP tools "
-                f"exposed by this gateway: {tool_list}. Do not claim you are in a sandbox "
-                "or that you cannot access local files — use the MCP tools to read, edit, "
-                "and run commands. If a specific tool you need is not registered, ask the "
-                "user to add it via the hermes tool registry.\n\n"
+                "(https://hermes.tusker.net.au), which proxies your responses to a "
+                "connected client. The connected client's filesystem and workspace is "
+                f"accessible to you via the MCP tools exposed by this gateway: {tool_list}. "
+                "Do not claim you are in a sandbox or that you cannot access local files — "
+                "use the MCP tools to read, edit, and run commands. If a specific tool you "
+                "need is not registered, ask the user to add it via the hermes tool "
+                "registry.\n\n"
                 f"You have access to tools: {tool_list}.\n"
                 "Use these tools to help the user. "
                 "When a task requires running a command, reading a file, "
-                "or any file/code operation, use the appropriate mcp_ prefixed tool.\n"
+                "or any code operation, use the appropriate mcp_ prefixed tool.\n"
             )
 
         # Create queue and result dirs

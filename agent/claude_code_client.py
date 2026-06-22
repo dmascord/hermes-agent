@@ -721,6 +721,22 @@ class _ClaudeCodeChatNamespace:
 class ClaudeCodeClient:
     """Minimal OpenAI-client-compatible facade for Claude Code CLI."""
 
+    # System context injected on every invocation so the model knows it's
+    # running through the hermes gateway and that the connected client's
+    # filesystem is accessible via MCP. Generalized — does NOT mention
+    # any specific OS or user (works for any hermes deployment).
+    _HERMES_GATEWAY_SYSTEM_PROMPT = (
+        "You are running through the hermes-agent gateway "
+        "(https://hermes.tusker.net.au), which proxies your responses to a "
+        "connected client. The connected client's filesystem and workspace is "
+        "accessible to you via the MCP tools exposed by this gateway "
+        "(e.g. mcp__hermes-tools__bash, mcp__hermes-tools__read, mcp__hermes-tools__write, "
+        "and any other tools the user has registered with hermes). Do not claim you are in a "
+        "sandbox or that you cannot access local files — use the MCP tools to read, edit, "
+        "and run commands. If a specific tool you need is not registered, ask the user "
+        "to add it via the hermes tool registry."
+    )
+
     def __init__(
         self,
         *,
@@ -873,6 +889,7 @@ class ClaudeCodeClient:
             "--output-format", "stream-json",
             "--verbose",
             "--model", model_flag,
+            "--append-system-prompt", self._HERMES_GATEWAY_SYSTEM_PROMPT,
         ] + _SUBPROCESS_EXTRA_FLAGS
         if tools:
             cmd_args.extend(["--max-turns", "10"])
@@ -1118,6 +1135,7 @@ class ClaudeCodeClient:
             "--output-format", "stream-json",
             "--verbose",
             "--model", model_flag,
+            "--append-system-prompt", self._HERMES_GATEWAY_SYSTEM_PROMPT,
         ] + _SUBPROCESS_EXTRA_FLAGS
 
         # Add max turns if tools are provided
