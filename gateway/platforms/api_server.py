@@ -6482,10 +6482,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     _rest.sort(key=_score, reverse=True)
                     # Quality floor — drop chronically-bad models from the chain.
-                    # Default 60.0 (a model with 60% success + 30/30 tool reliability
+                    # Default 50.0 (a model with 50% success + 0/30 tool reliability
                     # + 0 latency bonus is at the floor; anything worse is dropped).
+                    # Previously 60.0, but that drops too many primary models including
+                    # the user's primary HERMES_CODE_MODEL (e.g. github-copilot/gpt-5-mini=58.0)
+                    # and other useful chain models (xiaomi/mimo-v2.5-pro=59.4, etc.).
+                    # Lowered to 50.0 so quality-floor acts as a sanity check on truly
+                    # bad models (e.g. opencode-go/deepseek-v4-flash=45.4) without
+                    # removing mid-quality options that the user explicitly picked.
                     # Set HERMES_CODE_QUALITY_FLOOR=0 to disable.
-                    _floor = float(os.getenv("HERMES_CODE_QUALITY_FLOOR", "60.0") or 0.0)
+                    _floor = float(os.getenv("HERMES_CODE_QUALITY_FLOOR", "50.0") or 0.0)
                     _kept: List[str] = []
                     _dropped: List[Tuple[str, float]] = []
                     for m in _rest:
