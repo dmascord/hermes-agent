@@ -652,65 +652,66 @@ class _CodexCompletionsAdapter:
             print(f"[HTTP_LOG] RESPONSE_ERROR provider=copilot model={model} status={_codex_status} elapsed={_stream_elapsed:.2f}s body={_codex_body[:300]}", flush=True)
             raise
 
-            # Backfill empty output from collected stream events
-            _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
-                if collected_output_items:
-                    final.output = list(collected_output_items)
-                    logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
-                        len(collected_output_items),
-                    )
-                elif collected_text_deltas and not has_function_calls:
-                    # Only synthesize text when no tool calls were streamed —
-                    # a function_call response with incidental text should not
-                    # be collapsed into a plain-text message.
-                    assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
-                    logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
-                    )
-
-            # Extract text and tool calls from the Responses output.
-            # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
-            # so use a helper that handles both shapes.
-            def _item_get(obj: Any, key: str, default: Any = None) -> Any:
-                val = getattr(obj, key, None)
-                if val is None and isinstance(obj, dict):
-                    val = obj.get(key, default)
-                return val if val is not None else default
-
-            for item in getattr(final, "output", []):
-                item_type = _item_get(item, "type")
-                if item_type == "message":
-                    for part in (_item_get(item, "content") or []):
-                        ptype = _item_get(part, "type")
-                        if ptype in ("output_text", "text"):
-                            text_parts.append(_item_get(part, "text", ""))
-                elif item_type == "function_call":
-                    tool_calls_raw.append(SimpleNamespace(
-                        id=_item_get(item, "call_id", ""),
-                        type="function",
-                        function=SimpleNamespace(
-                            name=_item_get(item, "name", ""),
-                            arguments=_item_get(item, "arguments", "{}"),
-                        ),
-                    ))
-
-            resp_usage = getattr(final, "usage", None)
-            if resp_usage:
-                usage = SimpleNamespace(
-                    prompt_tokens=getattr(resp_usage, "input_tokens", 0),
-                    completion_tokens=getattr(resp_usage, "output_tokens", 0),
-                    total_tokens=getattr(resp_usage, "total_tokens", 0),
+        # Backfill empty output from collected stream events.
+        # Reasoning-mode Responses (e.g. gpt-5.5, gpt-5.4) often leave
+        # response.output empty even after streaming output_text deltas —
+        # synthesize a completed message from the deltas so the caller
+        # can extract the text.
+        _output = getattr(final, "output", None)
+        if isinstance(_output, list) and not _output:
+            if collected_output_items:
+                final.output = list(collected_output_items)
+                logger.debug(
+                    "Codex auxiliary: backfilled %d output items from stream events",
+                    len(collected_output_items),
                 )
-        except Exception as exc:
-            logger.debug("Codex auxiliary Responses API call failed: %s", exc)
-            raise
+            elif collected_text_deltas and not has_function_calls:
+                # Only synthesize text when no tool calls were streamed —
+                # a function_call response with incidental text should not
+                # be collapsed into a plain-text message.
+                assembled = "".join(collected_text_deltas)
+                final.output = [SimpleNamespace(
+                    type="message", role="assistant", status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )]
+                logger.debug(
+                    "Codex auxiliary: synthesized from %d deltas (%d chars)",
+                    len(collected_text_deltas), len(assembled),
+                )
+
+        # Extract text and tool calls from the Responses output.
+        # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
+        # so use a helper that handles both shapes.
+        def _item_get(obj: Any, key: str, default: Any = None) -> Any:
+            val = getattr(obj, key, None)
+            if val is None and isinstance(obj, dict):
+                val = obj.get(key, default)
+            return val if val is not None else default
+
+        for item in getattr(final, "output", []):
+            item_type = _item_get(item, "type")
+            if item_type == "message":
+                for part in (_item_get(item, "content") or []):
+                    ptype = _item_get(part, "type")
+                    if ptype in ("output_text", "text"):
+                        text_parts.append(_item_get(part, "text", ""))
+            elif item_type == "function_call":
+                tool_calls_raw.append(SimpleNamespace(
+                    id=_item_get(item, "call_id", ""),
+                    type="function",
+                    function=SimpleNamespace(
+                        name=_item_get(item, "name", ""),
+                        arguments=_item_get(item, "arguments", "{}"),
+                    ),
+                ))
+
+        resp_usage = getattr(final, "usage", None)
+        if resp_usage:
+            usage = SimpleNamespace(
+                prompt_tokens=getattr(resp_usage, "input_tokens", 0),
+                completion_tokens=getattr(resp_usage, "output_tokens", 0),
+                total_tokens=getattr(resp_usage, "total_tokens", 0),
+            )
 
         content = "".join(text_parts).strip() or None
 
