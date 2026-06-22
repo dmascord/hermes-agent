@@ -974,6 +974,7 @@ _SWARM_PREMIUM_MODEL_HINTS = (
     # (automatically set by copilot_request_headers() for copilot-api.* base URLs).
     # Claude via /v1/messages, GPT-5 via /v1.responses, GPT-4o via /chat/completions.
     "github-copilot-enterprise/claude-sonnet-4.6",
+    "github-copilot-enterprise/gpt-5.5",
     "github-copilot-enterprise/gpt-5.4",
     # zai/minimax fallbacks
     "zai/glm-4.7",
@@ -2475,6 +2476,7 @@ _GHE_COPILOT_PASSTHROUGH_MODELS: tuple[tuple[str, str], ...] = (
     ("claude-haiku-4.5",          "Anthropic Claude Haiku 4.5 via GHE Copilot — fast, vision"),
     ("gpt-5.4",                   "OpenAI GPT-5.4 via GHE Copilot — vision, Responses API"),
     ("gpt-5.4-mini",              "OpenAI GPT-5.4-mini via GHE Copilot — vision, Responses API"),
+    ("gpt-5.5",                   "OpenAI GPT-5.5 via GHE Copilot — vision, Responses API"),
     ("gpt-5-mini",                "OpenAI GPT-5-mini via GHE Copilot — Chat Completions API"),
     ("gpt-5.3-codex",             "OpenAI GPT-5.3-codex via GHE Copilot — agentic coding, Responses API"),
     ("gpt-5.2-codex",             "OpenAI GPT-5.2-codex via GHE Copilot — agentic coding, Responses API"),
@@ -2489,7 +2491,7 @@ _GHE_COPILOT_PASSTHROUGH_MODELS: tuple[tuple[str, str], ...] = (
 )
 
 _GHE_PREFIX = "github-copilot-enterprise"
-_GHE_VISION_PREFIXES = ("claude-", "gemini-", "gpt-4o", "gpt-4.1", "gpt-5.4", "gpt-5-mini")
+_GHE_VISION_PREFIXES = ("claude-", "gemini-", "gpt-4o", "gpt-4.1", "gpt-5.4", "gpt-5.5", "gpt-5-mini")
 _GHE_CODEX_MARKERS = ("codex",)
 
 
