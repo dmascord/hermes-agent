@@ -721,6 +721,7 @@ or (claude-style):
         and "<function_calls>" not in text
         and "<invoke name=" not in text
         and "<tool_invocation" not in text
+        and "```" not in text
     ):
         return None
 
@@ -858,5 +859,30 @@ or (claude-style):
                 "arguments": json.dumps({"raw": args_text}),
             },
         }
+
+    # Format 7: JSON in code block (```json {"name":"X","arguments":{...}} ```)
+    # Match the code block content and try to parse as JSON
+    m7 = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if m7:
+        import uuid as _uuid
+        try:
+            obj = json.loads(m7.group(1))
+            if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+                args = obj.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"raw": args}
+                return {
+                    "id": f"call_{_uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": obj.get("name", "unknown"),
+                        "arguments": json.dumps(args if isinstance(args, dict) else {"raw": str(args)}),
+                    },
+                }
+        except (json.JSONDecodeError, KeyError):
+            pass
 
     return None

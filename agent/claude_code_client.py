@@ -718,6 +718,104 @@ class _ClaudeCodeChatNamespace:
         self.completions = _ClaudeCodeChatCompletions(client)
 
 
+def _parse_text_tool_call(text: str) -> dict | None:
+    """Parse text content for tool call XML patterns.
+
+    Claude Code sometimes emits <function_calls> as raw text content
+    instead of as a real tool_use event. This function detects those
+    patterns and returns a structured tool call dict.
+
+    Supported formats:
+      <function_calls><invoke name="X"><parameter name="Y">VAL</parameter></invoke></function_calls>
+      <tool_call>{"name":"X","arguments":{...}}</tool_call>
+      <tool_invocation name="X" arguments={json} />
+      ```json {"name":"X","arguments":{...}} ```  (JSON in code block)
+
+    Returns {"call_id": ..., "name": ..., "arguments": {...}} or None.
+    """
+    if not text:
+        return None
+
+    # Format 1: <function_calls><invoke name="X"><parameter name="Y">VAL</parameter></invoke></function_calls>
+    m = re.search(r"<invoke\s+name=\"([^\"]+)\">(.*?)</invoke>", text, re.DOTALL)
+    if m:
+        name = m.group(1).strip()
+        args_block = m.group(2)
+        args = {}
+        for am in re.finditer(r"<parameter\s+name=\"([^\"]+)\">(.*?)</parameter>", args_block, re.DOTALL):
+            args[am.group(1)] = am.group(2).strip()
+        return {
+            "call_id": f"call_{uuid.uuid4().hex[:16]}",
+            "name": name,
+            "arguments": args,
+        }
+
+    # Format 2: <tool_call>{"name":"X","arguments":{...}}</tool_call>
+    m2 = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+    if m2:
+        try:
+            obj = json.loads(m2.group(1))
+            args = obj.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {"raw": args}
+            return {
+                "call_id": f"call_{uuid.uuid4().hex[:16]}",
+                "name": obj.get("name", "unknown"),
+                "arguments": args if isinstance(args, dict) else {"raw": str(args)},
+            }
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Format 3: <tool_invocation name="X" arguments={json} /> (self-closing)
+    m3 = re.search(r'<tool_invocation\s+name="([^"]+)"\s+arguments=(\{[^>]+?)\s*/?>', text, re.DOTALL)
+    if m3:
+        name = m3.group(1).strip()
+        args_text = m3.group(2).strip()
+        if args_text.endswith("/"):
+            args_text = args_text[:-1].rstrip()
+        for candidate in (args_text,
+                          args_text.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")):
+            try:
+                args = json.loads(candidate)
+                return {
+                    "call_id": f"call_{uuid.uuid4().hex[:16]}",
+                    "name": name,
+                    "arguments": args,
+                }
+            except json.JSONDecodeError:
+                continue
+        return {
+            "call_id": f"call_{uuid.uuid4().hex[:16]}",
+            "name": name,
+            "arguments": {"raw": args_text},
+        }
+
+    # Format 4: JSON in code block (```json {"name":"X","arguments":{...}} ```)
+    # Match the code block content and try to parse as JSON
+    m4 = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if m4:
+        try:
+            obj = json.loads(m4.group(1))
+            if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+                args = obj.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"raw": args}
+                return {
+                    "call_id": f"call_{uuid.uuid4().hex[:16]}",
+                    "name": obj.get("name", "unknown"),
+                    "arguments": args if isinstance(args, dict) else {"raw": str(args)},
+                }
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    return None
+
 class ClaudeCodeClient:
     """Minimal OpenAI-client-compatible facade for Claude Code CLI."""
 
@@ -743,10 +841,17 @@ class ClaudeCodeClient:
         "(or write). Built-in tool names like 'Bash' will not work — they have been "
         "disabled. The mcp__hermes-tools__* tools route through the hermes gateway to "
         "the connected client's filesystem for real execution.\n\n"
-        "Use claude-code's NATIVE tool-call mechanism (the same format claude-code uses "
-        "for any tool, e.g. `<function_calls><invoke name=\"...\">...</invoke></function_calls>`). "
-        "The bridge will parse this format. Do NOT write the tool call as plain text "
-        "or as JSON inside a code block — emit it as a real claude-code tool call."
+        "CRITICAL — You MUST emit a REAL tool call event when you need to run a command. "
+        "Do NOT write the tool call as text. Do NOT write XML inside a code block. "
+        "Do NOT describe what you will do in prose. "
+        "Emit the tool call directly using claude-code's native tool-call mechanism "
+        "(the same format claude-code uses for any tool, "
+        "e.g. `<function_calls><invoke name=\"mcp__hermes-tools__bash\">"
+        "<parameter name=\"command\">ls -la</parameter></invoke></function_calls>`). "
+        "The bridge will parse this format and execute the tool on the connected client's "
+        "filesystem. After invoking, STOP and wait for the result. "
+        "If you write the tool call as plain text or inside a code block, "
+        "the bridge will NOT execute it and your response will be useless."
     )
 
     def __init__(
@@ -1072,7 +1177,42 @@ class ClaudeCodeClient:
                                     )
                         elif ptype == "text":
                             text = part.get("text", "")
-                            if text:
+                            if not text:
+                                continue
+                            # Claude sometimes emits <function_calls> as raw text
+                            # content instead of as a real tool_use event. Parse
+                            # the text for XML tool call patterns and yield as
+                            # tool_call if found.
+                            _parsed_tc = _parse_text_tool_call(text)
+                            if _parsed_tc:
+                                call_id = _parsed_tc.get("call_id", uuid.uuid4().hex)
+                                tool_name = _parsed_tc.get("name", "")
+                                tool_input = _parsed_tc.get("arguments", {})
+                                # Yield the tool_call, caller will .send(result)
+                                result = yield {
+                                    "type": "tool_call",
+                                    "call_id": call_id,
+                                    "name": tool_name,
+                                    "arguments": tool_input,
+                                }
+                                # Caller provided result — write to bridge file
+                                if self._queue_out_dir:
+                                    result_path = os.path.join(
+                                        self._queue_out_dir, f"{call_id}.json"
+                                    )
+                                    try:
+                                        if isinstance(result, dict):
+                                            payload = result
+                                        else:
+                                            payload = {"content": str(result)}
+                                        with open(result_path, "w") as f:
+                                            json.dump(payload, f)
+                                    except Exception as exc:
+                                        _logger.error(
+                                            "bridge: failed to write result for %s: %s",
+                                            call_id, exc,
+                                        )
+                            else:
                                 yield {"type": "assistant_text", "text": text}
                 elif typ == "result":
                     for event in _drain_mcp_events():
