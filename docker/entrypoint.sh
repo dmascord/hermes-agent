@@ -172,6 +172,27 @@ MCPJSON
         echo "Registered hermes-tools MCP server for mimo CLI"
     fi
 
+    # Pre-accept mimo free-tier agreement so non-interactive `mimo run --pure`
+    # works. Without this, the interactive agreement dialog silently blocks
+    # requests in non-TTY mode (the binary can't show the dialog, so it exits
+    # with no stdout).
+    if command -v mimo >/dev/null 2>&1; then
+        _state_dir="${HERMES_HOME}/.local/state/mimocode"
+        mkdir -p "$_state_dir"
+        kv_file="$_state_dir/kv.json"
+        if [ ! -f "$kv_file" ] || ! grep -q "free_agreement_accepted" "$kv_file" 2>/dev/null; then
+            cat > "$kv_file" <<'KVJSON'
+{
+  "locale": "auto",
+  "free_agreement_accepted": true
+}
+KVJSON
+            chown hermes:hermes "$kv_file" 2>/dev/null || true
+            chmod 600 "$kv_file" 2>/dev/null || true
+            echo "Pre-accepted mimo free-tier agreement"
+        fi
+    fi
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi

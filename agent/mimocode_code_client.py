@@ -291,6 +291,23 @@ class MiMoCodeClient:
                 instructions = str(content).strip()
             elif role in ("user", "developer"):
                 user_parts.append(str(content).strip())
+            elif role == "assistant" and not content and msg.get("tool_calls"):
+                # Preserve assistant tool_calls as text so they're not
+                # silently dropped in multi-turn restart scenarios.
+                tc_texts = []
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    tc_texts.append(
+                        f"[tool_call: {fn.get('name', '?')} "
+                        f"args={fn.get('arguments', '{}')}]"
+                    )
+                if tc_texts:
+                    user_parts.append("Assistant tool calls:\n" + "\n".join(tc_texts))
+            elif role == "tool":
+                # Preserve tool results as text context.
+                tc_id = msg.get("tool_call_id", "")
+                c = content or ""
+                user_parts.append(f"Tool result ({tc_id}):\n{c}")
         return "\n\n".join(user_parts) if user_parts else ""
 
     def _create_chat_completion(
@@ -417,14 +434,48 @@ class MiMoCodeClient:
                 watcher_thread.join(timeout=2)
                 proc.wait(timeout=10)
             else:
-                # Simple mode: no tools, just read all output
-                stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+                # Simple mode: no tools — use deadline-based stdout reader
+                # with hard kill-timer. Replaces proc.communicate(timeout=timeout)
+                # which could hang for the full timeout if the mimo binary enters
+                # its polling-loop bug (GET /session/status every 750ms).
+                deadline = time.monotonic() + timeout
+                _stdout_lines: list[str] = []
+                while time.monotonic() < deadline:
+                    raw_line = proc.stdout.readline()
+                    if not raw_line:
+                        break
+                    _stdout_lines.append(raw_line.decode("utf-8", errors="replace"))
+                else:
+                    # Deadline reached — force-kill the process
+                    _logger.warning(
+                        "[mimocode-cli] timeout after %.1fs — force-killing process",
+                        timeout,
+                    )
+                    proc.kill()
+                    proc.wait(timeout=10)
+                    # Drain any remaining stderr before raising
+                    stderr_thread.join(timeout=2)
+                    if stderr_lines:
+                        _logger.warning(
+                            "[mimocode-cli] stderr at timeout: %s",
+                            "".join(stderr_lines)[:500],
+                        )
+                    raise RuntimeError(
+                        f"MiMoCode CLI exceeded {timeout}s timeout — "
+                        "the process may be stuck in a polling loop or "
+                        "the API may be rate-limiting this IP"
+                    )
 
-                if proc.returncode != 0:
-                    stderr = stderr_bytes.decode("utf-8", errors="replace")[:500]
-                    raise RuntimeError(f"MiMoCode CLI exited {proc.returncode}: {stderr}")
+                if proc.returncode not in (0, None):
+                    _drain_stderr_rem = ""
+                    try:
+                        _drain_stderr_rem += proc.stderr.read(4096).decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    stderr_msg = ("".join(stderr_lines) + _drain_stderr_rem)[:500]
+                    raise RuntimeError(f"MiMoCode CLI exited {proc.returncode}: {stderr_msg}")
 
-                for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
+                for line in _stdout_lines:
                     line = line.strip()
                     if not line:
                         continue
@@ -828,43 +879,67 @@ or (claude-style):
     # Format 6: <tool_invocation name="mcp__X" arguments={json} /> (self-closing)
     # Arguments are raw JSON, no quotes around them. The closing /> after
     # the JSON stops at the next > character.
-    m6 = re.search(r'<tool_invocation\s+name="([^"]+)"\s+arguments=(\{[^>]+?)\s*/?>', text, re.DOTALL)
-    if m6:
-        import uuid as _uuid
-        name = m6.group(1).strip()
-        args_text = m6.group(2).strip()
-        # Strip any trailing / that got included
-        if args_text.endswith("/"):
-            args_text = args_text[:-1].rstrip()
-        # Try both raw and HTML-entity-decoded
-        for candidate in (args_text,
-                          args_text.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")):
-            try:
-                args = json.loads(candidate)
-                return {
-                    "id": f"call_{_uuid.uuid4().hex[:16]}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args),
-                    },
-                }
-            except json.JSONDecodeError:
-                continue
-        return {
-            "id": f"call_{_uuid.uuid4().hex[:16]}",
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": json.dumps({"raw": args_text}),
-            },
-        }
+    # Flexible: handles attributes in any order, with double or single quotes,
+    # and with or without space before />.
+    import uuid as _uuid  # noqa: PLC0415 — used by multiple formats below
+    _ti_name = None
+    _ti_args_text = None
+    _ti_m = re.search(
+        r'<tool_invocation\s+'
+        r'(?:name=["\']([^"\']+)["\']\s*|\s+)*'
+        r'(?:arguments=(\{[^>]+?)\}\s*|\s+)*'
+        r'/?\s*>',
+        text, re.DOTALL,
+    )
+    if not _ti_m:
+        # Try with attributes reversed (arguments first, then name)
+        _ti_m = re.search(
+            r'<tool_invocation\s+'
+            r'(?:arguments=(\{[^>]+?\})\s*|\s+)*'
+            r'(?:name=["\']([^"\']+)["\']\s*|\s+)*'
+            r'/?\s*>',
+            text, re.DOTALL,
+        )
+    if _ti_m:
+        name = (_ti_m.group(1) or _ti_m.group(2) or "").strip()
+        args_text = (_ti_m.group(2) or _ti_m.group(1) or "").strip()
+        # Group 1 is name in first pattern, group 2 is name in second pattern
+        # Check which group is the name vs args based on whether it looks like JSON
+        if name.startswith("{"):
+            # Swapped — first group is actually args, second is name
+            name, args_text = (_ti_m.group(2) or "").strip(), name
+        if name and args_text:
+            # Strip any trailing / that got included
+            if args_text.endswith("/"):
+                args_text = args_text[:-1].rstrip()
+            # Try both raw and HTML-entity-decoded
+            for candidate in (args_text,
+                              args_text.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")):
+                try:
+                    args = json.loads(candidate)
+                    return {
+                        "id": f"call_{_uuid.uuid4().hex[:16]}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args),
+                        },
+                    }
+                except json.JSONDecodeError:
+                    continue
+            return {
+                "id": f"call_{_uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps({"raw": args_text}),
+                },
+            }
 
     # Format 7: JSON in code block (```json {"name":"X","arguments":{...}} ```)
     # Match the code block content and try to parse as JSON
     m7 = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
     if m7:
-        import uuid as _uuid
         try:
             obj = json.loads(m7.group(1))
             if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
@@ -884,5 +959,15 @@ or (claude-style):
                 }
         except (json.JSONDecodeError, KeyError):
             pass
+
+    # Format 8: tool_invocation wrapped in code blocks (any language tag)
+    # ```xml <tool_invocation name="..." arguments={...} /> ```
+    # or just ``` <tool_invocation ... /> ```
+    if "<tool_invocation" in text and "```" in text:
+        _ti_code = re.search(r'```(?:\w*)\s*(<tool_invocation[^`]+?/>)\s*```', text, re.DOTALL)
+        if _ti_code:
+            inner = _ti_code.group(1).strip()
+            # Recurse into format 6 parser on the inner XML
+            return _parse_tool_call_xml(inner)
 
     return None
