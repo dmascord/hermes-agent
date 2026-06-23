@@ -7818,11 +7818,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                     except Exception as _restart_exc:
                                         logger.warning("[hermes-code] mimocode-cli multi-turn restart failed: %s", _restart_exc)
                                 _bridge_finish_reason = "tool_calls" if _bridge_tool_calls else "stop"
-                                _bridge_usage_ns = SimpleNamespace(
-                                    prompt_tokens=_bridge_usage.get("input_tokens", 0),
-                                    completion_tokens=_bridge_usage.get("output_tokens", 0),
-                                    total_tokens=_bridge_usage.get("total_tokens", 0),
-                                )
+                                try:
+                                    _bridge_usage_ns = SimpleNamespace(
+                                        prompt_tokens=_bridge_usage.get("input_tokens", 0),
+                                        completion_tokens=_bridge_usage.get("output_tokens", 0),
+                                        total_tokens=_bridge_usage.get("total_tokens", 0),
+                                    )
+                                except Exception as _usage_exc:
+                                    logger.warning("[hermes-code] mimocode-cli bridge: _bridge_usage_ns failed: %s usage=%r", _usage_exc, _bridge_usage)
+                                    _bridge_usage_ns = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0)
                                 # If the bridge reported an error and produced no real content, use the error
                                 # message as the response text so downstream exhaustion/error checks catch it.
                                 if _bridge_error_msg and not _bridge_final_text and not _bridge_tool_calls:
@@ -7845,13 +7849,36 @@ class APIServerAdapter(BasePlatformAdapter):
                                     content=_bridge_final_text,
                                     stream=True,
                                 )
-                                response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
-                                await response.prepare(request)
-                                for _bridge_sse_chunk in _bridge_sse_chunks:
-                                    await response.write(f"data: {json.dumps(_bridge_sse_chunk)}\n\n".encode())
-                                await response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
-                                await response.write(b"data: [DONE]\n\n")
-                                await response.write_eof()
+                                try:
+                                    response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
+                                    await response.prepare(request)
+                                    for _bridge_sse_chunk in _bridge_sse_chunks:
+                                        await response.write(f"data: {json.dumps(_bridge_sse_chunk)}\n\n".encode())
+                                    await response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
+                                    await response.write(b"data: [DONE]\n\n")
+                                    await response.write_eof()
+                                except Exception as _resp_exc:
+                                    logger.warning("[TIMING][req=%s][mimo-stream] T+%.3fs mimocode-cli response.write failed: %s — falling back to plain response",
+                                        _req_id, time.monotonic() - _req_start, _resp_exc)
+                                    # Fall back to a plain JSON response (mimics what
+                                    # the 503 path does, but with the synthesized
+                                    # content rather than an error).
+                                    return web.json_response({
+                                        "id": _bridge_completion_id,
+                                        "object": "chat.completion",
+                                        "created": int(time.time()),
+                                        "model": _bridge_model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "message": {"role": "assistant", "content": _bridge_final_text},
+                                            "finish_reason": _bridge_finish_reason,
+                                        }],
+                                        "usage": {
+                                            "prompt_tokens": int(_bridge_usage_ns.prompt_tokens or 0),
+                                            "completion_tokens": int(_bridge_usage_ns.completion_tokens or 0),
+                                            "total_tokens": int(_bridge_usage_ns.total_tokens or 0),
+                                        },
+                                    })
                                 logger.info("[TIMING][req=%s][mimo-stream] T+%.3fs mimocode-cli completed: text_len=%d tool_calls=%d — RETURNING response",
                                     _req_id, time.monotonic() - _req_start, len(_bridge_final_text), len(_bridge_tool_calls))
                                 try:
