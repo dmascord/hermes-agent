@@ -290,6 +290,8 @@ class MiMoCodeClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        continue_session: bool = False,
+        session_id: str | None = None,
     ) -> Any:
         """Run mimo CLI and parse events.
 
@@ -297,6 +299,11 @@ class MiMoCodeClient:
         - Creates temp workspace with MCP bridge (server named "mcp")
         - Agent permission denies all built-in tools, allows only mcp_* tools
         - Uses streaming reader with watcher thread to handle MCP tool results
+
+        When continue_session=True, passes --continue (or --session <id>) to
+        mimo so it loads the existing session from disk and continues the
+        conversation. This preserves the full agent loop including tool
+        execution history.
         """
         prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
@@ -309,6 +316,12 @@ class MiMoCodeClient:
         if tools:
             cwd = self._setup_mcp_workspace(tools)
             cmd += ["--agent", "hermes"]
+
+        if continue_session:
+            if session_id:
+                cmd += ["--session", session_id]
+            else:
+                cmd += ["--continue"]
 
         if prompt:
             cmd += [prompt]

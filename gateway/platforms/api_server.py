@@ -7691,22 +7691,20 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 "tool_call_id": _tc_id,
                                                 "content": _tool_content if isinstance(_tool_content, str) else json.dumps(_tool_content),
                                             })
-                                        # mimo's _build_prompt() only takes the LAST user
-                                        # message and ignores prior assistant/tool messages.
-                                        # So we must include the original user message +
-                                        # the tool result IN the new user message so mimo
-                                        # actually sees both pieces of context.
+                                        # Append a USER message that tells the model
+                                        # the tool result has been provided. mimo's
+                                        # _build_prompt() only takes the LAST user
+                                        # message, so we must include both the
+                                        # original prompt and the tool result inline.
                                         _tool_summary = _tool_result_payload.get("content", "")
                                         if not isinstance(_tool_summary, str):
                                             _tool_summary = json.dumps(_tool_summary)
-                                        # Truncate to avoid blowing context window
                                         _tool_summary_short = (
                                             _tool_summary[:4000] + "\n... [truncated]"
                                             if len(_tool_summary) > 4000
                                             else _tool_summary
                                         )
-                                        # Find the original user prompt (last user/developer
-                                        # message in the original messages)
+                                        # Find the original user prompt
                                         _original_user_msg = ""
                                         for _orig_msg in reversed(passthrough_messages):
                                             if _orig_msg.get("role") in ("user", "developer"):
@@ -7724,16 +7722,24 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "content": (
                                                 f"Original request:\n\n{_original_user_msg}\n\n"
                                                 f"---\n\n"
-                                                f"The tool returned:\n\n```\n{_tool_summary_short}\n```\n\n"
+                                                f"The previous tool returned:\n\n```\n{_tool_summary_short}\n```\n\n"
                                                 "Based on this result, please answer my "
                                                 "original request directly in plain text. "
                                                 "Do not call any more tools."
                                             ),
                                         })
                                         # Start new mimo session with extended conversation
-                                        def _run_mc_restart(_c=_mc_client, _m=resolved_model, _ext=_ext_messages, _q=_bridge_events):
+                                        def _run_mc_restart(_c=_mc_client, _m=resolved_model, _ext=_ext_messages, _q=_bridge_events, _orig_msgs=passthrough_messages):
                                             try:
-                                                resp = _c._create_chat_completion(model=_m, messages=_ext, tools=passthrough_tools)
+                                                # Continue the SAME mimo session so the
+                                                # conversation history (including tool
+                                                # execution) is preserved on disk.
+                                                resp = _c._create_chat_completion(
+                                                    model=_m,
+                                                    messages=_ext,
+                                                    tools=passthrough_tools,
+                                                    continue_session=True,
+                                                )
                                                 if hasattr(resp, 'choices') and resp.choices:
                                                     msg = resp.choices[0].message
                                                     if getattr(msg, 'content', None):
