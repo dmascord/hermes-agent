@@ -691,16 +691,23 @@ def _parse_tool_call_xml(text: str) -> dict | None:
         <name>mcp_bash</name>
         <args>{"command": "..."}</args>
         </tool_call>
-    or (claude-style):
+or (claude-style):
         <function_calls>
-        <invoke name="mcp__hermes-tools__bash">
+        <invoke name="mcp__X">
         <parameter name="command">...</parameter>
         </invoke>
         </function_calls>
+    or (newer mimo, format 6):
+        <tool_invocation name="mcp__hermes-tools__bash" arguments={"command": "..."} />
     Returns an OpenAI-format tool_call dict or None.
     """
     import re
-    if "<tool_call>" not in text and "<function_calls>" not in text and "<invoke name=" not in text:
+    if (
+        "<tool_call>" not in text
+        and "<function_calls>" not in text
+        and "<invoke name=" not in text
+        and "<tool_invocation" not in text
+    ):
         return None
 
     # Format 1: JSON-style tool_call
@@ -800,6 +807,41 @@ def _parse_tool_call_xml(text: str) -> dict | None:
             "function": {
                 "name": name,
                 "arguments": json.dumps(args),
+            },
+        }
+
+    # Format 6: <tool_invocation name="mcp__X" arguments={json} /> (self-closing)
+    # Arguments are raw JSON, no quotes around them. The closing /> after
+    # the JSON stops at the next > character.
+    m6 = re.search(r'<tool_invocation\s+name="([^"]+)"\s+arguments=(\{[^>]+?)\s*/?>', text, re.DOTALL)
+    if m6:
+        import uuid as _uuid
+        name = m6.group(1).strip()
+        args_text = m6.group(2).strip()
+        # Strip any trailing / that got included
+        if args_text.endswith("/"):
+            args_text = args_text[:-1].rstrip()
+        # Try both raw and HTML-entity-decoded
+        for candidate in (args_text,
+                          args_text.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")):
+            try:
+                args = json.loads(candidate)
+                return {
+                    "id": f"call_{_uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args),
+                    },
+                }
+            except json.JSONDecodeError:
+                continue
+        return {
+            "id": f"call_{_uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps({"raw": args_text}),
             },
         }
 
