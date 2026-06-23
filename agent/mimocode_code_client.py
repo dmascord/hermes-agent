@@ -9,6 +9,7 @@ Supports two modes:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import shlex
@@ -646,7 +647,7 @@ def _parse_tool_call_xml(text: str) -> dict | None:
     """Parse mimo CLI's text-formatted tool_call XML.
 
     The mimo CLI sometimes emits tool_call as raw XML text instead of a
-    structured tool_use event:
+    structured tool_use event. Three formats observed:
         <tool_call>
         {"name": "mcp_bash", "arguments": {"command": "..."}}
         </tool_call>
@@ -656,8 +657,79 @@ def _parse_tool_call_xml(text: str) -> dict | None:
         <parameter=command>...</parameter>
         </function>
         </tool_call>
+    or (newer):
+        <tool_call>
+        <tool_name>mcp_bash</tool_name>
+        <parameters>
+        <command>head -3 /Users/tusker/...</command>
+        </parameters>
+        </tool_call>
     Returns an OpenAI-format tool_call dict or None.
     """
     import re
     if "<tool_call>" not in text:
         return None
+
+    # Format 1: JSON-style tool_call
+    m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            args = obj.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {"raw": args}
+            return {
+                "id": f"call_{hashlib.md5(m.group(1).encode()).hexdigest()[:16]}",
+                "type": "function",
+                "function": {
+                    "name": obj.get("name", "unknown"),
+                    "arguments": json.dumps(args),
+                },
+            }
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Format 2: <function=name><parameter=key>value</parameter></function>
+    m2 = re.search(r"<function=([^>]+)>.*?<parameter=([^>]+)>(.*?)</parameter>.*?</function>", text, re.DOTALL)
+    if m2:
+        import uuid as _uuid
+        name, key, value = m2.group(1), m2.group(2), m2.group(3).strip()
+        return {
+            "id": f"call_{_uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps({key: value}),
+            },
+        }
+
+    # Format 3: <tool_name>name</tool_name><parameters><key>value</key>...</parameters>
+    m3 = re.search(r"<tool_name>([^<]+)</tool_name>", text)
+    if m3:
+        import uuid as _uuid
+        name = m3.group(1).strip()
+        # Find the <parameters>...</parameters> block (if present)
+        params_m = re.search(r"<parameters>(.*?)</parameters>", text, re.DOTALL)
+        params_block = params_m.group(1) if params_m else text
+        # Strip the <tool_name>...</tool_name> if it's inside params_block
+        params_block = re.sub(r"<tool_name>.*?</tool_name>", "", params_block, flags=re.DOTALL)
+        # Extract all <key>value</key> pairs (non-nested)
+        args = {}
+        for am in re.finditer(r"<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([^<]*?)\s*</\1>", params_block, re.DOTALL):
+            key = am.group(1)
+            if key in ("parameters",):
+                continue
+            args[key] = am.group(2).strip()
+        return {
+            "id": f"call_{_uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args),
+            },
+        }
+
+    return None
