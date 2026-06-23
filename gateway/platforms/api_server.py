@@ -6116,8 +6116,9 @@ class APIServerAdapter(BasePlatformAdapter):
         _req_id = completion_id.replace("chatcmpl-", "")[:8]
         _req_start = time.monotonic()
         model_name = body.get("model", self._model_name)
-        logger.info("[TIMING][req=%s] chat_completions START model=%s has_tools=%s session_id=%s",
-                    _req_id, model_name, bool(passthrough_tools), session_id)
+        # NOTE: TIMING START log is emitted AFTER passthrough_tools is assigned
+        # (later in this function) so it can include has_tools. Don't reference
+        # passthrough_tools here — it raises UnboundLocalError.
         role_cfg = _get_role_alias_config(model_name)
         role_hint = dict(role_cfg.get("hint") or {}) if role_cfg else None
         _toolset_mode = "auto"
@@ -6407,6 +6408,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             out.append(t)
                     return out
                 passthrough_tools = _mcp_prefix_tools(passthrough_tools)
+            # Emit the START timing log AFTER passthrough_tools is assigned
+            # so the has_tools flag is accurate. Using _req_start above.
+            logger.info("[TIMING][req=%s] chat_completions START model=%s has_tools=%s session_id=%s t_offset=%.3fs",
+                        _req_id, model_name, bool(passthrough_tools), session_id,
+                        time.monotonic() - _req_start)
             # ── Fallback tool set ──────────────────────────────────────────────
             # 24+ tool definitions overwhelm smaller/cheaper fallback models
             # (kimi-k2-thinking: 94% text-only, glm-5: 62%, etc.).  The primary
