@@ -7535,11 +7535,26 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _bridge_usage = {}
                                 _bridge_model = resolved_model
                                 _bridge_tool_calls: list[dict] = []
-                                _bridge_sse_chunks: list[dict] = []
                                 _bridge_error_msg: str | None = None
                                 _bridge_last_tool_result: str | None = None
                                 _restart_count = 0
                                 _MAX_RESTARTS = 3
+                                _bridge_resp_failed = False
+                                _stream_response: web.StreamResponse | None = None
+                                try:
+                                    _stream_response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
+                                    await _stream_response.prepare(request)
+                                except Exception as _resp_prep_exc:
+                                    logger.warning("[TIMING][req=%s][mimo-stream] T+%.3fs mimocode-cli response.prepare failed: %s — falling back to plain response",
+                                        _req_id, time.monotonic() - _req_start, _resp_prep_exc)
+                                    return web.json_response({
+                                        "id": _bridge_completion_id,
+                                        "object": "chat.completion",
+                                        "created": int(time.time()),
+                                        "model": _bridge_model,
+                                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Stream preparation failed"}, "finish_reason": "error"}],
+                                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                                    })
                                 while True:
                                     _be = await _bridge_events.get()
                                     if _be is None or _be.get("type") == "_done":
@@ -7563,7 +7578,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "created": int(time.time()), "model": model_name,
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
-                                        _bridge_sse_chunks.append(_tc_chunk)
+                                        try:
+                                            await _stream_response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                        except Exception:
+                                            _bridge_resp_failed = True
+                                            _bridge_error_msg = "SSE write failed during tool_call"
+                                            break
                                         # Emit side-channel tool_call_request so the connected
                                         # client (Mac OMP daemon) knows to execute the tool
                                         # locally and POST the result back via the hub.
@@ -7573,13 +7593,17 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "name": _tool_name,
                                             "arguments": _tool_args,
                                         }
-                                        _bridge_sse_chunks.append({
-                                            "id": _bridge_completion_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": model_name,
+                                        _tcreq_chunk = {
+                                            "id": _bridge_completion_id, "object": "chat.completion.chunk",
+                                            "created": int(time.time()), "model": model_name,
                                             "data": _tool_call_request_event,
-                                        })
+                                        }
+                                        try:
+                                            await _stream_response.write(f"data: {json.dumps(_tcreq_chunk)}\n\n".encode())
+                                        except Exception:
+                                            _bridge_resp_failed = True
+                                            _bridge_error_msg = "SSE write failed during tool_call_request"
+                                            break
                                         _pending_call = None
                                         _tool_result_payload: dict = {"content": "[Tool execution timed out — no response from connected client]"}
                                         if session_id:
@@ -7647,7 +7671,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "created": int(time.time()), "model": model_name,
                                             "choices": [{"index": 0, "delta": {"content": _chunk_text}, "finish_reason": None}],
                                         }
-                                        _bridge_sse_chunks.append(_tc_chunk)
+                                        try:
+                                            await _stream_response.write(f"data: {json.dumps(_tc_chunk)}\n\n".encode())
+                                        except Exception:
+                                            _bridge_resp_failed = True
+                                            _bridge_error_msg = "SSE write failed during text"
+                                            break
                                     elif _bt == "error":
                                         _bridge_error_msg = _be.get("message", "")
                                         logger.warning("[hermes-code] mimocode-cli bridge error: %s", _bridge_error_msg)
@@ -7691,7 +7720,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "created": int(time.time()), "model": model_name,
                                             "choices": [{"index": 0, "delta": {"content": _bridge_final_text}, "finish_reason": None}],
                                         }
-                                        _bridge_sse_chunks.append(_synth_chunk)
+                                        try:
+                                            await _stream_response.write(f"data: {json.dumps(_synth_chunk)}\n\n".encode())
+                                        except Exception:
+                                            _bridge_resp_failed = True
+                                            _bridge_error_msg = "SSE write failed during synth chunk"
+                                            break
                                         # Don't restart — the synthesized text IS the answer
                                         _bridge_finish_reason = "stop"
                                         break
@@ -7823,8 +7857,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 # message as the response text so downstream exhaustion/error checks catch it.
                                 if _bridge_error_msg and not _bridge_final_text and not _bridge_tool_calls:
                                     _bridge_final_text = _bridge_error_msg
-                                logger.info("[TIMING][req=%s][mimo-stream] T+%.3fs bridge loop exit — building SSE response chunks=%d text_len=%d tool_calls=%d",
-                                    _req_id, time.monotonic() - _req_start, len(_bridge_sse_chunks), len(_bridge_final_text), len(_bridge_tool_calls))
+                                logger.info("[TIMING][req=%s][mimo-stream] T+%.3fs bridge loop exit — building SSE response text_len=%d tool_calls=%d",
+                                    _req_id, time.monotonic() - _req_start, len(_bridge_final_text), len(_bridge_tool_calls))
                                 _bridge_finish_chunk = {
                                     "id": _bridge_completion_id, "object": "chat.completion.chunk",
                                     "created": int(time.time()), "model": _bridge_model,
@@ -7842,13 +7876,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                     stream=True,
                                 )
                                 try:
-                                    response = web.StreamResponse(status=200, headers=_bridge_sse_headers)
-                                    await response.prepare(request)
-                                    for _bridge_sse_chunk in _bridge_sse_chunks:
-                                        await response.write(f"data: {json.dumps(_bridge_sse_chunk)}\n\n".encode())
-                                    await response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
-                                    await response.write(b"data: [DONE]\n\n")
-                                    await response.write_eof()
+                                    if _bridge_resp_failed:
+                                        raise ConnectionError("SSE stream previously failed")
+                                    await _stream_response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
+                                    await _stream_response.write(b"data: [DONE]\n\n")
+                                    await _stream_response.write_eof()
+                                    response = _stream_response
                                 except Exception as _resp_exc:
                                     logger.warning("[TIMING][req=%s][mimo-stream] T+%.3fs mimocode-cli response.write failed: %s — falling back to plain response",
                                         _req_id, time.monotonic() - _req_start, _resp_exc)
