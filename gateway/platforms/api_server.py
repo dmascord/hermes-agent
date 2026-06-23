@@ -6841,6 +6841,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                     )
                                 else:
                                     # Chat Completions API (GPT-5-mini, GPT-4o-mini, etc.)
+                                    from hermes_cli.timeouts import get_provider_request_timeout
+                                    _chat_timeout = get_provider_request_timeout(prov, resolved_model) or 300.0
                                     response_obj = await _s_loop.run_in_executor(
                                         None,
                                         lambda: client.chat.completions.create(
@@ -6848,7 +6850,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             messages=_copilot_messages(passthrough_messages),
                                             max_tokens=16384,
                                             tools=passthrough_tools,
-                                            timeout=30,
+                                            timeout=_chat_timeout,
                                         ),
                                     )
 
@@ -8069,7 +8071,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             logger.warning("[hermes-code] stream: acquire_stream exception for %s: %s", prov, _stream_exc)
                         if not _skip_normal_call:
                             _call_start = _time.time()
-                            logger.info("[hermes-code][req=%s] stream: calling call_llm for %s timeout=30s", _req_id, prov)
+                            from hermes_cli.timeouts import get_provider_request_timeout
+                            _call_timeout = get_provider_request_timeout(prov, resolved_model) or 300.0
+                            logger.info("[hermes-code][req=%s] stream: calling call_llm for %s timeout=%ss", _req_id, prov, _call_timeout)
                             try:
                                 response_obj = await _s_loop.run_in_executor(
                                     None,
@@ -8081,7 +8085,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         base_url=base_url,
                                         api_key=api_key,
                                         max_tokens=16384,
-                                        timeout=30,
+                                        timeout=_call_timeout,
                                         tools=passthrough_tools,
                                     ),
                                 )

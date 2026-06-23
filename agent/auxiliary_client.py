@@ -88,14 +88,14 @@ class _OpenAIProxy:
     __slots__ = ()
 
     def __call__(self, *args, **kwargs):
-        # Disable SDK-level retries by default. The Hermes gateway already has
-        # its own fallback chain at the api_server level (try next provider on
-        # failure). The OpenAI SDK's default max_retries=2 means 3 total
-        # attempts on timeout, so a single hung provider holds the request for
-        # ~90s at timeout=30s — exceeding Cloudflare's 100s origin timeout
-        # and triggering a 524. Callers that explicitly need SDK retries must
-        # pass max_retries explicitly.
-        kwargs.setdefault("max_retries", 0)
+        # Allow one SDK-level retry for transient failures (TCP reset, DNS
+        # hiccup, brief upstream blip).  The old default of max_retries=0 was
+        # chosen to avoid Cloudflare 524 cascades when a hung provider held
+        # the connection for ~90s (max_retries=2 × timeout=30s), but with
+        # the gateway timeouts now raised to 300s+ the risk is lower and
+        # the benefit of surviving a single transient blip is significant.
+        # Callers that explicitly need zero retries must pass max_retries=0.
+        kwargs.setdefault("max_retries", 1)
         return _load_openai_cls()(*args, **kwargs)
 
     def __instancecheck__(self, obj):
