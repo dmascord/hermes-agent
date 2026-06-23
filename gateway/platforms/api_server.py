@@ -7545,6 +7545,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _bridge_tool_calls: list[dict] = []
                                 _bridge_sse_chunks: list[dict] = []
                                 _bridge_error_msg: str | None = None
+                                _restart_count = 0
+                                _MAX_RESTARTS = 3
                                 while True:
                                     _be = await _bridge_events.get()
                                     if _be is None or _be.get("type") == "_done":
@@ -7659,7 +7661,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                     and _bridge_tool_calls
                                     and not _bridge_final_text
                                     and passthrough_messages
+                                    and _restart_count < _MAX_RESTARTS
                                 ):
+                                    _restart_count += 1
                                     try:
                                         logger.info(
                                             "[TIMING][req=%s][mimo-stream] T+%.3fs starting multi-turn restart tool_calls=%d",
@@ -7687,6 +7691,23 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 "tool_call_id": _tc_id,
                                                 "content": _tool_content if isinstance(_tool_content, str) else json.dumps(_tool_content),
                                             })
+                                        # Append a system message that tells the model the
+                                        # work is done — without this the model loops on
+                                        # the same tool call instead of producing a final
+                                        # answer. The mimo CLI doesn't have a native
+                                        # "force final answer" signal, so we use a system
+                                        # message that overrides its default tool-call
+                                        # behavior.
+                                        _ext_messages.append({
+                                            "role": "system",
+                                            "content": (
+                                                "The tool above has ALREADY been executed and "
+                                                "the result is in the previous tool message. "
+                                                "Use that result to answer the user's original "
+                                                "question directly in plain text. Do NOT call "
+                                                "any more tools. Respond with a final answer now."
+                                            ),
+                                        })
                                         # Start new mimo session with extended conversation
                                         def _run_mc_restart(_c=_mc_client, _m=resolved_model, _ext=_ext_messages, _q=_bridge_events):
                                             try:
