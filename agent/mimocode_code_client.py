@@ -433,6 +433,16 @@ class MiMoCodeClient:
                 watcher_stop.set()
                 watcher_thread.join(timeout=2)
                 proc.wait(timeout=10)
+                if time.monotonic() >= deadline:
+                    _logger.warning(
+                        "[mimocode-cli] MCP mode timeout after %.1fs — process may be stuck in polling loop",
+                        timeout,
+                    )
+                    raise RuntimeError(
+                        f"MiMoCode CLI exceeded {timeout}s timeout in MCP mode — "
+                        "the process may be stuck in a polling loop or "
+                        "the API may be rate-limiting this IP"
+                    )
             else:
                 # Simple mode: no tools — use deadline-based stdout reader
                 # with hard kill-timer. Replaces proc.communicate(timeout=timeout)
@@ -541,192 +551,10 @@ class MiMoCodeClient:
         choices = [SimpleNamespace(index=0, message=message, finish_reason="stop")]
         return SimpleNamespace(choices=choices, usage=SimpleNamespace(**usage), model=model)
 
-    def run_with_tool_bridge(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
-    ):
-        """MCP bridge mode: run with MCP proxy for tool interception.
-
-        Yields events: text, tool_call, final, error.
-        """
-        prompt = self._build_prompt(messages)
-        model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
-
-        # Set up MCP bridge communication channels
-        session_id = f"hermes_{int(time.time())}_{os.getpid()}"
-        self._queue_in_path = f"/tmp/hermes_queue_{session_id}.in"
-        self._queue_out_dir = f"/tmp/hermes_result_{session_id}"
-        os.makedirs(self._queue_out_dir, exist_ok=True)
-
-        tools_manifest = self._write_tools_manifest(tools or [])
-        mcp_config = self._build_mcp_config(tools_manifest)
-
-        # --pure disables external plugins (MCP). Strip it when using MCP bridge.
-        _args = [a for a in self._args if a != "--pure"]
-        cmd = [self._command] + _args
-        if model_name:
-            cmd += ["--model", model_name]
-        cmd += ["--mcp-config", mcp_config]
-        if prompt:
-            cmd += [prompt]
-
-        env = _build_subprocess_env()
-        _logger.info("[mimocode-cli] MCP bridge: %s", " ".join(cmd[:6]))
-
-        try:
-            if os.path.exists(self._queue_in_path):
-                os.unlink(self._queue_in_path)
-        except Exception:
-            pass
-
-        try:
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, env=env, text=False,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start mimo command '{self._command}'. "
-                "Install MiMoCode CLI: npm install -g @mimo-ai/cli"
-            ) from exc
-
-        mcp_events_lock = threading.Lock()
-        mcp_events: list[dict[str, Any]] = []
-        mcp_seen_call_ids: set[str] = set()
-        mcp_stop = threading.Event()
-
-        def _drain_mcp_events() -> list[dict[str, Any]]:
-            with mcp_events_lock:
-                drained = list(mcp_events)
-                mcp_events.clear()
-            return drained
-
-        def _watch_mcp_queue() -> None:
-            if not self._queue_in_path or not self._queue_out_dir:
-                return
-            offset = 0
-            while not mcp_stop.is_set():
-                try:
-                    if not os.path.exists(self._queue_in_path):
-                        time.sleep(0.05)
-                        continue
-                    with open(self._queue_in_path, "r", encoding="utf-8") as f:
-                        f.seek(offset)
-                        lines = f.readlines()
-                        offset = f.tell()
-                    for raw in lines:
-                        raw = raw.strip()
-                        if not raw:
-                            continue
-                        try:
-                            call = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        call_id = str(call.get("call_id") or "")
-                        if not call_id or call_id in mcp_seen_call_ids:
-                            continue
-                        mcp_seen_call_ids.add(call_id)
-                        event = {
-                            "type": "tool_call",
-                            "call_id": call_id,
-                            "name": str(call.get("tool") or ""),
-                            "arguments": call.get("arguments") or {},
-                        }
-                        with mcp_events_lock:
-                            mcp_events.append(event)
-                except Exception as exc:
-                    _logger.warning("[mimocode-cli] MCP queue monitor error: %s", exc)
-                time.sleep(0.05)
-
-        mcp_thread: threading.Thread | None = None
-        if tools and self._queue_in_path and self._queue_out_dir:
-            mcp_thread = threading.Thread(target=_watch_mcp_queue, daemon=True)
-            mcp_thread.start()
-
-        try:
-            for raw_line in proc.stdout:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                for ev in _drain_mcp_events():
-                    yield ev
-
-                etype = event.get("type", "")
-                part = event.get("part", {})
-
-                if etype == "text":
-                    text_payload = part.get("text", "")
-                    # mimo CLI sometimes emits tool_call as raw XML text
-                    # instead of a structured tool_use event. Parse it and
-                    # yield as tool_call so the gateway can route it to
-                    # the connected client via tool_call_hub.
-                    _xml_tc = _parse_tool_call_xml(text_payload)
-                    if _xml_tc:
-                        yield _xml_tc
-                    else:
-                        yield {"type": "text", "text": text_payload}
-                elif etype == "tool_use":
-                    call_id = part.get("callID", uuid.uuid4().hex)
-                    tool_name = part.get("tool", "unknown")
-                    tool_input = part.get("state", {}).get("input", {})
-                    yield {
-                        "type": "tool_call",
-                        "call_id": call_id,
-                        "name": tool_name,
-                        "arguments": tool_input if isinstance(tool_input, dict) else {},
-                    }
-                elif etype == "step_finish":
-                    tokens = part.get("tokens", {})
-                    yield {
-                        "type": "final",
-                        "model": model,
-                        "usage": {
-                            "input_tokens": tokens.get("input", 0),
-                            "output_tokens": tokens.get("output", 0),
-                            "total_tokens": tokens.get("total", 0),
-                        },
-                    }
-
-            proc.wait(timeout=timeout)
-
-            for ev in _drain_mcp_events():
-                yield ev
-
-            if proc.returncode != 0 and proc.stderr:
-                err_text = proc.stderr.read()[:500]
-                if err_text:
-                    yield {"type": "error", "message": f"exit {proc.returncode}: {err_text}"}
-
-        except Exception as exc:
-            _logger.error("[mimocode-cli] MCP bridge error: %s", exc)
-            yield {"type": "error", "message": str(exc)}
-        finally:
-            mcp_stop.set()
-            if mcp_thread is not None:
-                mcp_thread.join(timeout=1.0)
-            for _path in [tools_manifest, mcp_config, self._queue_in_path]:
-                if _path and os.path.exists(_path):
-                    try:
-                        os.unlink(_path)
-                    except Exception:
-                        pass
-            if self._queue_out_dir and os.path.isdir(self._queue_out_dir):
-                try:
-                    import shutil
-                    shutil.rmtree(self._queue_out_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            self._queue_in_path = None
-            self._queue_out_dir = None
+    # NOTE: run_with_tool_bridge was previously defined here but was dead code
+    # (never called from anywhere) and referenced undefined methods
+    # _write_tools_manifest() and _build_mcp_config(). The current code path
+    # uses _create_chat_completion() instead (which calls _setup_mcp_workspace()).
 
 
 # Module-level helper, moved here so it doesn't break the class body.
@@ -798,19 +626,25 @@ or (claude-style):
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # Format 2: <function=name><parameter=key>value</parameter></function>
-    m2 = re.search(r"<function=([^>]+)>.*?<parameter=([^>]+)>(.*?)</parameter>.*?</function>", text, re.DOTALL)
+    # Format 2: <function=name><parameter=key>value</parameter>...</function>
+    # Handles multiple <parameter=key>value</parameter> pairs.
+    m2 = re.search(r"<function=([^>]+)>(.*?)</function>", text, re.DOTALL)
     if m2:
         import uuid as _uuid
-        name, key, value = m2.group(1), m2.group(2), m2.group(3).strip()
-        return {
-            "id": f"call_{_uuid.uuid4().hex[:16]}",
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": json.dumps({key: value}),
-            },
-        }
+        name = m2.group(1).strip()
+        inner = m2.group(2)
+        args = {}
+        for pm in re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", inner, re.DOTALL):
+            args[pm.group(1).strip()] = pm.group(2).strip()
+        if args:
+            return {
+                "id": f"call_{_uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args),
+                },
+            }
 
     # Format 3: <tool_name>name</tool_name><parameters><key>value</key>...</parameters>
     m3 = re.search(r"<tool_name>([^<]+)</tool_name>", text)
