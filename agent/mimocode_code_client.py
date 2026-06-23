@@ -169,15 +169,7 @@ class MiMoCodeClient:
             f.write("name: hermes\n")
             f.write("description: Hermes tool proxy agent\n")
             f.write("permission:\n")
-            # CRITICAL: explicitly deny mimo's BUILT-IN tool names. mimo's
-            # default system prompt teaches the model to invoke
-            # [tool_call: bash for '...'], [tool_call: ls for ...],
-            # etc. — those run via mimo's built-in executor and NEVER
-            # reach the hermes MCP bridge. We must deny them by name
-            # AND tell the model to use the mcp_<name> variants.
             f.write("  '*': deny\n")
-            for builtin in ("bash", "read", "write", "edit", "grep", "glob", "ls", "webfetch"):
-                f.write(f"  '{builtin}': deny\n")
             for name in mcp_tool_names:
                 f.write(f"  '{name}': allow\n")
             f.write("tool_allowlist:\n")
@@ -197,11 +189,10 @@ class MiMoCodeClient:
                 "Use these tools to help the user. "
                 "When a task requires running a command, reading a file, "
                 "or any code operation, use the appropriate mcp_ prefixed tool.\n\n"
-                "CRITICAL: mimo has built-in tools named 'bash', 'read', 'write', 'edit', "
-                "'grep', 'glob', 'ls'. Those built-ins run inside the container and CANNOT "
-                "access the connected client's filesystem. You MUST use the mcp_-prefixed "
-                "equivalents instead — e.g. 'mcp_bash' instead of 'bash'. The bridge routes "
-                "mcp_ tool calls to the connected client for real execution.\n"
+                "Important: invoke the MCP-prefixed tool names (e.g. mcp_bash, "
+                "mcp_read, mcp_write, mcp_edit) rather than the bare names. "
+                "The bridge routes the MCP tools to the connected client for "
+                "real filesystem access.\n"
             )
 
         # Create queue and result dirs
