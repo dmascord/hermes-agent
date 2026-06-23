@@ -95,54 +95,6 @@ class MiMoCodeClient:
         self._queue_out_dir: str | None = None
 
 
-def _parse_tool_call_xml(text: str) -> dict | None:
-    """Parse mimo CLI's text-formatted tool_call XML.
-
-    The mimo CLI sometimes emits tool_call as raw XML text instead of a
-    structured tool_use event:
-        <tool_call>
-        {"name": "mcp_bash", "arguments": {"command": "..."}}
-        </tool_call>
-    or
-        <tool_call>
-        <function=mcp_bash>
-        <parameter=command>...</parameter>
-        </function>
-        </tool_call>
-    Returns an OpenAI-format tool_call dict or None.
-    """
-    import re
-    if "<tool_call>" not in text:
-        return None
-    # JSON-style tool_call
-    m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
-    if m:
-        try:
-            obj = json.loads(m.group(1))
-            return {
-                "id": f"call_{hashlib.md5(m.group(1).encode()).hexdigest()[:16]}" if 'hashlib' in dir() else f"call_{len(m.group(1))}",
-                "type": "function",
-                "function": {
-                    "name": obj.get("name", "unknown"),
-                    "arguments": json.dumps(obj.get("arguments", {})),
-                },
-            }
-        except (json.JSONDecodeError, KeyError):
-            pass
-    # XML-style tool_call: <function=name><parameter=key>value</parameter></function>
-    m2 = re.search(r"<function=([^>]+)>.*?<parameter=([^>]+)>(.*?)</parameter>.*?</function>", text, re.DOTALL)
-    if m2:
-        import uuid as _uuid
-        name, key, value = m2.group(1), m2.group(2), m2.group(3).strip()
-        return {
-            "id": f"call_{_uuid.uuid4().hex[:16]}",
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": json.dumps({key: value}),
-            },
-        }
-    return None
 
     def _setup_mcp_workspace(self, tools: list[dict[str, Any]]) -> str:
         """Create a temp workspace that forces mimo to use MCP tools only.
@@ -687,3 +639,25 @@ def _parse_tool_call_xml(text: str) -> dict | None:
                     pass
             self._queue_in_path = None
             self._queue_out_dir = None
+
+
+# Module-level helper, moved here so it doesn't break the class body.
+def _parse_tool_call_xml(text: str) -> dict | None:
+    """Parse mimo CLI's text-formatted tool_call XML.
+
+    The mimo CLI sometimes emits tool_call as raw XML text instead of a
+    structured tool_use event:
+        <tool_call>
+        {"name": "mcp_bash", "arguments": {"command": "..."}}
+        </tool_call>
+    or
+        <tool_call>
+        <function=mcp_bash>
+        <parameter=command>...</parameter>
+        </function>
+        </tool_call>
+    Returns an OpenAI-format tool_call dict or None.
+    """
+    import re
+    if "<tool_call>" not in text:
+        return None
