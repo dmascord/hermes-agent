@@ -646,8 +646,8 @@ class MiMoCodeClient:
 def _parse_tool_call_xml(text: str) -> dict | None:
     """Parse mimo CLI's text-formatted tool_call XML.
 
-    The mimo CLI sometimes emits tool_call as raw XML text instead of a
-    structured tool_use event. Three formats observed:
+    The mimo CLI emits tool_call as raw XML text in many different shapes.
+    Five formats observed:
         <tool_call>
         {"name": "mcp_bash", "arguments": {"command": "..."}}
         </tool_call>
@@ -661,13 +661,24 @@ def _parse_tool_call_xml(text: str) -> dict | None:
         <tool_call>
         <tool_name>mcp_bash</tool_name>
         <parameters>
-        <command>head -3 /Users/tusker/...</command>
+        <command>...</command>
         </parameters>
         </tool_call>
+    or (compact):
+        <tool_call>
+        <name>mcp_bash</name>
+        <args>{"command": "..."}</args>
+        </tool_call>
+    or (claude-style):
+        <function_calls>
+        <invoke name="mcp__hermes-tools__bash">
+        <parameter name="command">...</parameter>
+        </invoke>
+        </function_calls>
     Returns an OpenAI-format tool_call dict or None.
     """
     import re
-    if "<tool_call>" not in text:
+    if "<tool_call>" not in text and "<function_calls>" not in text and "<invoke name=" not in text:
         return None
 
     # Format 1: JSON-style tool_call
@@ -723,6 +734,44 @@ def _parse_tool_call_xml(text: str) -> dict | None:
             if key in ("parameters",):
                 continue
             args[key] = am.group(2).strip()
+        return {
+            "id": f"call_{_uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args),
+            },
+        }
+
+    # Format 4: <name>name</name><args>{json}</args>
+    m4 = re.search(r"<name>([^<]+)</name>", text)
+    if m4 and "<args>" in text:
+        import uuid as _uuid
+        name = m4.group(1).strip()
+        args_m = re.search(r"<args>(.*?)</args>", text, re.DOTALL)
+        args_text = args_m.group(1).strip() if args_m else "{}"
+        try:
+            args = json.loads(args_text)
+        except json.JSONDecodeError:
+            args = {"raw": args_text}
+        return {
+            "id": f"call_{_uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args),
+            },
+        }
+
+    # Format 5: <function_calls><invoke name="mcp__X"><parameter name="key">value</parameter></invoke></function_calls>
+    m5 = re.search(r"<invoke\s+name=\"([^\"]+)\">(.*?)</invoke>", text, re.DOTALL)
+    if m5:
+        import uuid as _uuid
+        name = m5.group(1).strip()
+        args_block = m5.group(2)
+        args = {}
+        for am in re.finditer(r"<parameter\s+name=\"([^\"]+)\">(.*?)</parameter>", args_block, re.DOTALL):
+            args[am.group(1)] = am.group(2).strip()
         return {
             "id": f"call_{_uuid.uuid4().hex[:16]}",
             "type": "function",
