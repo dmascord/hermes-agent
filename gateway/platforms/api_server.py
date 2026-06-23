@@ -53,6 +53,12 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+# Module-level timestamp for correlating per-request logs across the
+# many entry points (chat_completions, /pending-tool-calls, /tool_responses).
+# Reset at the start of each request; not used as a true global.
+_REQ_START_TS: dict[str, float] = {}
+_req_start_global = time.monotonic()
+
 try:
     from aiohttp import web
     AIOHTTP_AVAILABLE = True
@@ -6108,6 +6114,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # First 8 hex chars of the completion_id is unique enough to trace
         # a single request through fallback chain, quality scoring, etc.
         _req_id = completion_id.replace("chatcmpl-", "")[:8]
+        _req_start = time.monotonic()
+        logger.info("[TIMING][req=%s] chat_completions START model=%s has_tools=%s session_id=%s",
+                    _req_id, model_name, bool(passthrough_tools), session_id)
         model_name = body.get("model", self._model_name)
         role_cfg = _get_role_alias_config(model_name)
         role_hint = dict(role_cfg.get("hint") or {}) if role_cfg else None
@@ -7333,15 +7342,26 @@ class APIServerAdapter(BasePlatformAdapter):
                                         if session_id:
                                             try:
                                                 from gateway.platforms import tool_call_hub
+                                                _t_register = time.monotonic()
                                                 _pending_call = tool_call_hub.register_call(
                                                     session_id, _call_id, tool_name=_tool_name,
                                                     arguments=_tool_args,
                                                 )
+                                                logger.info(
+                                                    "[TIMING][req=%s][claude-stream] T+%.3fs registered tool_call_hub call_id=%s tool=%s args_keys=%s",
+                                                    _req_id, _t_register - _req_start,
+                                                    _call_id, _tool_name, list(_tool_args.keys()) if isinstance(_tool_args, dict) else [],
+                                                )
                                                 # Run the blocking wait in an executor so the
                                                 # asyncio event loop stays responsive (we're
                                                 # inside an `await _bridge_events.get()` loop).
-                                                def _wait_for_response(_p=_pending_call):
-                                                    _p.event.wait(timeout=300)
+                                                def _wait_for_response(_p=_pending_call, _cid=_call_id, _t0=_t_register, _rid=_req_id):
+                                                    _waited = _p.event.wait(timeout=300)
+                                                    _t_done = time.monotonic()
+                                                    logger.info(
+                                                        "[TIMING][req=%s][claude-stream] T+%.3fs hub.wait returned call_id=%s waited=%.3fs status=%s",
+                                                        _rid, _t_done - _req_start, _cid, _t_done - _t0, _p.status,
+                                                    )
                                                     return _p
                                                 _pending_call = await _s_loop.run_in_executor(None, _wait_for_response)
                                                 if _pending_call.status == "ok":
@@ -7351,8 +7371,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 else:
                                                     _tool_result_payload = {"content": f"[Tool execution timed out — no response from connected client]"}
                                                 logger.info(
-                                                    "[hermes-code] bridge: received tool response for %s status=%s result_len=%d",
-                                                    _call_id, _pending_call.status,
+                                                    "[TIMING][req=%s][claude-stream] T+%.3fs result written call_id=%s status=%s result_len=%d",
+                                                    _req_id, time.monotonic() - _req_start, _call_id, _pending_call.status,
                                                     len(str(_pending_call.result or "")),
                                                 )
                                             except Exception as _hub_exc:
@@ -7564,12 +7584,23 @@ class APIServerAdapter(BasePlatformAdapter):
                                         if session_id:
                                             try:
                                                 from gateway.platforms import tool_call_hub
+                                                _t_register = time.monotonic()
                                                 _pending_call = tool_call_hub.register_call(
                                                     session_id, _call_id, tool_name=_tool_name,
                                                     arguments=_tool_args,
                                                 )
-                                                def _wait_for_response_mc(_p=_pending_call):
-                                                    _p.event.wait(timeout=300)
+                                                logger.info(
+                                                    "[TIMING][req=%s][mimo-stream] T+%.3fs registered tool_call_hub call_id=%s tool=%s args_keys=%s",
+                                                    _req_id, _t_register - _req_start,
+                                                    _call_id, _tool_name, list(_tool_args.keys()) if isinstance(_tool_args, dict) else [],
+                                                )
+                                                def _wait_for_response_mc(_p=_pending_call, _cid=_call_id, _t0=_t_register, _rid=_req_id):
+                                                    _waited = _p.event.wait(timeout=300)
+                                                    _t_done = time.monotonic()
+                                                    logger.info(
+                                                        "[TIMING][req=%s][mimo-stream] T+%.3fs hub.wait returned call_id=%s waited=%.3fs status=%s",
+                                                        _rid, _t_done - _req_start, _cid, _t_done - _t0, _p.status,
+                                                    )
                                                     return _p
                                                 _pending_call = await _s_loop.run_in_executor(None, _wait_for_response_mc)
                                                 if _pending_call.status == "ok":
@@ -7579,8 +7610,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 else:
                                                     _tool_result_payload = {"content": f"[Tool execution timed out — no response from connected client]"}
                                                 logger.info(
-                                                    "[hermes-code] mimocode-cli bridge: received tool response for %s status=%s result_len=%d",
-                                                    _call_id, _pending_call.status,
+                                                    "[TIMING][req=%s][mimo-stream] T+%.3fs result written call_id=%s status=%s result_len=%d",
+                                                    _req_id, time.monotonic() - _req_start, _call_id, _pending_call.status,
                                                     len(str(_pending_call.result or "")),
                                                 )
                                             except Exception as _hub_exc:
@@ -12010,8 +12041,9 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.platforms import tool_call_hub
             tool_call_hub.set_response(session_id, call_id, status, result)
             logger.info(
-                "[api_server] ingested tool response session=%s call_id=%s status=%s",
-                session_id, call_id, status,
+                "[TIMING] T+%.3fs tool_response POST received session=%s call_id=%s status=%s result_len=%d",
+                time.monotonic() - _req_start_global, session_id, call_id, status,
+                len(str(result or "")),
             )
         except Exception as e:
             logger.error("Failed to set tool response: %s", e, exc_info=True)
@@ -12047,7 +12079,10 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.platforms import tool_call_hub
 
         deadline = time.monotonic() + wait_s
+        _poll_start = time.monotonic()
+        _poll_iterations = 0
         while time.monotonic() < deadline:
+            _poll_iterations += 1
             from gateway.platforms.tool_call_hub import _hub as _tool_hub
             with _tool_hub._lock:
                 ses = _tool_hub._pending.get(session_id, {})
@@ -12056,9 +12091,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     for cid, p in list(ses.items())
                 ]
             if pending:
+                logger.info(
+                    "[TIMING] T+%.3fs pending-tool-calls RETURNED session=%s found=%d iters=%d elapsed=%.3fs",
+                    time.monotonic() - _req_start_global, session_id, len(pending), _poll_iterations,
+                    time.monotonic() - _poll_start,
+                )
                 return web.json_response({"tool_calls": pending}, status=200)
             await asyncio.sleep(0.1)
 
+        logger.info(
+            "[TIMING] T+%.3fs pending-tool-calls TIMEOUT session=%s iters=%d waited=%.1fs",
+            time.monotonic() - _req_start_global, session_id, _poll_iterations, wait_s,
+        )
         return web.json_response({"tool_calls": []}, status=200)
 
         return web.json_response({"ok": True}, status=200)
