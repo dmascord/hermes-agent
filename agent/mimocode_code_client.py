@@ -996,4 +996,37 @@ or (claude-style):
             # Recurse into format 6 parser on the inner XML
             return _parse_tool_call_xml(inner)
 
+    # Format 9: <mcp_toolname>content</mcp_toolname> (bare XML tag with tool name)
+    # The model sometimes emits tool calls as bare XML tags where the tag name
+    # IS the tool name and the content is the command/argument.
+    # Examples:
+    #   <mcp_bash>head -3 /path/to/file</mcp_bash>
+    #   <mcp_read>/path/to/file</mcp_read>
+    m9 = re.search(r'<(mcp_[a-zA-Z_][a-zA-Z0-9_]*)>([^<]+)</\1>', text)
+    if m9:
+        name = m9.group(1).strip()
+        content = m9.group(2).strip()
+        # Map the content to the appropriate parameter based on tool name
+        if name.endswith("_bash"):
+            args = {"command": content}
+        elif name.endswith("_read"):
+            args = {"path": content}
+        elif name.endswith("_write"):
+            args = {"path": content, "content": content}
+        elif name.endswith("_edit"):
+            args = {"path": content, "input": content}
+        elif name.endswith("_find"):
+            args = {"paths": [content]}
+        elif name.endswith("_search_tool_bm25"):
+            args = {"query": content}
+        else:
+            args = {"raw": content}
+        return {
+            "id": f"call_{_uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args),
+            },
+        }
     return None
