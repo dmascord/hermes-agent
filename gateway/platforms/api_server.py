@@ -7691,21 +7691,30 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 "tool_call_id": _tc_id,
                                                 "content": _tool_content if isinstance(_tool_content, str) else json.dumps(_tool_content),
                                             })
-                                        # Append a system message that tells the model the
-                                        # work is done — without this the model loops on
-                                        # the same tool call instead of producing a final
-                                        # answer. The mimo CLI doesn't have a native
-                                        # "force final answer" signal, so we use a system
-                                        # message that overrides its default tool-call
-                                        # behavior.
+                                        # Append a USER message asking the model to
+                                        # produce the final answer based on the tool result.
+                                        # This follows the canonical OpenAI Chat Completions
+                                        # message order:
+                                        #   user → assistant(tool_calls) → tool → user(final ask) → assistant(content)
+                                        # mimo's internal prompt dominates system-role messages,
+                                        # but a user-role turn naturally signals "your turn
+                                        # to answer" — the model is trained on this pattern.
+                                        _tool_summary = _tool_result_payload.get("content", "")
+                                        if not isinstance(_tool_summary, str):
+                                            _tool_summary = json.dumps(_tool_summary)
+                                        # Truncate to avoid blowing context window
+                                        _tool_summary_short = (
+                                            _tool_summary[:4000] + "\n... [truncated]"
+                                            if len(_tool_summary) > 4000
+                                            else _tool_summary
+                                        )
                                         _ext_messages.append({
-                                            "role": "system",
+                                            "role": "user",
                                             "content": (
-                                                "The tool above has ALREADY been executed and "
-                                                "the result is in the previous tool message. "
-                                                "Use that result to answer the user's original "
-                                                "question directly in plain text. Do NOT call "
-                                                "any more tools. Respond with a final answer now."
+                                                f"The tool returned:\n\n```\n{_tool_summary_short}\n```\n\n"
+                                                "Based on this result, please answer my "
+                                                "original question directly in plain text. "
+                                                "Do not call any more tools."
                                             ),
                                         })
                                         # Start new mimo session with extended conversation
