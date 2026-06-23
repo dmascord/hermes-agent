@@ -7691,14 +7691,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 "tool_call_id": _tc_id,
                                                 "content": _tool_content if isinstance(_tool_content, str) else json.dumps(_tool_content),
                                             })
-                                        # Append a USER message asking the model to
-                                        # produce the final answer based on the tool result.
-                                        # This follows the canonical OpenAI Chat Completions
-                                        # message order:
-                                        #   user → assistant(tool_calls) → tool → user(final ask) → assistant(content)
-                                        # mimo's internal prompt dominates system-role messages,
-                                        # but a user-role turn naturally signals "your turn
-                                        # to answer" — the model is trained on this pattern.
+                                        # mimo's _build_prompt() only takes the LAST user
+                                        # message and ignores prior assistant/tool messages.
+                                        # So we must include the original user message +
+                                        # the tool result IN the new user message so mimo
+                                        # actually sees both pieces of context.
                                         _tool_summary = _tool_result_payload.get("content", "")
                                         if not isinstance(_tool_summary, str):
                                             _tool_summary = json.dumps(_tool_summary)
@@ -7708,12 +7705,28 @@ class APIServerAdapter(BasePlatformAdapter):
                                             if len(_tool_summary) > 4000
                                             else _tool_summary
                                         )
+                                        # Find the original user prompt (last user/developer
+                                        # message in the original messages)
+                                        _original_user_msg = ""
+                                        for _orig_msg in reversed(passthrough_messages):
+                                            if _orig_msg.get("role") in ("user", "developer"):
+                                                _c = _orig_msg.get("content", "")
+                                                if isinstance(_c, str):
+                                                    _original_user_msg = _c
+                                                elif isinstance(_c, list):
+                                                    _original_user_msg = " ".join(
+                                                        p.get("text", "") for p in _c
+                                                        if isinstance(p, dict) and p.get("type") == "text"
+                                                    )
+                                                break
                                         _ext_messages.append({
                                             "role": "user",
                                             "content": (
+                                                f"Original request:\n\n{_original_user_msg}\n\n"
+                                                f"---\n\n"
                                                 f"The tool returned:\n\n```\n{_tool_summary_short}\n```\n\n"
                                                 "Based on this result, please answer my "
-                                                "original question directly in plain text. "
+                                                "original request directly in plain text. "
                                                 "Do not call any more tools."
                                             ),
                                         })
