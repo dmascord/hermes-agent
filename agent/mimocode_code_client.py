@@ -131,19 +131,24 @@ class MiMoCodeClient:
         with open(os.path.join(mimocode_dir, "mimocode.json"), "w") as f:
             json.dump(mimocode_config, f)
 
-        # Build tool schemas with mcp_ prefix names for the bridge
+        # Build tool schemas (gateway already added mcp_ prefix, so just record names)
         tool_schemas = []
         mcp_tool_names = []
         for tool in tools:
             if tool.get("type") == "function":
                 func = tool.get("function", {})
-                original_name = func.get("name", "")
+                tool_name = func.get("name", "")
                 tool_schemas.append({
-                    "name": original_name,
+                    "name": tool_name,
                     "description": func.get("description", ""),
                     "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
                 })
-                mcp_tool_names.append(f"mcp_{original_name}")
+                # The gateway has already prefixed the tool name with mcp_ for
+                # mimocode-cli. The agent.md allowlist should use the SAME
+                # prefixed name (NOT add another mcp_ on top — that would
+                # produce mcp_mcp_bash and the model would call a tool that
+                # doesn't exist).
+                mcp_tool_names.append(tool_name)
 
         with open(os.path.join(workspace, "tools.json"), "w") as f:
             json.dump(tool_schemas, f)
