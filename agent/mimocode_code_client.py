@@ -642,6 +642,32 @@ class MiMoCodeClient:
         stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
         stderr_thread.start()
 
+        # Character-level StreamSieve to catch tool calls that span multiple
+        # SSE JSON lines. Without this, a long <tool_call>...</tool_call> that the
+        # mimo CLI emits across two `proc.stdout.readline()` boundaries is
+        # missed because each half fails the regex match in
+        # _parse_tool_call_xml. The sieve buffers text internally and yields
+        # (text, tool_call) events as soon as a complete block is detected.
+        # We initialise it lazily on the first text event (need the tool_names
+        # at that point; we read them from any tool_use event's part if seen).
+        _sieve: _StreamSieve | None = None
+        _known_tool_names: list[str] = []
+        # Pre-populate tool_names from the tools list (best-effort, may be empty)
+        if tools:
+            for t in tools:
+                fn = t.get("function", {}) if isinstance(t, dict) else {}
+                n = fn.get("name") if isinstance(fn, dict) else None
+                if not n and isinstance(t, dict):
+                    n = t.get("name")
+                if n:
+                    _known_tool_names.append(n)
+
+        def _sieve_parse(buf: str, names: list[str]) -> tuple[list[dict] | None, str]:
+            tc = _parse_tool_call_xml(buf, names)
+            if tc:
+                return [tc], _clean_tool_text(buf)
+            return None, buf
+
         try:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
@@ -661,32 +687,38 @@ class MiMoCodeClient:
 
                 if etype == "text":
                     text_payload = part.get("text", "")
-                    # Parse XML tool_call embedded in text (mimo sometimes emits
-                    # tool_call as raw XML instead of a structured tool_use event)
-                    _xml_tc = _parse_tool_call_xml(text_payload)
-                    if _xml_tc:
-                        # _parse_tool_call_xml returns OpenAI function format:
-                        #   {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
-                        # Convert to our custom tool_call format that the gateway
-                        # dispatch expects:
-                        #   {"type": "tool_call", "call_id": "...", "name": "...", "arguments": {...}}
-                        _func = _xml_tc.get("function", {})
-                        _raw_args = _func.get("arguments", "{}")
-                        if isinstance(_raw_args, str):
-                            try:
-                                _parsed_args = json.loads(_raw_args)
-                            except json.JSONDecodeError:
-                                _parsed_args = {"raw": _raw_args}
-                        else:
-                            _parsed_args = _raw_args
-                        yield {
-                            "type": "tool_call",
-                            "call_id": _xml_tc.get("id", uuid.uuid4().hex),
-                            "name": _func.get("name", "unknown"),
-                            "arguments": _parsed_args if isinstance(_parsed_args, dict) else {},
-                        }
-                    else:
-                        yield {"type": "text", "text": text_payload}
+                    if not text_payload:
+                        continue
+                    # Lazy-init the sieve on first text event so we have
+                    # tool_names for name resolution.
+                    if _sieve is None:
+                        _sieve = _StreamSieve(_sieve_parse, _known_tool_names)
+                    # Feed the text through the sieve; the sieve catches
+                    # tool calls that span multiple text events.
+                    for kind, data in _sieve.feed(text_payload):
+                        if kind == "text":
+                            # Clean up any tool-call residue (e.g. partial
+                            # TOOL_CALL: lines that the sieve flushed)
+                            yield {"type": "text", "text": _clean_tool_text(data)}
+                        elif kind == "tool_call":
+                            for tc in data:
+                                _func = tc.get("function", {})
+                                _raw_args = _func.get("arguments", "{}")
+                                if isinstance(_raw_args, str):
+                                    try:
+                                        _parsed_args = json.loads(_raw_args)
+                                    except json.JSONDecodeError:
+                                        _parsed_args = {"raw": _raw_args}
+                                else:
+                                    _parsed_args = _raw_args
+                                yield {
+                                    "type": "tool_call",
+                                    "call_id": tc.get("id", uuid.uuid4().hex),
+                                    "name": _func.get("name", "unknown"),
+                                    "arguments": _parsed_args
+                                    if isinstance(_parsed_args, dict)
+                                    else {},
+                                }
                 elif etype == "tool_use":
                     call_id = part.get("callID", uuid.uuid4().hex)
                     tool_name = part.get("tool", "unknown")
@@ -708,6 +740,32 @@ class MiMoCodeClient:
                             "total_tokens": tokens.get("total", 0),
                         },
                     }
+
+            # Flush any buffered text/tool_call from the sieve
+            if _sieve is not None:
+                for kind, data in _sieve.flush():
+                    if kind == "text":
+                        if data:
+                            yield {"type": "text", "text": _clean_tool_text(data)}
+                    elif kind == "tool_call":
+                        for tc in data:
+                            _func = tc.get("function", {})
+                            _raw_args = _func.get("arguments", "{}")
+                            if isinstance(_raw_args, str):
+                                try:
+                                    _parsed_args = json.loads(_raw_args)
+                                except json.JSONDecodeError:
+                                    _parsed_args = {"raw": _raw_args}
+                            else:
+                                _parsed_args = _raw_args
+                            yield {
+                                "type": "tool_call",
+                                "call_id": tc.get("id", uuid.uuid4().hex),
+                                "name": _func.get("name", "unknown"),
+                                "arguments": _parsed_args
+                                if isinstance(_parsed_args, dict)
+                                else {},
+                            }
 
             # After events: check timeout
             if time.monotonic() >= deadline:
@@ -749,12 +807,511 @@ class MiMoCodeClient:
                     pass
 
 
-# Module-level helper, moved here so it doesn't break the class body.
-def _parse_tool_call_xml(text: str) -> dict | None:
+# Module-level helpers, moved here so they don't break the class body.
+# These were adopted from Fly143/MiMo2API (MIT licensed) to handle additional
+# tool call formats the mimo CLI has been observed to emit, plus general
+# noise tolerance and markdown-fence skipping. Algorithms adapted, not copied.
+
+
+def _find_balanced_json(text: str, start: int) -> str:
+    """Find balanced JSON object starting at `start`.
+
+    Tracks brace depth with string-aware escape handling. Returns the
+    substring (including the surrounding braces) or empty string if no
+    balanced object exists.
+
+    Used by Format 10 and 11 to extract JSON payloads that may contain
+    nested objects/arrays (e.g. arguments with nested structure).
+    """
+    if start >= len(text) or text[start] != "{":
+        return ""
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if esc:
+            esc = False
+            continue
+        if c == "\\" and in_str:
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return ""
+
+
+def _auto_type(val: str) -> Any:
+    """Auto-detect type: bool, int, float, list, dict, or string.
+
+    Used after XML parameter extraction to coerce values to the type
+    the tool schema expects. Recognises:
+      - booleans: true / false (case-insensitive)
+      - null: null / none
+      - integers and floats
+      - JSON arrays and objects: [1, 2] / {"k": "v"}
+    """
+    if not isinstance(val, str):
+        return val
+    s = val.strip()
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    if s.lower() in ("null", "none"):
+        return None
+    # JSON array or object
+    if s.startswith(("[", "{")):
+        try:
+            parsed = json.loads(s)
+            return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return val
+
+
+def _resolve_tool_name(name: str, tool_names: list[str] | None) -> str | None:
+    """Resolve tool name with 4-level matching.
+
+    1. Exact match
+    2. Case-insensitive match
+    3. camelCase -> snake_case match
+    4. snake_case case-insensitive match
+
+    Returns the canonical name from `tool_names` or None if not found.
+    `tool_names` may be None (in which case `name` is returned as-is).
+    """
+    if not name:
+        return None
+    if not tool_names:
+        return name
+    if name in tool_names:
+        return name
+    name_lower = name.lower()
+    for tn in tool_names:
+        if tn.lower() == name_lower:
+            return tn
+    # camelCase -> snake_case
+    import re as _re_r
+    snake = _re_r.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
+    if snake in tool_names:
+        return snake
+    for tn in tool_names:
+        if tn.lower() == snake:
+            return tn
+    return None
+
+
+def _skip_fenced_block(text: str, i: int) -> tuple[int, str | None]:
+    """Skip markdown code blocks (``` and ~~~) starting at position i.
+
+    Returns (new_position, skipped_text or None).
+    If the position is at a fence opener, returns the position past the
+    matching fence close (or end of text) and the skipped text.
+    Otherwise returns (i, None).
+    """
+    n = len(text)
+    if i >= n:
+        return i, None
+    char = text[i]
+    if char not in ("`", "~"):
+        return i, None
+    # Count fence length
+    fence_len = 0
+    while i + fence_len < n and text[i + fence_len] == char:
+        fence_len += 1
+    if fence_len < 3:
+        return i, None
+    # Find matching close
+    j = i + fence_len
+    nl = text.find("\n", j)
+    if nl < 0:
+        return i, None
+    j = nl + 1
+    while j < n:
+        nl2 = text.find("\n", j)
+        if nl2 < 0:
+            return n, text[i:n]
+        line_start = nl2 + 1
+        close_len = 0
+        while (
+            line_start + close_len < n
+            and text[line_start + close_len] == char
+        ):
+            close_len += 1
+        if close_len >= fence_len:
+            end = line_start + fence_len
+            if end < n and text[end] == "\n":
+                end += 1
+            return end, text[i:end]
+        j = line_start + 1
+    return n, text[i:n]
+
+
+def _strip_mimoml(text: str) -> str:
+    """Strip MiMoML noise from tool call tags, return normalised XML.
+
+    Handles 8+ variants observed in mimo's native MiMoML format:
+      <|MiMoML|tool_calls>     <tool_calls>
+      <MiMoML|tool_calls>      <tool_calls>     (missing leading |)
+      <|MiMoML tool_calls>     <tool_calls>     (space instead of |)
+      <｜MiMoML｜tool_calls>    <tool_calls>     (full-width pipes ｜)
+      <MiMoMLtool_calls>       <tool_calls>     (no separator)
+      <mimoml-tool_calls>      <tool_calls>     (hyphen)
+      <mimoml_tool_calls>      <tool_calls>     (underscore)
+      <|MiMoML|function_calls> <function_calls> (function_calls variant)
+
+    Skips content inside ``` and ~~~ markdown fences (those are
+    documentation examples, not actual tool calls).
+    """
+    if not text:
+        return text
+    result = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Markdown fence? skip the whole block
+        new_i, skipped = _skip_fenced_block(text, i)
+        if skipped is not None:
+            result.append(skipped)
+            i = new_i
+            continue
+        c = text[i]
+        if c != "<":
+            result.append(c)
+            i += 1
+            continue
+        # Find end of tag
+        end = text.find(">", i)
+        if end == -1:
+            result.append(text[i:])
+            break
+        inner = text[i + 1 : end]
+        closing = inner.startswith("/")
+        rest = inner[1:] if closing else inner
+        # Consume MiMoML noise
+        j = 0
+        is_mimoml = False
+        rest_len = len(rest)
+        while j < rest_len:
+            ch = rest[j]
+            if ch in "| ｜\t\r\n ":
+                j += 1
+                is_mimoml = True
+                continue
+            if (
+                rest[j : j + 6].lower() == "mimoml"
+                or rest[j : j + 4].lower() == "dsml"
+            ):
+                kw_len = 4 if rest[j : j + 4].lower() == "dsml" else 6
+                j += kw_len
+                is_mimoml = True
+                if j < rest_len and rest[j] in ("-", "_"):
+                    j += 1
+                continue
+            break
+        if is_mimoml:
+            # Match canonical tag name
+            name_end = j
+            while name_end < rest_len and (
+                rest[name_end].isalnum() or rest[name_end] == "_"
+            ):
+                name_end += 1
+            tag = rest[j:name_end].lower()
+            if tag in ("tool_calls", "function_calls", "invoke", "parameter"):
+                # Preserve any attributes (e.g. name="X") and skip the
+                # trailing | or ｜ after the closing >
+                attrs = rest[name_end:]
+                # Strip a leading |, |, or ｜ from attrs (e.g. |name="x")
+                if attrs and attrs[0] in ("|", "｜"):
+                    attrs = attrs[1:]
+                prefix = "</" if closing else "<"
+                result.append(prefix + tag + attrs + ">")
+                k = end + 1
+                if k < n and text[k] in ("|", "｜"):
+                    k += 1
+                i = k
+                continue
+        result.append(text[i : end + 1])
+        i = end + 1
+    return "".join(result)
+
+
+def _clean_tool_text(text: str) -> str:
+    """Strip tool call residue from text after extraction.
+
+    Removes leftover:
+      - TOOL_CALL: name(...) lines
+      - <|MiMoML|*> tags
+      - <tool_call>...</tool_call>
+      - <function=...>...</function>
+      - <parameter=...>...</parameter>
+      - <tool_invocation .../> self-closing tags
+      - Empty ```code fences```
+      - Excess blank lines
+    """
+    if not text:
+        return text
+    import re as _re_c
+    text = _re_c.sub(r"TOOL_CALL:\s*\w+\s*\([^)]*(?:\([^)]*\)[^)]*)*\)", "", text, flags=_re_c.IGNORECASE)
+    text = _re_c.sub(r"TOOL_CALL:.*$", "", text, flags=_re_c.MULTILINE | _re_c.IGNORECASE)
+    text = _re_c.sub(r"</?\|?MiMoML\|?[^>]*>", "", text)
+    text = _re_c.sub(r"<tool_calls?>.*?</tool_calls?>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<(?:\|?MiMoML\|?)?invoke[^>]*>.*?</(?:\|?MiMoML\|?)?invoke>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<(?:\|?MiMoML\|?)?parameter[^>]*>.*?</(?:\|?MiMoML\|?)?parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<tool_call>.*?</tool_call>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<function=\w+>.*?</function>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<parameter=\w+>.*?</parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<tool_invocation[^>]*/>", "", text)
+    text = _re_c.sub(r"```\w*\s*\n?\s*```", "", text)
+    text = _re_c.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+class _StreamSieve:
+    """Character-level sieve that separates text from tool call blocks.
+
+    Used to catch tool calls that span multiple SSE JSON lines (e.g. when
+    mimo CLI emits a long tool_call XML that the readline() boundary
+    splits mid-tag). Adapted from Fly143/MiMo2API's StreamSieve.
+
+    Modes:
+        feed(chunk)  -> list of (kind, data) events
+                        kind = "text" | "tool_call"
+        flush()      -> emit any remaining buffered text/tool_call
+    """
+
+    _TOOL_STARTS = (
+        "TOOL_CALL:",
+        "<tool_call>",
+        "<function_call",
+        "<function=",
+        "[调用工具:",
+        "<|MiMoML|tool_calls>",
+        "<｜MiMoML｜tool_calls>",
+        "<|MiMoML|function_calls>",
+        "<｜MiMoML｜function_calls>",
+        "<tool_calls>",
+        "<function_calls>",
+        "<tool_invocation",
+    )
+
+    def __init__(self, parse_fn, tool_names: list[str] | None = None):
+        self._parse_fn = parse_fn
+        self._tool_names = tool_names or []
+        self._buf = ""
+        self._capturing = False
+        self._capture_buf = ""
+
+    def feed(self, chunk: str) -> list[tuple[str, Any]]:
+        events: list[tuple[str, Any]] = []
+        if self._capturing:
+            self._capture_buf += chunk
+            result = self._try_finish()
+            if result is not None:
+                prefix, tool_calls, suffix = result
+                if prefix:
+                    events.append(("text", prefix))
+                if tool_calls:
+                    events.append(("tool_call", tool_calls))
+                if suffix:
+                    self._buf = suffix
+                self._capturing = False
+                self._capture_buf = ""
+            return events
+        self._buf += chunk
+        start = self._find_tool_start(self._buf)
+        if start >= 0:
+            prefix = self._buf[:start]
+            rest = self._buf[start:]
+            self._buf = ""
+            if prefix:
+                events.append(("text", prefix))
+            self._capture_buf = rest
+            self._capturing = True
+            result = self._try_finish()
+            if result is not None:
+                pre, tcs, suf = result
+                if pre:
+                    events.append(("text", pre))
+                if tcs:
+                    events.append(("tool_call", tcs))
+                if suf:
+                    self._buf = suf
+                self._capturing = False
+                self._capture_buf = ""
+        else:
+            safe, hold = self._split_safe(self._buf)
+            if safe:
+                events.append(("text", safe))
+            self._buf = hold
+        return events
+
+    def flush(self) -> list[tuple[str, Any]]:
+        events: list[tuple[str, Any]] = []
+        if self._capturing:
+            result = self._try_finish()
+            if result is not None:
+                pre, tcs, suf = result
+                if pre:
+                    events.append(("text", pre))
+                if tcs:
+                    events.append(("tool_call", tcs))
+                if suf:
+                    events.append(("text", suf))
+            else:
+                if self._capture_buf:
+                    events.append(("text", self._capture_buf))
+            self._capturing = False
+            self._capture_buf = ""
+        if self._buf:
+            events.append(("text", self._buf))
+            self._buf = ""
+        return events
+
+    def _find_tool_start(self, text: str) -> int:
+        idx = -1
+        # Skip content inside markdown fences
+        i = 0
+        n = len(text)
+        while i < n:
+            new_i, _ = _skip_fenced_block(text, i)
+            if new_i != i:
+                # Fence skipped; look only in non-fence portions
+                # But for tool call detection, fences should block all
+                # detection in their range, so we mask them out.
+                # For simplicity, just check the first non-fence portion.
+                break
+            i += 1
+        # Simple approach: find earliest tool start not inside a fence
+        best = -1
+        for tag in self._TOOL_STARTS:
+            pos = text.find(tag)
+            if pos >= 0 and (best < 0 or pos < best):
+                # Check if inside a fence
+                inside_fence = False
+                j = 0
+                while j < pos:
+                    new_j, _ = _skip_fenced_block(text, j)
+                    if new_j == j:
+                        j += 1
+                        continue
+                    if new_j > pos:
+                        inside_fence = True
+                        break
+                    j = new_j
+                if not inside_fence:
+                    best = pos
+        return best
+
+    def _split_safe(self, text: str) -> tuple[str, str]:
+        """Release safe text, hold suspicious trailing chars."""
+        # Check last 20 chars for partial tool start
+        for i in range(len(text) - 1, max(len(text) - 25, -1), -1):
+            tail = text[i:]
+            for tag in self._TOOL_STARTS:
+                if tag.startswith(tail) and len(tail) >= 1:
+                    return text[:i], tail
+        return text, ""
+
+    def _try_finish(self) -> tuple[str, list[dict] | None, str] | None:
+        if not self._capture_buf:
+            return None
+        if not self._is_capture_complete():
+            return None
+        result = self._parse_fn(self._capture_buf, self._tool_names)
+        if result is None:
+            return None
+        if isinstance(result, tuple) and len(result) == 2:
+            tool_calls, cleaned = result
+        elif isinstance(result, list):
+            tool_calls, cleaned = result, ""
+        else:
+            return None
+        prefix, suffix = self._extract_non_tool_parts(self._capture_buf)
+        if tool_calls:
+            return (prefix, tool_calls, suffix)
+        return (cleaned or self._capture_buf, None, "")
+
+    def _is_capture_complete(self) -> bool:
+        buf = self._capture_buf
+        if buf.lstrip().upper().startswith("TOOL_CALL:"):
+            return ")" in buf or "\n" in buf
+        if "[调用工具:" in buf:
+            return "\n" in buf or "]" in buf
+        if buf.lstrip().startswith("<"):
+            # Must have an opening fence closer, or markdown close
+            if "<tool_invocation" in buf and "/>" in buf:
+                return True
+            if "<tool_call" in buf and "</tool_call>" in buf:
+                return True
+            if "<function_call" in buf and "</function_call>" in buf:
+                return True
+            if "<tool_calls>" in buf and "</tool_calls>" in buf:
+                return True
+            if "<|MiMoML|tool_calls>" in buf and "</|MiMoML|tool_calls>" in buf:
+                return True
+            if "<function=" in buf and "</function>" in buf:
+                return True
+            return False
+        return False
+
+    def _extract_non_tool_parts(self, text: str) -> tuple[str, str]:
+        start = -1
+        for tag in self._TOOL_STARTS:
+            pos = text.find(tag)
+            if pos >= 0 and (start < 0 or pos < start):
+                start = pos
+        if start < 0:
+            return text, ""
+        prefix = text[:start]
+        rest = text[start:]
+        end = -1
+        if rest.lstrip().upper().startswith("TOOL_CALL:"):
+            nl = rest.find("\n")
+            if nl >= 0:
+                end = start + nl + 1
+        elif "[调用工具:" in rest:
+            end = start + rest.find("]") + 1
+        elif "<tool_call" in rest:
+            end = start + rest.find("</tool_call>") + len("</tool_call>")
+        elif "<function=" in rest:
+            end = start + rest.find("</function>") + len("</function>")
+        elif "<function_call" in rest:
+            end = start + rest.find("</function_call>") + len("</function_call>")
+        elif "<tool_calls>" in rest:
+            end = start + rest.find("</tool_calls>") + len("</tool_calls>")
+        elif "<|MiMoML|tool_calls>" in rest:
+            end = start + rest.find("</|MiMoML|tool_calls>") + len("</|MiMoML|tool_calls>")
+        elif "<tool_invocation" in rest:
+            end = start + rest.find("/>") + 2
+        if end < 0:
+            return prefix, ""
+        return prefix, text[end:]
+
+
+def _parse_tool_call_xml(text: str, tool_names: list[str] | None = None) -> dict | None:
     """Parse mimo CLI's text-formatted tool_call XML.
 
     The mimo CLI emits tool_call as raw XML text in many different shapes.
-    Five formats observed:
+    Twelve formats observed:
         <tool_call>
         {"name": "mcp_bash", "arguments": {"command": "..."}}
         </tool_call>
@@ -796,8 +1353,13 @@ or (claude-style):
         and "<mcp_" not in text
         and '"command"' not in text
         and '"name"' not in text
+        and "TOOL_CALL:" not in text
+        and "MiMoML" not in text
+        and "mimoml" not in text
+        and "<function=" not in text
     ):
         return None
+
 
     # Format 1: JSON-style tool_call
     m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
@@ -810,11 +1372,14 @@ or (claude-style):
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {"raw": args}
+            resolved = _resolve_tool_name(
+                obj.get("name", "unknown"), tool_names
+            ) or obj.get("name", "unknown")
             return {
                 "id": f"call_{hashlib.md5(m.group(1).encode()).hexdigest()[:16]}",
                 "type": "function",
                 "function": {
-                    "name": obj.get("name", "unknown"),
+                    "name": resolved,
                     "arguments": json.dumps(args),
                 },
             }
@@ -1054,36 +1619,235 @@ or (claude-style):
                     }
             except (json.JSONDecodeError, KeyError):
                 pass
-        # Try {"name": "...", "arguments": {...}} pattern
-        m10b = re.search(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{', text)
+        # Try {"name": "...", "arguments": {...}} pattern using balanced-brace
+        # scanner so we handle nested objects/arrays (depth-aware).
+        m10b = re.search(
+            r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{', text
+        )
         if m10b:
-            # Find the matching closing brace
             start = m10b.start()
-            depth = 0
-            for end in range(start, len(text)):
-                if text[end] == '{':
+            js = _find_balanced_json(text, start)
+            if js:
+                try:
+                    obj = json.loads(js)
+                    if (
+                        isinstance(obj, dict)
+                        and "name" in obj
+                        and "arguments" in obj
+                    ):
+                        args = obj.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError:
+                                args = {"raw": args}
+                        # Apply tool name resolution
+                        resolved = _resolve_tool_name(
+                            obj.get("name", "unknown"), tool_names
+                        ) or obj.get("name", "unknown")
+                        return {
+                            "id": f"call_{_uuid.uuid4().hex[:16]}",
+                            "type": "function",
+                            "function": {
+                                "name": resolved,
+                                "arguments": json.dumps(
+                                    args if isinstance(args, dict) else {"raw": str(args)}
+                                ),
+                            },
+                        }
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+    # Format 11: TOOL_CALL: name(args) plain-text format
+    # Older mimo CLI versions (and some prompts) emit tool calls as:
+    #   TOOL_CALL: mcp_bash(command="ls -la")
+    # or with python-style args:
+    #   TOOL_CALL: mcp_read(path="/etc/hostname")
+    # Uses depth-aware parenthesis matching to handle nested calls/quotes.
+    if "TOOL_CALL:" in text:
+        m11 = re.search(
+            r"(?:^|\n)\s*TOOL_CALL:\s*(\w+)\s*\(", text
+        )
+        if m11:
+            fname = m11.group(1)
+            paren_start = m11.end() - 1
+            depth = 1
+            in_str = False
+            esc = False
+            end_paren = -1
+            for k in range(paren_start + 1, len(text)):
+                c = text[k]
+                if esc:
+                    esc = False
+                    continue
+                if c == "\\" and in_str:
+                    esc = True
+                    continue
+                if c == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if c == "(":
                     depth += 1
-                elif text[end] == '}':
+                elif c == ")":
                     depth -= 1
                     if depth == 0:
-                        try:
-                            obj = json.loads(text[start:end+1])
-                            if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
-                                args = obj.get("arguments", {})
-                                if isinstance(args, str):
-                                    try:
-                                        args = json.loads(args)
-                                    except json.JSONDecodeError:
-                                        args = {"raw": args}
-                                return {
-                                    "id": f"call_{_uuid.uuid4().hex[:16]}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": obj.get("name", "unknown"),
-                                        "arguments": json.dumps(args if isinstance(args, dict) else {"raw": str(args)}),
-                                    },
-                                }
-                        except (json.JSONDecodeError, ValueError):
-                            pass
+                        end_paren = k
                         break
+            if end_paren > 0:
+                args_raw = text[paren_start + 1 : end_paren]
+                # Parse python-style kwargs: key="value", key2=123
+                args = _parse_python_kwargs(args_raw)
+                resolved = _resolve_tool_name(fname, tool_names) or fname
+                return {
+                    "id": f"call_{_uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": resolved,
+                        "arguments": json.dumps(args),
+                    },
+                }
+
+    # Format 12: MiMoML native format (with noise tolerance)
+    # <|MiMoML|tool_calls>
+    #   <|MiMoML|invoke name="X">
+    #     <|MiMoML|parameter name="Y"><![CDATA[V]]></|MiMoML|parameter>
+    #   </|MiMoML|invoke>
+    # </|MiMoML|tool_calls>
+    if "MiMoML" in text or "mimoml" in text:
+        normalised = _strip_mimoml(text)
+        # Now look for normalised <tool_calls><invoke name="X">...</invoke></tool_calls>
+        m12 = re.search(
+            r"<tool_calls>(.*?)</tool_calls>", normalised, re.DOTALL | re.IGNORECASE
+        )
+        if m12:
+            inner = m12.group(1)
+            m12i = re.search(
+                r'<invoke\s+name=["\']([^"\']+)["\']>(.*?)</invoke>',
+                inner,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if m12i:
+                fname = m12i.group(1).strip()
+                args = _parse_mimoml_params(m12i.group(2))
+                resolved = _resolve_tool_name(fname, tool_names) or fname
+                return {
+                    "id": f"call_{_uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": resolved,
+                        "arguments": json.dumps(args),
+                    },
+                }
     return None
+
+
+def _parse_python_kwargs(raw: str) -> dict[str, Any]:
+    """Parse python-style kwargs: key1="v1", key2=123, key3=True.
+
+    Handles balanced parentheses/brackets/braces within values.
+    """
+    if not raw:
+        return {}
+    raw = raw.strip()
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    args: dict[str, Any] = {}
+    parts = _smart_split_args(raw, ",")
+    for part in parts:
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        # Strip surrounding quotes
+        if (v.startswith('"') and v.endswith('"')) or (
+            v.startswith("'") and v.endswith("'")
+        ):
+            v = v[1:-1]
+        args[k] = _auto_type(v)
+    return args
+
+
+def _smart_split_args(text: str, sep: str) -> list[str]:
+    """Split `text` by `sep` respecting parens/brackets/braces and quotes."""
+    parts: list[str] = []
+    current: list[str] = []
+    dp = db = dbr = 0
+    in_str = False
+    quote_char = ""
+    esc = False
+    for ch in text:
+        if esc:
+            current.append(ch)
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            current.append(ch)
+            esc = True
+            continue
+        if in_str:
+            current.append(ch)
+            if ch == quote_char:
+                in_str = False
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            quote_char = ch
+            current.append(ch)
+            continue
+        if ch == "(":
+            dp += 1
+        elif ch == ")":
+            dp -= 1
+        elif ch == "[":
+            db += 1
+        elif ch == "]":
+            db -= 1
+        elif ch == "{":
+            dbr += 1
+        elif ch == "}":
+            dbr -= 1
+        elif ch == sep and dp == 0 and db == 0 and dbr == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def _parse_mimoml_params(inner: str) -> dict[str, Any]:
+    """Parse MiMoML <parameter name="X">VALUE</parameter> children into dict.
+
+    Extracts CDATA, auto-types booleans/numbers, and merges duplicate keys
+    into lists.
+    """
+    import re as _re_p
+    args: dict[str, Any] = {}
+    for m in _re_p.finditer(
+        r'<parameter\s+name=["\']([^"\']+)["\']>(.*?)</parameter>',
+        inner,
+        _re_p.DOTALL | _re_p.IGNORECASE,
+    ):
+        key = m.group(1).strip()
+        raw = m.group(2).strip()
+        # Strip CDATA wrapper if present
+        if raw.startswith("<![CDATA[") and raw.endswith("]]>"):
+            raw = raw[len("<![CDATA[") : -len("]]>")]
+        val: Any = _auto_type(raw)
+        if key in args:
+            existing = args[key]
+            if isinstance(existing, list):
+                existing.append(val)
+            else:
+                args[key] = [existing, val]
+        else:
+            args[key] = val
+    return args
