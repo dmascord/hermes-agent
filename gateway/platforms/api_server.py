@@ -7638,6 +7638,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                         if _mc_client._queue_out_dir:
                                             _result_path = os.path.join(_mc_client._queue_out_dir, f"{_call_id}.json")
                                             try:
+                                                # Make sure the result dir still exists
+                                                # (it may have been cleaned up between
+                                                # mimo subprocess exit and bridge write).
+                                                os.makedirs(_mc_client._queue_out_dir, exist_ok=True)
                                                 with open(_result_path, "w") as _rf:
                                                     json.dump(_tool_result_payload, _rf)
                                                 logger.info("[hermes-code] mimocode-cli bridge: wrote real result for %s (%d bytes)", _call_id, len(json.dumps(_tool_result_payload)))
@@ -7823,6 +7827,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 # message as the response text so downstream exhaustion/error checks catch it.
                                 if _bridge_error_msg and not _bridge_final_text and not _bridge_tool_calls:
                                     _bridge_final_text = _bridge_error_msg
+                                logger.info("[TIMING][req=%s][mimo-stream] T+%.3fs bridge loop exit — building SSE response chunks=%d text_len=%d tool_calls=%d",
+                                    _req_id, time.monotonic() - _req_start, len(_bridge_sse_chunks), len(_bridge_final_text), len(_bridge_tool_calls))
                                 _bridge_finish_chunk = {
                                     "id": _bridge_completion_id, "object": "chat.completion.chunk",
                                     "created": int(time.time()), "model": _bridge_model,
@@ -7846,7 +7852,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 await response.write(f"data: {json.dumps(_bridge_finish_chunk)}\n\n".encode())
                                 await response.write(b"data: [DONE]\n\n")
                                 await response.write_eof()
-                                logger.info("[hermes-code][req=%s] mimocode-cli completed: text_len=%d tool_calls=%d", _req_id, len(_bridge_final_text), len(_bridge_tool_calls))
+                                logger.info("[TIMING][req=%s][mimo-stream] T+%.3fs mimocode-cli completed: text_len=%d tool_calls=%d — RETURNING response",
+                                    _req_id, time.monotonic() - _req_start, len(_bridge_final_text), len(_bridge_tool_calls))
                                 try:
                                     from agent.model_cooldown_db import mark_provider_success
                                     mark_provider_success(prov, resolved_model, base_url=base_url or "")
