@@ -7305,20 +7305,69 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
                                         _bridge_sse_chunks.append(_tc_chunk)
-                                        # Write placeholder result to unblock the MCP bridge.
-                                        # The generator yields tool_call but does NOT expect
-                                        # .send() — the bridge thread uses "for event in gen"
-                                        # (next() only).  We write directly to the result file
-                                        # so the MCP proxy unblocks and the CLI continues.
+                                        # Emit a side-channel tool_call_request event so the
+                                        # connected client (Mac OMP daemon) knows it needs to
+                                        # execute the tool locally and POST the result back.
+                                        # The hub registers a PendingCall keyed by
+                                        # (session_id, call_id); the matching _handle_tool_responses
+                                        # endpoint unblocks it via PendingCall.event.set().
+                                        _tool_call_request_event = {
+                                            "type": "tool_call_request",
+                                            "call_id": _call_id,
+                                            "name": _tool_name,
+                                            "arguments": _tool_args,
+                                        }
+                                        _bridge_sse_chunks.append({
+                                            "id": _bridge_completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": model_name,
+                                            "data": _tool_call_request_event,
+                                        })
+                                        # Wait for the client to POST the result to
+                                        # /v1/sessions/{session_id}/tool_responses, OR a
+                                        # 300s timeout. Until then the MCP bridge stays
+                                        # blocked on the result file.
+                                        _pending_call = None
+                                        _tool_result_payload: dict = {"content": "[Tool execution timed out — no response from connected client]"}
+                                        if session_id:
+                                            try:
+                                                from gateway.platforms import tool_call_hub
+                                                _pending_call = tool_call_hub.register_call(
+                                                    session_id, _call_id, tool_name=_tool_name,
+                                                )
+                                                # Run the blocking wait in an executor so the
+                                                # asyncio event loop stays responsive (we're
+                                                # inside an `await _bridge_events.get()` loop).
+                                                def _wait_for_response(_p=_pending_call):
+                                                    _p.event.wait(timeout=300)
+                                                    return _p
+                                                _pending_call = await _s_loop.run_in_executor(None, _wait_for_response)
+                                                if _pending_call.status == "ok":
+                                                    _tool_result_payload = {"content": _pending_call.result if _pending_call.result is not None else ""}
+                                                elif _pending_call.status == "error":
+                                                    _tool_result_payload = {"error": _pending_call.result or "client-side tool error"}
+                                                else:
+                                                    _tool_result_payload = {"content": f"[Tool execution timed out — no response from connected client]"}
+                                                logger.info(
+                                                    "[hermes-code] bridge: received tool response for %s status=%s result_len=%d",
+                                                    _call_id, _pending_call.status,
+                                                    len(str(_pending_call.result or "")),
+                                                )
+                                            except Exception as _hub_exc:
+                                                logger.warning("[hermes-code] bridge: tool_call_hub error: %s", _hub_exc)
+                                                _tool_result_payload = {"content": f"[Tool hub error: {_hub_exc}]"}
+                                        # Write the REAL client-supplied result to the result
+                                        # file so the MCP bridge unblocks and the CLI sees
+                                        # the actual output (not a placeholder).
                                         if _cc_client._queue_out_dir:
                                             _result_path = os.path.join(_cc_client._queue_out_dir, f"{_call_id}.json")
                                             try:
-                                                _placeholder = {"content": f"[Tool {_tool_name} called with {_tool_args}]"}
                                                 with open(_result_path, "w") as _rf:
-                                                    json.dump(_placeholder, _rf)
-                                                logger.info("[hermes-code] bridge: wrote placeholder result for %s", _call_id)
+                                                    json.dump(_tool_result_payload, _rf)
+                                                logger.info("[hermes-code] bridge: wrote real result for %s (%d bytes)", _call_id, len(json.dumps(_tool_result_payload)))
                                             except Exception as _re:
-                                                logger.warning("[hermes-code] bridge: failed to write placeholder result: %s", _re)
+                                                logger.warning("[hermes-code] bridge: failed to write result: %s", _re)
                                         logger.info("[hermes-code] bridge: streamed tool_call %s to OMP", _call_id)
                                     elif _bt in ("text", "assistant_text"):
                                         _text = _be.get("text", "")
@@ -7493,16 +7542,56 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "choices": [{"index": 0, "delta": {"tool_calls": [dict(_tc, index=0)]}, "finish_reason": None}],
                                         }
                                         _bridge_sse_chunks.append(_tc_chunk)
-                                        # Write placeholder result to unblock the MCP bridge proxy
+                                        # Emit side-channel tool_call_request so the connected
+                                        # client (Mac OMP daemon) knows to execute the tool
+                                        # locally and POST the result back via the hub.
+                                        _tool_call_request_event = {
+                                            "type": "tool_call_request",
+                                            "call_id": _call_id,
+                                            "name": _tool_name,
+                                            "arguments": _tool_args,
+                                        }
+                                        _bridge_sse_chunks.append({
+                                            "id": _bridge_completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": model_name,
+                                            "data": _tool_call_request_event,
+                                        })
+                                        _pending_call = None
+                                        _tool_result_payload: dict = {"content": "[Tool execution timed out — no response from connected client]"}
+                                        if session_id:
+                                            try:
+                                                from gateway.platforms import tool_call_hub
+                                                _pending_call = tool_call_hub.register_call(
+                                                    session_id, _call_id, tool_name=_tool_name,
+                                                )
+                                                def _wait_for_response_mc(_p=_pending_call):
+                                                    _p.event.wait(timeout=300)
+                                                    return _p
+                                                _pending_call = await _s_loop.run_in_executor(None, _wait_for_response_mc)
+                                                if _pending_call.status == "ok":
+                                                    _tool_result_payload = {"content": _pending_call.result if _pending_call.result is not None else ""}
+                                                elif _pending_call.status == "error":
+                                                    _tool_result_payload = {"error": _pending_call.result or "client-side tool error"}
+                                                else:
+                                                    _tool_result_payload = {"content": f"[Tool execution timed out — no response from connected client]"}
+                                                logger.info(
+                                                    "[hermes-code] mimocode-cli bridge: received tool response for %s status=%s result_len=%d",
+                                                    _call_id, _pending_call.status,
+                                                    len(str(_pending_call.result or "")),
+                                                )
+                                            except Exception as _hub_exc:
+                                                logger.warning("[hermes-code] mimocode-cli bridge: tool_call_hub error: %s", _hub_exc)
+                                                _tool_result_payload = {"content": f"[Tool hub error: {_hub_exc}]"}
                                         if _mc_client._queue_out_dir:
                                             _result_path = os.path.join(_mc_client._queue_out_dir, f"{_call_id}.json")
                                             try:
-                                                _placeholder = {"content": f"[Tool {_tool_name} called with {_tool_args}]"}
                                                 with open(_result_path, "w") as _rf:
-                                                    json.dump(_placeholder, _rf)
-                                                logger.info("[hermes-code] mimocode-cli bridge: wrote placeholder result for %s", _call_id)
+                                                    json.dump(_tool_result_payload, _rf)
+                                                logger.info("[hermes-code] mimocode-cli bridge: wrote real result for %s (%d bytes)", _call_id, len(json.dumps(_tool_result_payload)))
                                             except Exception as _re:
-                                                logger.warning("[hermes-code] mimocode-cli bridge: failed to write placeholder result: %s", _re)
+                                                logger.warning("[hermes-code] mimocode-cli bridge: failed to write result: %s", _re)
                                     elif _bt in ("text", "assistant_text"):
                                         _chunk_text = _be.get("text", "")
                                         _bridge_final_text += _chunk_text
@@ -8674,14 +8763,44 @@ class APIServerAdapter(BasePlatformAdapter):
                                         },
                                     }
                                     _bridge_tool_calls_ns.append(_tc)
+                                    # Register with the tool_call_hub and wait for the
+                                    # connected client to POST the result. Log the
+                                    # tool_call_request so the Mac daemon can also
+                                    # pick it up via /v1/sessions/{session_id}/pending-tool-calls
+                                    # or via log tailing.
+                                    _pending_call_ns = None
+                                    _tool_result_payload_ns: dict = {"content": "[Tool execution timed out — no response from connected client]"}
+                                    if session_id:
+                                        try:
+                                            from gateway.platforms import tool_call_hub
+                                            _pending_call_ns = tool_call_hub.register_call(
+                                                session_id, _call_id, tool_name=_tool_name,
+                                            )
+                                            logger.info(
+                                                "[hermes-code] ns claude bridge: tool_call_request call_id=%s tool=%s args=%s session=%s",
+                                                _call_id, _tool_name, json.dumps(_tool_args)[:300], session_id,
+                                            )
+                                            def _wait_for_response_ns(_p=_pending_call_ns):
+                                                _p.event.wait(timeout=300)
+                                                return _p
+                                            _pending_call_ns = await _s_loop.run_in_executor(None, _wait_for_response_ns)
+                                            if _pending_call_ns.status == "ok":
+                                                _tool_result_payload_ns = {"content": _pending_call_ns.result if _pending_call_ns.result is not None else ""}
+                                            elif _pending_call_ns.status == "error":
+                                                _tool_result_payload_ns = {"error": _pending_call_ns.result or "client-side tool error"}
+                                            else:
+                                                _tool_result_payload_ns = {"content": "[Tool execution timed out — no response from connected client]"}
+                                        except Exception as _hub_exc:
+                                            logger.warning("[hermes-code] ns claude bridge: tool_call_hub error: %s", _hub_exc)
+                                            _tool_result_payload_ns = {"content": f"[Tool hub error: {_hub_exc}]"}
                                     if _cc_client_ns._queue_out_dir:
                                         _result_path = os.path.join(_cc_client_ns._queue_out_dir, f"{_call_id}.json")
                                         try:
-                                            _placeholder = {"content": f"[Tool {_tool_name} called with {_tool_args}]"}
                                             with open(_result_path, "w") as _rf:
-                                                json.dump(_placeholder, _rf)
+                                                json.dump(_tool_result_payload_ns, _rf)
+                                            logger.info("[hermes-code] ns claude bridge: wrote real result for %s (%d bytes)", _call_id, len(json.dumps(_tool_result_payload_ns)))
                                         except Exception as _re:
-                                            logger.warning("[hermes-code] ns bridge: failed to write placeholder result: %s", _re)
+                                            logger.warning("[hermes-code] ns bridge: failed to write result: %s", _re)
                                 elif _bt in ("text", "assistant_text"):
                                     _bridge_final_text_ns += _be.get("text", "")
                                 elif _bt == "final":
@@ -11896,6 +12015,50 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"ok": True}, status=200)
 
+    async def _handle_pending_tool_calls(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/pending-tool-calls — long-poll for pending tool calls.
+
+        The connected Mac daemon polls this endpoint to discover when the model
+        has emitted a tool_call. It should execute the tool locally and POST the
+        result to /v1/sessions/{session_id}/tool_responses.
+
+        Long-polls up to `wait` seconds (default 25) for at least one pending
+        call, OR returns immediately if one is already pending. Returns:
+            {"tool_calls": [{"call_id": "...", "name": "...", "arguments": {...}, "tool_name": "..."}, ...]}
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = (request.match_info.get("session_id") or "").strip()
+        if not session_id:
+            return web.json_response({"error": "Missing session_id in path"}, status=400)
+
+        try:
+            wait_s = float(request.query.get("wait", "25"))
+        except ValueError:
+            wait_s = 25.0
+        wait_s = min(max(wait_s, 0.0), 60.0)
+
+        from gateway.platforms import tool_call_hub
+
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            from gateway.platforms.tool_call_hub import _hub as _tool_hub
+            with _tool_hub._lock:
+                ses = _tool_hub._pending.get(session_id, {})
+                pending = [
+                    {"call_id": cid, "name": p.tool_name, "tool_name": p.tool_name, "arguments": {}}
+                    for cid, p in list(ses.items())
+                ]
+            if pending:
+                return web.json_response({"tool_calls": pending}, status=200)
+            await asyncio.sleep(0.1)
+
+        return web.json_response({"tool_calls": []}, status=200)
+
+        return web.json_response({"ok": True}, status=200)
+
 
     async def _handle_audio_speech(self, request: "web.Request") -> "web.Response":
         """POST /v1/audio/speech — OpenAI-compatible TTS.
@@ -12204,6 +12367,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/sessions/{session_id}/tool_responses", self._handle_tool_responses)
+            self._app.router.add_get("/v1/sessions/{session_id}/pending-tool-calls", self._handle_pending_tool_calls)
             # Audio — TTS and STT (OpenAI-compatible)
             self._app.router.add_post("/v1/audio/speech", self._handle_audio_speech)
             self._app.router.add_post("/v1/audio/transcriptions", self._handle_audio_transcriptions)
