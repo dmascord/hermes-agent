@@ -19,10 +19,11 @@ from typing import Optional, Dict, Tuple
 
 
 class PendingCall:
-    def __init__(self, session_id: str, call_id: str, tool_name: Optional[str] = None):
+    def __init__(self, session_id: str, call_id: str, tool_name: Optional[str] = None, arguments: Optional[dict] = None):
         self.session_id = session_id
         self.call_id = call_id
         self.tool_name = tool_name
+        self.arguments = arguments or {}
         self.event = threading.Event()
         self.status: Optional[str] = None
         self.result = None
@@ -42,7 +43,7 @@ class _ToolCallHub:
         # Orphaned results keyed by (session_id, call_id)
         self._orphaned: Dict[Tuple[str, str], PendingCall] = {}
 
-    def register_call(self, session_id: str, call_id: str, tool_name: Optional[str] = None) -> PendingCall:
+    def register_call(self, session_id: str, call_id: str, tool_name: Optional[str] = None, arguments: Optional[dict] = None) -> PendingCall:
         """Register and return a PendingCall for session_id/call_id.
 
         If a response was posted earlier (orphaned), adopt it so callers
@@ -54,14 +55,21 @@ class _ToolCallHub:
             if key in self._orphaned:
                 p = self._orphaned.pop(key)
                 p.tool_name = p.tool_name or tool_name
+                p.arguments = p.arguments or arguments or {}
                 od = self._pending.setdefault(session_id, OrderedDict())
                 od[call_id] = p
                 return p
 
             od = self._pending.setdefault(session_id, OrderedDict())
             if call_id in od:
-                return od[call_id]
-            p = PendingCall(session_id, call_id, tool_name=tool_name)
+                # Update arguments if previously missing
+                existing = od[call_id]
+                if not existing.arguments and arguments:
+                    existing.arguments = arguments
+                if not existing.tool_name and tool_name:
+                    existing.tool_name = tool_name
+                return existing
+            p = PendingCall(session_id, call_id, tool_name=tool_name, arguments=arguments)
             od[call_id] = p
             return p
 
@@ -110,8 +118,8 @@ class _ToolCallHub:
 _hub = _ToolCallHub()
 
 
-def register_call(session_id: str, call_id: str, tool_name: Optional[str] = None) -> PendingCall:
-    return _hub.register_call(session_id, call_id, tool_name)
+def register_call(session_id: str, call_id: str, tool_name: Optional[str] = None, arguments: Optional[dict] = None) -> PendingCall:
+    return _hub.register_call(session_id, call_id, tool_name, arguments)
 
 
 def set_response(session_id: str, call_id: str, status: str, result) -> bool:

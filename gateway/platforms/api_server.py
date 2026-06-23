@@ -7335,6 +7335,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 from gateway.platforms import tool_call_hub
                                                 _pending_call = tool_call_hub.register_call(
                                                     session_id, _call_id, tool_name=_tool_name,
+                                                    arguments=_tool_args,
                                                 )
                                                 # Run the blocking wait in an executor so the
                                                 # asyncio event loop stays responsive (we're
@@ -7565,6 +7566,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 from gateway.platforms import tool_call_hub
                                                 _pending_call = tool_call_hub.register_call(
                                                     session_id, _call_id, tool_name=_tool_name,
+                                                    arguments=_tool_args,
                                                 )
                                                 def _wait_for_response_mc(_p=_pending_call):
                                                     _p.event.wait(timeout=300)
@@ -8775,6 +8777,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             from gateway.platforms import tool_call_hub
                                             _pending_call_ns = tool_call_hub.register_call(
                                                 session_id, _call_id, tool_name=_tool_name,
+                                                arguments=_tool_args,
                                             )
                                             logger.info(
                                                 "[hermes-code] ns claude bridge: tool_call_request call_id=%s tool=%s args=%s session=%s",
@@ -9547,7 +9550,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if external_tool_mode == "broker":
                     try:
                         from gateway.platforms import tool_call_hub
-                        tool_call_hub.register_call(session_id, call_id, tool_name)
+                        tool_call_hub.register_call(session_id, call_id, tool_name, arguments)
                         logger.info(
                             "[api_server] registered external tool call session=%s call_id=%s tool=%s",
                             session_id, call_id, tool_name,
@@ -9871,6 +9874,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 from gateway.platforms import tool_call_hub
                                 tool_call_hub.register_call(
                                     payload.get("session_id", session_id), payload.get("call_id"), payload.get("tool_name"),
+                                    payload.get("arguments"),
                                 )
                         except Exception:
                             pass
@@ -12048,7 +12052,7 @@ class APIServerAdapter(BasePlatformAdapter):
             with _tool_hub._lock:
                 ses = _tool_hub._pending.get(session_id, {})
                 pending = [
-                    {"call_id": cid, "name": p.tool_name, "tool_name": p.tool_name, "arguments": {}}
+                    {"call_id": cid, "name": p.tool_name, "tool_name": p.tool_name, "arguments": dict(p.arguments or {})}
                     for cid, p in list(ses.items())
                 ]
             if pending:
