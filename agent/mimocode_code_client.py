@@ -195,14 +195,25 @@ class MiMoCodeClient:
                 "real filesystem access.\n\n"
                 "CRITICAL — Use this EXACT format when invoking a tool:\n"
                 '  <tool_invocation name="mcp_bash" arguments={"command": "ls -la"} />\n'
-                '  <tool_invocation name="mcp_read" arguments={"file_path": "/path/to/file"} />\n\n'
+                '  <tool_invocation name="mcp_read" arguments={"path": "/path/to/file"} />\n'
+                '  <tool_invocation name="mcp_write" arguments={"path": "/path/to/file", "content": "file contents here"} />\n'
+                '  <tool_invocation name="mcp_edit" arguments={"path": "/path/to/file", "input": "EDIT_SPEC_HERE"} />\n'
+                '  <tool_invocation name="mcp_find" arguments={"paths": ["src/**/*.py"]} />\n'
+                '  <tool_invocation name="mcp_search_tool_bm25" arguments={"query": "search terms here"} />\n\n'
                 "Rules:\n"
                 "1. Emit ONE tool invocation per response (do not chain).\n"
                 "2. The `arguments` value is raw JSON (no HTML entities, no escaping).\n"
-                '3. Close with ` />` (self-closing), NOT `></tool_invocation>`.\n'
-                "4. Do NOT wrap the invocation in code blocks (no ``` fences).\n"
-                "5. Do NOT describe what you'll do in prose — emit the invocation directly.\n"
-                "6. After invoking, STOP. The bridge will execute and return a result.\n"
+                "3. ALL required parameters MUST be included — never emit empty arguments {}.\n"
+                "   - mcp_bash REQUIRES \"command\" (the shell command string)\n"
+                "   - mcp_read REQUIRES \"path\" (absolute file path)\n"
+                "   - mcp_write REQUIRES \"path\" and \"content\"\n"
+                "   - mcp_edit REQUIRES \"path\" and \"input\"\n"
+                "   - mcp_find REQUIRES \"paths\" (array of glob patterns)\n"
+                "   - mcp_search_tool_bm25 REQUIRES \"query\" (search string)\n"
+                "4. Close with ` />` (self-closing), NOT `></tool_invocation>`.\n"
+                "5. Do NOT wrap the invocation in code blocks (no ``` fences).\n"
+                "6. Do NOT describe what you'll do in prose — emit the invocation directly.\n"
+                "7. After invoking, STOP. The bridge will execute and return a result.\n"
             )
 
         # Create queue and result dirs
