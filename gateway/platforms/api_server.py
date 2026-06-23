@@ -7662,161 +7662,161 @@ class APIServerAdapter(BasePlatformAdapter):
                                     elif _bt == "final":
                                         _bridge_usage = _be.get("usage", {})
                                         _bridge_model = _be.get("model", resolved_model)
-                                # If we got a tool result back but the model never
-                                # produced a final text response, fall back to
-                                # using the tool result itself as the final text.
-                                # This matches OpenAI's chat completions flow where
-                                # the assistant often returns tool_calls without
-                                # content; the client (Mac daemon / OpenAI
-                                # library) is expected to POST tool results back
-                                # in a follow-up turn to get a final answer.
-                                # Since hermes handles the tool execution in a
-                                # side channel (not via the client), we synthesize
-                                # a final assistant turn that incorporates the
-                                # tool result content.
-                                if (
-                                    _bt == "final"
-                                    and _bridge_tool_calls
-                                    and not _bridge_final_text
-                                    and _bridge_last_tool_result
-                                ):
-                                    _tool_summary = _bridge_last_tool_result
-                                    if not isinstance(_tool_summary, str):
-                                        _tool_summary = json.dumps(_tool_summary)
-                                    # Truncate
-                                    if len(_tool_summary) > 4000:
-                                        _tool_summary = _tool_summary[:4000] + "\n... [truncated]"
-                                    _bridge_final_text = (
-                                        f"Tool execution result:\n```\n{_tool_summary}\n```"
-                                    )
-                                    logger.info(
-                                        "[TIMING][req=%s][mimo-stream] T+%.3fs synthesized final text from tool result (len=%d)",
-                                        _req_id, time.monotonic() - _req_start, len(_bridge_final_text),
-                                    )
-                                    # Emit as a final text chunk
-                                    _synth_chunk = {
-                                        "id": _bridge_completion_id, "object": "chat.completion.chunk",
-                                        "created": int(time.time()), "model": model_name,
-                                        "choices": [{"index": 0, "delta": {"content": _bridge_final_text}, "finish_reason": None}],
-                                    }
-                                    _bridge_sse_chunks.append(_synth_chunk)
-                                    # Don't restart — the synthesized text IS the answer
-                                    _bridge_finish_reason = "stop"
-                                    break
-                                # === MULTI-TURN RESTART ===
-                                # mimo is a single-shot CLI — once it emits a tool_call
-                                # and gets the result, the subprocess often exits
-                                # without the model producing a final answer. We
-                                # detect that here and start a new mimo session
-                                # with the conversation extended to include the
-                                # tool_call + tool_result, so the model can produce
-                                # a final response. The SSE stays open the whole time.
-                                if (
-                                    _bt == "final"
-                                    and _bridge_tool_calls
-                                    and not _bridge_final_text
-                                    and passthrough_messages
-                                    and _restart_count < _MAX_RESTARTS
-                                ):
-                                    _restart_count += 1
-                                    try:
-                                        logger.info(
-                                            "[TIMING][req=%s][mimo-stream] T+%.3fs starting multi-turn restart tool_calls=%d",
-                                            _req_id, time.monotonic() - _req_start, len(_bridge_tool_calls),
-                                        )
-                                        # Build extended conversation:
-                                        # original messages + assistant tool_calls + tool results
-                                        _ext_messages = list(passthrough_messages)
-                                        # Append assistant message with the tool_calls
-                                        _asst_msg = {
-                                            "role": "assistant",
-                                            "content": None,
-                                            "tool_calls": _bridge_tool_calls,
-                                        }
-                                        _ext_messages.append(_asst_msg)
-                                        # Append role=tool messages for each tool_call
-                                        # (the tool result was already written to the queue
-                                        # but the subprocess exited before the model saw it)
-                                        for _tc in _bridge_tool_calls:
-                                            _tc_id = _tc.get("id", "")
-                                            # Use the most recent tool result payload (one tool call per round-trip typically)
-                                            _tool_content = _tool_result_payload.get("content", "")
-                                            _ext_messages.append({
-                                                "role": "tool",
-                                                "tool_call_id": _tc_id,
-                                                "content": _tool_content if isinstance(_tool_content, str) else json.dumps(_tool_content),
-                                            })
-                                        # Append a USER message that tells the model
-                                        # the tool result has been provided. mimo's
-                                        # _build_prompt() only takes the LAST user
-                                        # message, so we must include both the
-                                        # original prompt and the tool result inline.
-                                        _tool_summary = _tool_result_payload.get("content", "")
+                                    # If we got a tool result back but the model never
+                                    # produced a final text response, fall back to
+                                    # using the tool result itself as the final text.
+                                    # This matches OpenAI's chat completions flow where
+                                    # the assistant often returns tool_calls without
+                                    # content; the client (Mac daemon / OpenAI
+                                    # library) is expected to POST tool results back
+                                    # in a follow-up turn to get a final answer.
+                                    # Since hermes handles the tool execution in a
+                                    # side channel (not via the client), we synthesize
+                                    # a final assistant turn that incorporates the
+                                    # tool result content.
+                                    if (
+                                        _bt == "final"
+                                        and _bridge_tool_calls
+                                        and not _bridge_final_text
+                                        and _bridge_last_tool_result
+                                    ):
+                                        _tool_summary = _bridge_last_tool_result
                                         if not isinstance(_tool_summary, str):
                                             _tool_summary = json.dumps(_tool_summary)
-                                        _tool_summary_short = (
-                                            _tool_summary[:4000] + "\n... [truncated]"
-                                            if len(_tool_summary) > 4000
-                                            else _tool_summary
+                                        # Truncate
+                                        if len(_tool_summary) > 4000:
+                                            _tool_summary = _tool_summary[:4000] + "\n... [truncated]"
+                                        _bridge_final_text = (
+                                            f"Tool execution result:\n```\n{_tool_summary}\n```"
                                         )
-                                        # Find the original user prompt
-                                        _original_user_msg = ""
-                                        for _orig_msg in reversed(passthrough_messages):
-                                            if _orig_msg.get("role") in ("user", "developer"):
-                                                _c = _orig_msg.get("content", "")
-                                                if isinstance(_c, str):
-                                                    _original_user_msg = _c
-                                                elif isinstance(_c, list):
-                                                    _original_user_msg = " ".join(
-                                                        p.get("text", "") for p in _c
-                                                        if isinstance(p, dict) and p.get("type") == "text"
-                                                    )
-                                                break
-                                        _ext_messages.append({
-                                            "role": "user",
-                                            "content": (
-                                                f"Original request:\n\n{_original_user_msg}\n\n"
-                                                f"---\n\n"
-                                                f"The previous tool returned:\n\n```\n{_tool_summary_short}\n```\n\n"
-                                                "Based on this result, please answer my "
-                                                "original request directly in plain text. "
-                                                "Do not call any more tools."
-                                            ),
-                                        })
-                                        # Start new mimo session with extended conversation
-                                        def _run_mc_restart(_c=_mc_client, _m=resolved_model, _ext=_ext_messages, _q=_bridge_events, _orig_msgs=passthrough_messages):
-                                            try:
-                                                # Restart mimo with the extended conversation.
-                                                # Don't use --continue (causes 413 + cooldown).
-                                                resp = _c._create_chat_completion(
-                                                    model=_m,
-                                                    messages=_ext,
-                                                    tools=passthrough_tools,
-                                                )
-                                                if hasattr(resp, 'choices') and resp.choices:
-                                                    msg = resp.choices[0].message
-                                                    if getattr(msg, 'content', None):
-                                                        _q.put_nowait({"type": "text", "text": msg.content})
-                                                _q.put_nowait({"type": "final", "model": _m, "usage": {
-                                                    "input_tokens": getattr(getattr(resp, 'usage', None), 'prompt_tokens', 0) or 0,
-                                                    "output_tokens": getattr(getattr(resp, 'usage', None), 'completion_tokens', 0) or 0,
-                                                    "total_tokens": getattr(getattr(resp, 'usage', None), 'total_tokens', 0) or 0,
-                                                }})
-                                            except Exception as exc:
-                                                _q.put_nowait({"type": "error", "message": f"restart error: {exc}"})
-                                            finally:
-                                                _q.put_nowait({"type": "_done"})
-                                        threading.Thread(target=_run_mc_restart, daemon=True).start()
                                         logger.info(
-                                            "[TIMING][req=%s][mimo-stream] T+%.3fs multi-turn restart thread spawned",
-                                            _req_id, time.monotonic() - _req_start,
+                                            "[TIMING][req=%s][mimo-stream] T+%.3fs synthesized final text from tool result (len=%d)",
+                                            _req_id, time.monotonic() - _req_start, len(_bridge_final_text),
                                         )
-                                        # DON'T break — let the main while loop continue
-                                        # to drain events from the new thread
-                                        _bridge_tool_calls = []  # reset to avoid emitting tool_calls chunk twice
-                                        continue
-                                    except Exception as _restart_exc:
-                                        logger.warning("[hermes-code] mimocode-cli multi-turn restart failed: %s", _restart_exc)
+                                        # Emit as a final text chunk
+                                        _synth_chunk = {
+                                            "id": _bridge_completion_id, "object": "chat.completion.chunk",
+                                            "created": int(time.time()), "model": model_name,
+                                            "choices": [{"index": 0, "delta": {"content": _bridge_final_text}, "finish_reason": None}],
+                                        }
+                                        _bridge_sse_chunks.append(_synth_chunk)
+                                        # Don't restart — the synthesized text IS the answer
+                                        _bridge_finish_reason = "stop"
+                                        break
+                                    # === MULTI-TURN RESTART ===
+                                    # mimo is a single-shot CLI — once it emits a tool_call
+                                    # and gets the result, the subprocess often exits
+                                    # without the model producing a final answer. We
+                                    # detect that here and start a new mimo session
+                                    # with the conversation extended to include the
+                                    # tool_call + tool_result, so the model can produce
+                                    # a final response. The SSE stays open the whole time.
+                                    if (
+                                        _bt == "final"
+                                        and _bridge_tool_calls
+                                        and not _bridge_final_text
+                                        and passthrough_messages
+                                        and _restart_count < _MAX_RESTARTS
+                                    ):
+                                        _restart_count += 1
+                                        try:
+                                            logger.info(
+                                                "[TIMING][req=%s][mimo-stream] T+%.3fs starting multi-turn restart tool_calls=%d",
+                                                _req_id, time.monotonic() - _req_start, len(_bridge_tool_calls),
+                                            )
+                                            # Build extended conversation:
+                                            # original messages + assistant tool_calls + tool results
+                                            _ext_messages = list(passthrough_messages)
+                                            # Append assistant message with the tool_calls
+                                            _asst_msg = {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": _bridge_tool_calls,
+                                            }
+                                            _ext_messages.append(_asst_msg)
+                                            # Append role=tool messages for each tool_call
+                                            # (the tool result was already written to the queue
+                                            # but the subprocess exited before the model saw it)
+                                            for _tc in _bridge_tool_calls:
+                                                _tc_id = _tc.get("id", "")
+                                                # Use the most recent tool result payload (one tool call per round-trip typically)
+                                                _tool_content = _tool_result_payload.get("content", "")
+                                                _ext_messages.append({
+                                                    "role": "tool",
+                                                    "tool_call_id": _tc_id,
+                                                    "content": _tool_content if isinstance(_tool_content, str) else json.dumps(_tool_content),
+                                                })
+                                            # Append a USER message that tells the model
+                                            # the tool result has been provided. mimo's
+                                            # _build_prompt() only takes the LAST user
+                                            # message, so we must include both the
+                                            # original prompt and the tool result inline.
+                                            _tool_summary = _tool_result_payload.get("content", "")
+                                            if not isinstance(_tool_summary, str):
+                                                _tool_summary = json.dumps(_tool_summary)
+                                            _tool_summary_short = (
+                                                _tool_summary[:4000] + "\n... [truncated]"
+                                                if len(_tool_summary) > 4000
+                                                else _tool_summary
+                                            )
+                                            # Find the original user prompt
+                                            _original_user_msg = ""
+                                            for _orig_msg in reversed(passthrough_messages):
+                                                if _orig_msg.get("role") in ("user", "developer"):
+                                                    _c = _orig_msg.get("content", "")
+                                                    if isinstance(_c, str):
+                                                        _original_user_msg = _c
+                                                    elif isinstance(_c, list):
+                                                        _original_user_msg = " ".join(
+                                                            p.get("text", "") for p in _c
+                                                            if isinstance(p, dict) and p.get("type") == "text"
+                                                        )
+                                                    break
+                                            _ext_messages.append({
+                                                "role": "user",
+                                                "content": (
+                                                    f"Original request:\n\n{_original_user_msg}\n\n"
+                                                    f"---\n\n"
+                                                    f"The previous tool returned:\n\n```\n{_tool_summary_short}\n```\n\n"
+                                                    "Based on this result, please answer my "
+                                                    "original request directly in plain text. "
+                                                    "Do not call any more tools."
+                                                ),
+                                            })
+                                            # Start new mimo session with extended conversation
+                                            def _run_mc_restart(_c=_mc_client, _m=resolved_model, _ext=_ext_messages, _q=_bridge_events, _orig_msgs=passthrough_messages):
+                                                try:
+                                                    # Restart mimo with the extended conversation.
+                                                    # Don't use --continue (causes 413 + cooldown).
+                                                    resp = _c._create_chat_completion(
+                                                        model=_m,
+                                                        messages=_ext,
+                                                        tools=passthrough_tools,
+                                                    )
+                                                    if hasattr(resp, 'choices') and resp.choices:
+                                                        msg = resp.choices[0].message
+                                                        if getattr(msg, 'content', None):
+                                                            _q.put_nowait({"type": "text", "text": msg.content})
+                                                    _q.put_nowait({"type": "final", "model": _m, "usage": {
+                                                        "input_tokens": getattr(getattr(resp, 'usage', None), 'prompt_tokens', 0) or 0,
+                                                        "output_tokens": getattr(getattr(resp, 'usage', None), 'completion_tokens', 0) or 0,
+                                                        "total_tokens": getattr(getattr(resp, 'usage', None), 'total_tokens', 0) or 0,
+                                                    }})
+                                                except Exception as exc:
+                                                    _q.put_nowait({"type": "error", "message": f"restart error: {exc}"})
+                                                finally:
+                                                    _q.put_nowait({"type": "_done"})
+                                            threading.Thread(target=_run_mc_restart, daemon=True).start()
+                                            logger.info(
+                                                "[TIMING][req=%s][mimo-stream] T+%.3fs multi-turn restart thread spawned",
+                                                _req_id, time.monotonic() - _req_start,
+                                            )
+                                            # DON'T break — let the main while loop continue
+                                            # to drain events from the new thread
+                                            _bridge_tool_calls = []  # reset to avoid emitting tool_calls chunk twice
+                                            continue
+                                        except Exception as _restart_exc:
+                                            logger.warning("[hermes-code] mimocode-cli multi-turn restart failed: %s", _restart_exc)
                                 _bridge_finish_reason = "tool_calls" if _bridge_tool_calls else "stop"
                                 try:
                                     _bridge_usage_ns = SimpleNamespace(
