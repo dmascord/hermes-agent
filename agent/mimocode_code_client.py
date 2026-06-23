@@ -107,7 +107,7 @@ class MiMoCodeClient:
 
         Creates:
         - .mcp.json with server named "mcp" (produces mcp_* tool IDs)
-        - .mimocode/agents/hermes.md with permission deny-all + allow mcp_*
+        - .mimocode/agent/hermes.md with tools: deny-all-builtins
         - tools.json manifest for the MCP bridge
         - queue.in and result/ for tool call proxying
         """
@@ -157,9 +157,10 @@ class MiMoCodeClient:
             json.dump(tool_schemas, f)
 
         # Create agent definition
-        # Permission: deny all tools (*), allow only mcp_* prefixed tools
-        # This forces the model to use MCP-proxied tools exclusively
-        agent_dir = os.path.join(workspace, ".mimocode", "agents")
+        # Permission: deny all built-in tools, allow only MCP bridge tools.
+        # The MCP bridge registers tools at runtime (mcp_bash, mcp_read, etc.)
+        # which are NOT controlled by the agent's built-in tool permissions.
+        agent_dir = os.path.join(workspace, ".mimocode", "agent")
         os.makedirs(agent_dir, exist_ok=True)
 
         tool_list = ", ".join(mcp_tool_names)
@@ -167,14 +168,18 @@ class MiMoCodeClient:
         with open(os.path.join(agent_dir, "hermes.md"), "w") as f:
             f.write("---\n")
             f.write("name: hermes\n")
-            f.write("description: Hermes tool proxy agent\n")
-            f.write("permission:\n")
-            f.write("  '*': deny\n")
-            for name in mcp_tool_names:
-                f.write(f"  '{name}': allow\n")
-            f.write("tool_allowlist:\n")
-            for name in mcp_tool_names:
-                f.write(f"  - {name}\n")
+            f.write("mode: primary\n")
+            f.write("description: Hermes tool proxy agent - MCP bridge tools only\n")
+            f.write("tools:\n")
+            f.write("  bash: false\n")
+            f.write("  read: false\n")
+            f.write("  write: false\n")
+            f.write("  edit: false\n")
+            f.write("  glob: false\n")
+            f.write("  grep: false\n")
+            f.write("  webfetch: false\n")
+            f.write("  actor: false\n")
+            f.write("  task: false\n")
             f.write("---\n\n")
             f.write(
                 "You are running through the hermes-agent gateway "
