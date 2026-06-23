@@ -649,7 +649,26 @@ class MiMoCodeClient:
                     # tool_call as raw XML instead of a structured tool_use event)
                     _xml_tc = _parse_tool_call_xml(text_payload)
                     if _xml_tc:
-                        yield _xml_tc
+                        # _parse_tool_call_xml returns OpenAI function format:
+                        #   {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
+                        # Convert to our custom tool_call format that the gateway
+                        # dispatch expects:
+                        #   {"type": "tool_call", "call_id": "...", "name": "...", "arguments": {...}}
+                        _func = _xml_tc.get("function", {})
+                        _raw_args = _func.get("arguments", "{}")
+                        if isinstance(_raw_args, str):
+                            try:
+                                _parsed_args = json.loads(_raw_args)
+                            except json.JSONDecodeError:
+                                _parsed_args = {"raw": _raw_args}
+                        else:
+                            _parsed_args = _raw_args
+                        yield {
+                            "type": "tool_call",
+                            "call_id": _xml_tc.get("id", uuid.uuid4().hex),
+                            "name": _func.get("name", "unknown"),
+                            "arguments": _parsed_args if isinstance(_parsed_args, dict) else {},
+                        }
                     else:
                         yield {"type": "text", "text": text_payload}
                 elif etype == "tool_use":
