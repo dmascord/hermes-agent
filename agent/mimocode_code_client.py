@@ -94,6 +94,56 @@ class MiMoCodeClient:
         self._queue_in_path: str | None = None
         self._queue_out_dir: str | None = None
 
+
+def _parse_tool_call_xml(text: str) -> dict | None:
+    """Parse mimo CLI's text-formatted tool_call XML.
+
+    The mimo CLI sometimes emits tool_call as raw XML text instead of a
+    structured tool_use event:
+        <tool_call>
+        {"name": "mcp_bash", "arguments": {"command": "..."}}
+        </tool_call>
+    or
+        <tool_call>
+        <function=mcp_bash>
+        <parameter=command>...</parameter>
+        </function>
+        </tool_call>
+    Returns an OpenAI-format tool_call dict or None.
+    """
+    import re
+    if "<tool_call>" not in text:
+        return None
+    # JSON-style tool_call
+    m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            return {
+                "id": f"call_{hashlib.md5(m.group(1).encode()).hexdigest()[:16]}" if 'hashlib' in dir() else f"call_{len(m.group(1))}",
+                "type": "function",
+                "function": {
+                    "name": obj.get("name", "unknown"),
+                    "arguments": json.dumps(obj.get("arguments", {})),
+                },
+            }
+        except (json.JSONDecodeError, KeyError):
+            pass
+    # XML-style tool_call: <function=name><parameter=key>value</parameter></function>
+    m2 = re.search(r"<function=([^>]+)>.*?<parameter=([^>]+)>(.*?)</parameter>.*?</function>", text, re.DOTALL)
+    if m2:
+        import uuid as _uuid
+        name, key, value = m2.group(1), m2.group(2), m2.group(3).strip()
+        return {
+            "id": f"call_{_uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps({key: value}),
+            },
+        }
+    return None
+
     def _setup_mcp_workspace(self, tools: list[dict[str, Any]]) -> str:
         """Create a temp workspace that forces mimo to use MCP tools only.
 
@@ -360,6 +410,11 @@ class MiMoCodeClient:
 
                     if etype == "text":
                         text_parts.append(part.get("text", ""))
+                        # mimo CLI sometimes emits tool_call as raw XML text
+                        # instead of a structured tool_use event. Parse it.
+                        _xml_tc = _parse_tool_call_xml(part.get("text", ""))
+                        if _xml_tc:
+                            tool_calls.append(_xml_tc)
                     elif etype == "tool_use":
                         tool_input = part.get("state", {}).get("input", {})
                         tool_calls.append({
@@ -403,6 +458,11 @@ class MiMoCodeClient:
 
                     if etype == "text":
                         text_parts.append(part.get("text", ""))
+                        # mimo CLI sometimes emits tool_call as raw XML text
+                        # instead of a structured tool_use event. Parse it.
+                        _xml_tc = _parse_tool_call_xml(part.get("text", ""))
+                        if _xml_tc:
+                            tool_calls.append(_xml_tc)
                     elif etype == "tool_use":
                         tool_input = part.get("state", {}).get("input", {})
                         tool_calls.append({
@@ -434,10 +494,18 @@ class MiMoCodeClient:
                     pass
 
         content_text = "\n".join(text_parts) if text_parts else ""
+        # Strip the <tool_call>...</tool_call> XML out of content_text if we
+        # parsed it as a tool_call — the model emitted both forms and we
+        # don't want the raw XML leaking into the response content.
+        if tool_calls and "<tool_call>" in content_text:
+            import re as _re
+            content_text = _re.sub(r"<tool_call>.*?</tool_call>", "", content_text, flags=_re.DOTALL).strip()
         message = SimpleNamespace(
             role="assistant",
             content=content_text if content_text else None,
-            tool_calls=tool_calls if tool_calls and not content_text else None,
+            # If we parsed tool calls (either from structured events or from
+            # XML in the text), include them. Otherwise fall back to text only.
+            tool_calls=tool_calls if tool_calls else None,
         )
         choices = [SimpleNamespace(index=0, message=message, finish_reason="stop")]
         return SimpleNamespace(choices=choices, usage=SimpleNamespace(**usage), model=model)
