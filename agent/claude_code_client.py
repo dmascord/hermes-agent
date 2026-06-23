@@ -890,6 +890,12 @@ class ClaudeCodeClient:
             "--verbose",
             "--model", model_flag,
             "--append-system-prompt", self._HERMES_GATEWAY_SYSTEM_PROMPT,
+            # Force the model to use ONLY the MCP bridge tools. Built-in
+            # Bash/Read/Write/Edit would let the model bypass hermes and
+            # execute against the container filesystem (wrong path).
+            # --tools "" disables ALL built-in tools so only MCP tools
+            # (registered via --mcp-config) are available.
+            "--tools", "",
         ] + _SUBPROCESS_EXTRA_FLAGS
         if tools:
             cmd_args.extend(["--max-turns", "10"])
@@ -1136,6 +1142,9 @@ class ClaudeCodeClient:
             "--verbose",
             "--model", model_flag,
             "--append-system-prompt", self._HERMES_GATEWAY_SYSTEM_PROMPT,
+            # Disable built-in tools so the model MUST use MCP bridge
+            # tools (which route through hermes → connected client).
+            "--tools", "",
         ] + _SUBPROCESS_EXTRA_FLAGS
 
         # Add max turns if tools are provided
