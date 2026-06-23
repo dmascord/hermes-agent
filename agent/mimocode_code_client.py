@@ -192,7 +192,17 @@ class MiMoCodeClient:
                 "Important: invoke the MCP-prefixed tool names (e.g. mcp_bash, "
                 "mcp_read, mcp_write, mcp_edit) rather than the bare names. "
                 "The bridge routes the MCP tools to the connected client for "
-                "real filesystem access.\n"
+                "real filesystem access.\n\n"
+                "CRITICAL — Use this EXACT format when invoking a tool:\n"
+                '  <tool_invocation name="mcp_bash" arguments={"command": "ls -la"} />\n'
+                '  <tool_invocation name="mcp_read" arguments={"file_path": "/path/to/file"} />\n\n'
+                "Rules:\n"
+                "1. Emit ONE tool invocation per response (do not chain).\n"
+                "2. The `arguments` value is raw JSON (no HTML entities, no escaping).\n"
+                '3. Close with ` />` (self-closing), NOT `></tool_invocation>`.\n'
+                "4. Do NOT wrap the invocation in code blocks (no ``` fences).\n"
+                "5. Do NOT describe what you'll do in prose — emit the invocation directly.\n"
+                "6. After invoking, STOP. The bridge will execute and return a result.\n"
             )
 
         # Create queue and result dirs

@@ -742,7 +742,11 @@ class ClaudeCodeClient:
         "invoke mcp__hermes-tools__read. To edit a file, invoke mcp__hermes-tools__edit "
         "(or write). Built-in tool names like 'Bash' will not work — they have been "
         "disabled. The mcp__hermes-tools__* tools route through the hermes gateway to "
-        "the connected client's filesystem for real execution."
+        "the connected client's filesystem for real execution.\n\n"
+        "Use claude-code's NATIVE tool-call mechanism (the same format claude-code uses "
+        "for any tool, e.g. `<function_calls><invoke name=\"...\">...</invoke></function_calls>`). "
+        "The bridge will parse this format. Do NOT write the tool call as plain text "
+        "or as JSON inside a code block — emit it as a real claude-code tool call."
     )
 
     def __init__(
