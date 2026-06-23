@@ -7545,6 +7545,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _bridge_tool_calls: list[dict] = []
                                 _bridge_sse_chunks: list[dict] = []
                                 _bridge_error_msg: str | None = None
+                                _bridge_last_tool_result: str | None = None
                                 _restart_count = 0
                                 _MAX_RESTARTS = 3
                                 while True:
@@ -7622,9 +7623,18 @@ class APIServerAdapter(BasePlatformAdapter):
                                                     _req_id, time.monotonic() - _req_start, _call_id, _pending_call.status,
                                                     len(str(_pending_call.result or "")),
                                                 )
+                                                # Cache the latest tool result so we can
+                                                # synthesize a final assistant text if
+                                                # mimo exits without producing one.
+                                                _bridge_last_tool_result = (
+                                                    _pending_call.result
+                                                    if _pending_call.result is not None
+                                                    else ""
+                                                )
                                             except Exception as _hub_exc:
                                                 logger.warning("[hermes-code] mimocode-cli bridge: tool_call_hub error: %s", _hub_exc)
                                                 _tool_result_payload = {"content": f"[Tool hub error: {_hub_exc}]"}
+                                                _bridge_last_tool_result = _tool_result_payload.get("content", "")
                                         if _mc_client._queue_out_dir:
                                             _result_path = os.path.join(_mc_client._queue_out_dir, f"{_call_id}.json")
                                             try:
@@ -7648,6 +7658,47 @@ class APIServerAdapter(BasePlatformAdapter):
                                     elif _bt == "final":
                                         _bridge_usage = _be.get("usage", {})
                                         _bridge_model = _be.get("model", resolved_model)
+                                # If we got a tool result back but the model never
+                                # produced a final text response, fall back to
+                                # using the tool result itself as the final text.
+                                # This matches OpenAI's chat completions flow where
+                                # the assistant often returns tool_calls without
+                                # content; the client (Mac daemon / OpenAI
+                                # library) is expected to POST tool results back
+                                # in a follow-up turn to get a final answer.
+                                # Since hermes handles the tool execution in a
+                                # side channel (not via the client), we synthesize
+                                # a final assistant turn that incorporates the
+                                # tool result content.
+                                if (
+                                    _bt == "final"
+                                    and _bridge_tool_calls
+                                    and not _bridge_final_text
+                                    and _bridge_last_tool_result
+                                ):
+                                    _tool_summary = _bridge_last_tool_result
+                                    if not isinstance(_tool_summary, str):
+                                        _tool_summary = json.dumps(_tool_summary)
+                                    # Truncate
+                                    if len(_tool_summary) > 4000:
+                                        _tool_summary = _tool_summary[:4000] + "\n... [truncated]"
+                                    _bridge_final_text = (
+                                        f"Tool execution result:\n```\n{_tool_summary}\n```"
+                                    )
+                                    logger.info(
+                                        "[TIMING][req=%s][mimo-stream] T+%.3fs synthesized final text from tool result (len=%d)",
+                                        _req_id, time.monotonic() - _req_start, len(_bridge_final_text),
+                                    )
+                                    # Emit as a final text chunk
+                                    _synth_chunk = {
+                                        "id": _bridge_completion_id, "object": "chat.completion.chunk",
+                                        "created": int(time.time()), "model": model_name,
+                                        "choices": [{"index": 0, "delta": {"content": _bridge_final_text}, "finish_reason": None}],
+                                    }
+                                    _bridge_sse_chunks.append(_synth_chunk)
+                                    # Don't restart — the synthesized text IS the answer
+                                    _bridge_finish_reason = "stop"
+                                    break
                                 # === MULTI-TURN RESTART ===
                                 # mimo is a single-shot CLI — once it emits a tool_call
                                 # and gets the result, the subprocess often exits
@@ -7731,14 +7782,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                         # Start new mimo session with extended conversation
                                         def _run_mc_restart(_c=_mc_client, _m=resolved_model, _ext=_ext_messages, _q=_bridge_events, _orig_msgs=passthrough_messages):
                                             try:
-                                                # Continue the SAME mimo session so the
-                                                # conversation history (including tool
-                                                # execution) is preserved on disk.
+                                                # Restart mimo with the extended conversation.
+                                                # Don't use --continue (causes 413 + cooldown).
                                                 resp = _c._create_chat_completion(
                                                     model=_m,
                                                     messages=_ext,
                                                     tools=passthrough_tools,
-                                                    continue_session=True,
                                                 )
                                                 if hasattr(resp, 'choices') and resp.choices:
                                                     msg = resp.choices[0].message
