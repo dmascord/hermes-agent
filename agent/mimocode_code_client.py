@@ -793,6 +793,9 @@ or (claude-style):
         and "<invoke name=" not in text
         and "<tool_invocation" not in text
         and "```" not in text
+        and "<mcp_" not in text
+        and '"command"' not in text
+        and '"name"' not in text
     ):
         return None
 
@@ -1029,4 +1032,58 @@ or (claude-style):
                 "arguments": json.dumps(args),
             },
         }
+    # Format 10: Bare JSON tool call in text (no XML wrapper, no code fence)
+    # The model sometimes emits JSON tool calls as plain text, e.g.:
+    #   {"command": "head -3 /path/to/file"}
+    #   {"name": "mcp_bash", "arguments": {"command": "ls"}}
+    # Only attempt on short text (< 500 chars) to avoid false positives.
+    if len(text) < 500:
+        # Try {"command": "..."} pattern (bash shorthand)
+        m10 = re.search(r'\{\s*"command"\s*:\s*"[^"]{2,}"\s*\}', text)
+        if m10:
+            try:
+                obj = json.loads(m10.group(0))
+                if isinstance(obj, dict) and "command" in obj:
+                    return {
+                        "id": f"call_{_uuid.uuid4().hex[:16]}",
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_bash",
+                            "arguments": json.dumps(obj),
+                        },
+                    }
+            except (json.JSONDecodeError, KeyError):
+                pass
+        # Try {"name": "...", "arguments": {...}} pattern
+        m10b = re.search(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{', text)
+        if m10b:
+            # Find the matching closing brace
+            start = m10b.start()
+            depth = 0
+            for end in range(start, len(text)):
+                if text[end] == '{':
+                    depth += 1
+                elif text[end] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = json.loads(text[start:end+1])
+                            if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+                                args = obj.get("arguments", {})
+                                if isinstance(args, str):
+                                    try:
+                                        args = json.loads(args)
+                                    except json.JSONDecodeError:
+                                        args = {"raw": args}
+                                return {
+                                    "id": f"call_{_uuid.uuid4().hex[:16]}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": obj.get("name", "unknown"),
+                                        "arguments": json.dumps(args if isinstance(args, dict) else {"raw": str(args)}),
+                                    },
+                                }
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        break
     return None
