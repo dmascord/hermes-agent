@@ -734,7 +734,15 @@ class ClaudeCodeClient:
         "and any other tools the user has registered with hermes). Do not claim you are in a "
         "sandbox or that you cannot access local files — use the MCP tools to read, edit, "
         "and run commands. If a specific tool you need is not registered, ask the user "
-        "to add it via the hermes tool registry."
+        "to add it via the hermes tool registry.\n\n"
+        "CRITICAL: This CLI subprocess was started with --tools \"\" which disables ALL "
+        "built-in tools (Bash, Read, Write, Edit, etc.). The ONLY tools available to you "
+        "are the mcp__hermes-tools__* MCP tools exposed via the --mcp-config. To run a "
+        "shell command, invoke mcp__hermes-tools__bash (NOT 'Bash'). To read a file, "
+        "invoke mcp__hermes-tools__read. To edit a file, invoke mcp__hermes-tools__edit "
+        "(or write). Built-in tool names like 'Bash' will not work — they have been "
+        "disabled. The mcp__hermes-tools__* tools route through the hermes gateway to "
+        "the connected client's filesystem for real execution."
     )
 
     def __init__(

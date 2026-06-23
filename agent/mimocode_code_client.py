@@ -169,7 +169,15 @@ class MiMoCodeClient:
             f.write("name: hermes\n")
             f.write("description: Hermes tool proxy agent\n")
             f.write("permission:\n")
+            # CRITICAL: explicitly deny mimo's BUILT-IN tool names. mimo's
+            # default system prompt teaches the model to invoke
+            # [tool_call: bash for '...'], [tool_call: ls for ...],
+            # etc. — those run via mimo's built-in executor and NEVER
+            # reach the hermes MCP bridge. We must deny them by name
+            # AND tell the model to use the mcp_<name> variants.
             f.write("  '*': deny\n")
+            for builtin in ("bash", "read", "write", "edit", "grep", "glob", "ls", "webfetch"):
+                f.write(f"  '{builtin}': deny\n")
             for name in mcp_tool_names:
                 f.write(f"  '{name}': allow\n")
             f.write("tool_allowlist:\n")
@@ -188,7 +196,12 @@ class MiMoCodeClient:
                 f"You have access to tools: {tool_list}.\n"
                 "Use these tools to help the user. "
                 "When a task requires running a command, reading a file, "
-                "or any code operation, use the appropriate mcp_ prefixed tool.\n"
+                "or any code operation, use the appropriate mcp_ prefixed tool.\n\n"
+                "CRITICAL: mimo has built-in tools named 'bash', 'read', 'write', 'edit', "
+                "'grep', 'glob', 'ls'. Those built-ins run inside the container and CANNOT "
+                "access the connected client's filesystem. You MUST use the mcp_-prefixed "
+                "equivalents instead — e.g. 'mcp_bash' instead of 'bash'. The bridge routes "
+                "mcp_ tool calls to the connected client for real execution.\n"
             )
 
         # Create queue and result dirs
@@ -586,7 +599,16 @@ class MiMoCodeClient:
                 part = event.get("part", {})
 
                 if etype == "text":
-                    yield {"type": "text", "text": part.get("text", "")}
+                    text_payload = part.get("text", "")
+                    # mimo CLI sometimes emits tool_call as raw XML text
+                    # instead of a structured tool_use event. Parse it and
+                    # yield as tool_call so the gateway can route it to
+                    # the connected client via tool_call_hub.
+                    _xml_tc = _parse_tool_call_xml(text_payload)
+                    if _xml_tc:
+                        yield _xml_tc
+                    else:
+                        yield {"type": "text", "text": text_payload}
                 elif etype == "tool_use":
                     call_id = part.get("callID", uuid.uuid4().hex)
                     tool_name = part.get("tool", "unknown")
