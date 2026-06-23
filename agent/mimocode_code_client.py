@@ -335,7 +335,13 @@ class MiMoCodeClient:
         prompt = self._build_prompt(messages)
         model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
 
-        cmd = [self._command] + self._args
+        cmd = [self._command]
+        # When tools are provided, strip --pure (disables MCP/external plugins)
+        # so the MCP bridge can work. --pure must be removed because it
+        # prevents mimo from loading the .mimocode/mimocode.json config that
+        # _setup_mcp_workspace() creates.
+        _effective_args = [a for a in self._args if a != "--pure"] if tools else self._args
+        cmd += _effective_args
         if model_name:
             cmd += ["--model", model_name]
 
@@ -551,10 +557,161 @@ class MiMoCodeClient:
         choices = [SimpleNamespace(index=0, message=message, finish_reason="stop")]
         return SimpleNamespace(choices=choices, usage=SimpleNamespace(**usage), model=model)
 
-    # NOTE: run_with_tool_bridge was previously defined here but was dead code
-    # (never called from anywhere) and referenced undefined methods
-    # _write_tools_manifest() and _build_mcp_config(). The current code path
-    # uses _create_chat_completion() instead (which calls _setup_mcp_workspace()).
+    def stream_events(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ):
+        """Generator that runs mimo CLI and yields events.
+
+        Yields event dicts with types:
+          - {"type": "text", "text": "..."}
+          - {"type": "tool_call", "call_id": "...", "name": "...", "arguments": {...}}
+          - {"type": "final", "model": "...", "usage": {...}}
+          - {"type": "error", "message": "..."}
+
+        Unlike _create_chat_completion(), this does NOT use a watcher thread
+        that executes tools locally. Instead, tool_call events are yielded to
+        the caller, which should handle them by:
+          1. Registering with tool_call_hub
+          2. Waiting for the connected client to POST the result
+          3. Writing the result to <self._queue_out_dir>/<call_id>.json
+          4. The MCP bridge reads the result and returns it to the subprocess
+          5. The subprocess continues producing events
+
+        This avoids the race where the watcher executes tools locally (with
+        wrong results for non-bash tools) before the gateway can proxy them
+        to the connected client.
+        """
+        prompt = self._build_prompt(messages)
+        model_name = MODEL_MAP.get(model, model) if model else "mimo/mimo-auto"
+
+        cmd = [self._command]
+        _effective_args = [a for a in self._args if a != "--pure"] if tools else self._args
+        cmd += _effective_args
+        if model_name:
+            cmd += ["--model", model_name]
+
+        cwd = None
+        if tools:
+            cwd = self._setup_mcp_workspace(tools)
+            cmd += ["--agent", "hermes"]
+
+        if prompt:
+            cmd += [prompt]
+
+        env = _build_subprocess_env()
+        _logger.info("[mimocode-cli] stream_events: %s cwd=%s", " ".join(cmd[:8]), cwd)
+
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, text=False,
+            cwd=cwd,
+        )
+
+        # Drain stderr in a background thread
+        stderr_lines: list[str] = []
+        def _drain_stderr():
+            try:
+                while True:
+                    chunk = proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    stderr_lines.append(chunk.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                raw_line = proc.stdout.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = event.get("type", "")
+                part = event.get("part", {})
+
+                if etype == "text":
+                    text_payload = part.get("text", "")
+                    # Parse XML tool_call embedded in text (mimo sometimes emits
+                    # tool_call as raw XML instead of a structured tool_use event)
+                    _xml_tc = _parse_tool_call_xml(text_payload)
+                    if _xml_tc:
+                        yield _xml_tc
+                    else:
+                        yield {"type": "text", "text": text_payload}
+                elif etype == "tool_use":
+                    call_id = part.get("callID", uuid.uuid4().hex)
+                    tool_name = part.get("tool", "unknown")
+                    tool_input = part.get("state", {}).get("input", {})
+                    yield {
+                        "type": "tool_call",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "arguments": tool_input if isinstance(tool_input, dict) else {},
+                    }
+                elif etype == "step_finish":
+                    tokens = part.get("tokens", {})
+                    yield {
+                        "type": "final",
+                        "model": model,
+                        "usage": {
+                            "input_tokens": tokens.get("input", 0),
+                            "output_tokens": tokens.get("output", 0),
+                            "total_tokens": tokens.get("total", 0),
+                        },
+                    }
+
+            # After events: check timeout
+            if time.monotonic() >= deadline:
+                _logger.warning(
+                    "[mimocode-cli] stream_events timeout after %.1fs — force-killing process",
+                    timeout,
+                )
+                proc.kill()
+                proc.wait(timeout=10)
+                stderr_thread.join(timeout=2)
+                if stderr_lines:
+                    _logger.warning(
+                        "[mimocode-cli] stream_events stderr at timeout: %s",
+                        "".join(stderr_lines)[:500],
+                    )
+                yield {"type": "error", "message": f"MiMoCode CLI exceeded {timeout}s timeout"}
+                return
+
+            proc.wait(timeout=10)
+            stderr_thread.join(timeout=2)
+
+            if proc.returncode not in (0, None):
+                stderr_msg = ("".join(stderr_lines))[:500]
+                yield {"type": "error", "message": f"MiMoCode CLI exited {proc.returncode}: {stderr_msg}"}
+
+        except Exception as exc:
+            _logger.error("[mimocode-cli] stream_events error: %s", exc)
+            yield {"type": "error", "message": str(exc)}
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+            stderr_thread.join(timeout=2)
+            # Clean up MCP workspace
+            if cwd:
+                try:
+                    import shutil
+                    shutil.rmtree(cwd, ignore_errors=True)
+                except Exception:
+                    pass
 
 
 # Module-level helper, moved here so it doesn't break the class body.

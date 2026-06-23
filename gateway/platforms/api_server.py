@@ -7521,26 +7521,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                 if session_id:
                                     _bridge_sse_headers["X-Hermes-Session-Id"] = session_id
                                 _bridge_events: asyncio.Queue = asyncio.Queue()
-                                def _run_mc_simple(_c=_mc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools, _q=_bridge_events):
+                                def _run_mc_bridge(_c=_mc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools, _q=_bridge_events):
                                     try:
-                                        resp = _c._create_chat_completion(model=_m, messages=_msgs, tools=_tools)
-                                        if hasattr(resp, 'choices') and resp.choices:
-                                            msg = resp.choices[0].message
-                                            if getattr(msg, 'content', None):
-                                                _q.put_nowait({"type": "text", "text": msg.content})
-                                            if getattr(msg, 'tool_calls', None):
-                                                for tc in msg.tool_calls:
-                                                    _q.put_nowait({"type": "tool_call", "call_id": tc.get("id", ""), "name": tc["function"]["name"], "arguments": json.loads(tc["function"]["arguments"])})
-                                            _q.put_nowait({"type": "final", "model": _m, "usage": {
-                                                "input_tokens": getattr(getattr(resp, 'usage', None), 'prompt_tokens', 0) or 0,
-                                                "output_tokens": getattr(getattr(resp, 'usage', None), 'completion_tokens', 0) or 0,
-                                                "total_tokens": getattr(getattr(resp, 'usage', None), 'total_tokens', 0) or 0,
-                                            }})
+                                        gen = _c.stream_events(model=_m, messages=_msgs, tools=_tools)
+                                        for event in gen:
+                                            _q.put_nowait(event)
                                     except Exception as exc:
                                         _q.put_nowait({"type": "error", "message": str(exc)})
                                     finally:
                                         _q.put_nowait({"type": "_done"})
-                                threading.Thread(target=_run_mc_simple, daemon=True).start()
+                                threading.Thread(target=_run_mc_bridge, daemon=True).start()
                                 _bridge_final_text = ""
                                 _bridge_usage = {}
                                 _bridge_model = resolved_model
