@@ -177,7 +177,11 @@ MCPJSON
     # requests in non-TTY mode (the binary can't show the dialog, so it exits
     # with no stdout).
     if command -v mimo >/dev/null 2>&1; then
-        _state_dir="${HERMES_HOME}/.local/state/mimocode"
+        # Mimo's HOME is set to HERMES_HOME/home/ (see get_subprocess_home()),
+        # so XDG_STATE_HOME resolves to HERMES_HOME/home/.local/state/mimocode/.
+        # The kv.json MUST go here — NOT under HERMES_HOME/.local/state/ — or
+        # mimo won't find it.
+        _state_dir="${HERMES_HOME}/home/.local/state/mimocode"
         mkdir -p "$_state_dir"
         kv_file="$_state_dir/kv.json"
         if [ ! -f "$kv_file" ] || ! grep -q "free_agreement_accepted" "$kv_file" 2>/dev/null; then
