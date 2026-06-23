@@ -6115,9 +6115,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # a single request through fallback chain, quality scoring, etc.
         _req_id = completion_id.replace("chatcmpl-", "")[:8]
         _req_start = time.monotonic()
+        model_name = body.get("model", self._model_name)
         logger.info("[TIMING][req=%s] chat_completions START model=%s has_tools=%s session_id=%s",
                     _req_id, model_name, bool(passthrough_tools), session_id)
-        model_name = body.get("model", self._model_name)
         role_cfg = _get_role_alias_config(model_name)
         role_hint = dict(role_cfg.get("hint") or {}) if role_cfg else None
         _toolset_mode = "auto"
