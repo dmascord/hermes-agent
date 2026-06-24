@@ -236,8 +236,6 @@ DEFAULT_CONTEXT_LENGTHS = {
     "nemotron-3-ultra-550b-a55b": 1000000,  # 1M context, OpenRouter free
     "nemotron-3-super-120b-a12b": 1000000,  # 1M context, OpenRouter free
     "laguna-m": 262144,                      # 256K context, Poolside via OpenRouter
-    "hermes-4-405b": 131072,                 # 128K context, Nous direct
-    "hermes-4-70b": 131072,                  # 128K context, Nous direct
     # Arcee
     "trinity": 262144,
     # OpenRouter
