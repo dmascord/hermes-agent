@@ -8621,9 +8621,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 if "/" not in provider_model and provider_model not in ("claude-code-cli", "mimocode-cli"):
                     continue
 
-                # Check cooldown before attempting this provider
+                # Check cooldown before attempting this provider.
+                # Skip this check for external CLI providers — their cooldowns
+                # are about external subprocess/auth state, not about the
+                # passthrough fallback chain, and blocking them here causes
+                # explicit "claude-code-cli" / "mimocode-cli" requests to fail
+                # with "no passthrough providers available" (503).
+                _is_external_cli = (
+                    provider_model == "claude-code-cli"
+                    or provider_model.startswith("claude-code-cli/")
+                    or provider_model == "mimocode-cli"
+                    or provider_model.startswith("mimocode-cli/")
+                )
                 _prov_prefix = provider_model.split("/")[0] if "/" in provider_model else ""
-                if _prov_prefix:
+                if _prov_prefix and not _is_external_cli:
                     try:
                         from agent.model_cooldown_db import model_cooldown_remaining
                         _cooldown_key = provider_model
