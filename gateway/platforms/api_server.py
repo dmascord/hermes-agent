@@ -7700,6 +7700,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                     if _bt == "tool_call":
                                         _call_id = _be.get("call_id", "")
                                         _tool_name = _be.get("name", "")
+                                        # Strip MCP prefix on the way back to the client —
+                                        # hermes is the boundary that translates between
+                                        # client-friendly names and the CLI's mcp_-prefixed IDs.
+                                        # claude-code uses mcp__hermes-tools__<name>;
+                                        # mimocode uses mcp_<name>.
+                                        if _tool_name.startswith("mcp__hermes-tools__"):
+                                            _tool_name = _tool_name[len("mcp__hermes-tools__"):]
+                                        elif _tool_name.startswith("mcp_"):
+                                            _tool_name = _tool_name[len("mcp_"):]
                                         _tool_args = _be.get("arguments", {})
                                         _tc = {
                                             "id": _call_id,
