@@ -2103,7 +2103,10 @@ def _normalize_external_tool_name(name: Any) -> str:
     raw = str(name or "").strip()
     if raw == "terminal":
         return "bash"
-    # Strip mcp_ prefix: mcp_bash → bash, mcp_read → read, etc.
+    # claude-code-cli: mcp__hermes-tools__<name> → <name>
+    if raw.startswith("mcp__hermes-tools__"):
+        return raw[len("mcp__hermes-tools__"):]
+    # mimocode-cli: mcp_<name> → <name>
     if raw.startswith("mcp_"):
         return raw[4:]
     return raw
