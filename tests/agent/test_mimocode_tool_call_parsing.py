@@ -29,6 +29,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from agent.mimocode_code_client import (  # noqa: E402
+    MiMoCodeClient,
     _find_balanced_json,
     _auto_type,
     _resolve_tool_name,
@@ -39,6 +40,10 @@ from agent.mimocode_code_client import (  # noqa: E402
     _parse_mimoml_params,
     _parse_tool_call_xml,
     _StreamSieve,
+    _args_to_kwargs_str,
+    _coerce_args_to_schema,
+    _fixup_skill_params,
+    _post_process_tool_call,
 )
 
 
@@ -526,3 +531,109 @@ class TestStreamSieve:
         # The tool call inside the fence should NOT be extracted
         tool_calls = [d for k, d in events if k == "tool_call"]
         assert len(tool_calls) == 0
+
+
+class TestTier2Helpers:
+    def test_fixup_skill_params_remaps_skill_name(self):
+        args = {"skill_name": "filesystem-review"}
+        out = _fixup_skill_params("skill_view", args)
+        assert out == {"name": "filesystem-review"}
+
+    def test_fixup_skill_params_noop_for_other_tools(self):
+        args = {"skill_name": "foo"}
+        out = _fixup_skill_params("mcp_bash", args)
+        assert out == {"skill_name": "foo"}
+
+    def test_coerce_args_to_schema_openai_shape(self):
+        tools = [{
+            "function": {
+                "name": "mcp_demo",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "verbose": {"type": "boolean"},
+                        "label": {"type": "string"},
+                    },
+                },
+            }
+        }]
+        args = {"count": "3", "verbose": "true", "label": 9}
+        out = _coerce_args_to_schema(args, "mcp_demo", tools)
+        assert out == {"count": 3, "verbose": True, "label": "9"}
+
+    def test_coerce_args_to_schema_input_schema_shape(self):
+        tools = [{
+            "name": "mcp_demo",
+            "input_schema": {
+                "type": "object",
+                "properties": {"flag": {"type": "boolean"}},
+            },
+        }]
+        out = _coerce_args_to_schema({"flag": "0"}, "mcp_demo", tools)
+        assert out == {"flag": False}
+
+    def test_args_to_kwargs_str_round_trip(self):
+        kwargs_str = _args_to_kwargs_str({
+            "command": "echo hi",
+            "verbose": True,
+            "count": 2,
+            "optional": None,
+        })
+        parsed = _parse_python_kwargs(kwargs_str)
+        assert parsed == {
+            "command": "echo hi",
+            "verbose": True,
+            "count": 2,
+            "optional": None,
+        }
+
+    def test_post_process_tool_call_applies_schema_and_skill_fixup(self):
+        tools = [{
+            "function": {
+                "name": "skill_view",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "depth": {"type": "integer"},
+                    },
+                },
+            }
+        }]
+        ev = {
+            "type": "tool_call",
+            "call_id": "call_1",
+            "name": "skill_view",
+            "arguments": {"skill_name": "foo", "depth": "4"},
+        }
+        out = _post_process_tool_call(ev, tools)
+        assert out["arguments"] == {"name": "foo", "depth": 4}
+
+
+class TestBuildPromptTier2:
+    def test_build_prompt_serializes_tool_call_as_tool_call_text(self):
+        client = MiMoCodeClient(command="mimo", args=["run", "--format", "json", "--pure"])
+        prompt = client._build_prompt([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "mcp_bash",
+                        "arguments": json.dumps({"command": "ls -la", "verbose": True}),
+                    }
+                }],
+            }
+        ])
+        assert "TOOL_CALL: mcp_bash(" in prompt
+        assert 'command="ls -la"' in prompt
+        assert "verbose=True" in prompt
+
+
+class TestStreamEventsSessionFlags:
+    def test_stream_events_signature_supports_session_flags(self):
+        import inspect
+        sig = inspect.signature(MiMoCodeClient.stream_events)
+        assert "continue_session" in sig.parameters
+        assert "session_id" in sig.parameters

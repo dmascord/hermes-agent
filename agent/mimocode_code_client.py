@@ -308,14 +308,14 @@ class MiMoCodeClient:
             elif role in ("user", "developer"):
                 user_parts.append(str(content).strip())
             elif role == "assistant" and not content and msg.get("tool_calls"):
-                # Preserve assistant tool_calls as text so they're not
-                # silently dropped in multi-turn restart scenarios.
+                # Preserve assistant tool_calls in a format the parser can
+                # round-trip: TOOL_CALL: name(key="value", ...)
                 tc_texts = []
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
                     tc_texts.append(
-                        f"[tool_call: {fn.get('name', '?')} "
-                        f"args={fn.get('arguments', '{}')}]"
+                        f"TOOL_CALL: {fn.get('name', '?')}"
+                        f"({_args_to_kwargs_str(fn.get('arguments', '{}'))})"
                     )
                 if tc_texts:
                     user_parts.append("Assistant tool calls:\n" + "\n".join(tc_texts))
@@ -580,8 +580,14 @@ class MiMoCodeClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        continue_session: bool = False,
+        session_id: str | None = None,
     ):
         """Generator that runs mimo CLI and yields events.
+
+        When continue_session=True, passes --continue (or --session <id>) to
+        mimo so it resumes an existing local session on disk. This is the
+        streaming equivalent of _create_chat_completion(..., continue_session=...).
 
         Yields event dicts with types:
           - {"type": "text", "text": "..."}
@@ -615,6 +621,12 @@ class MiMoCodeClient:
         if tools:
             cwd = self._setup_mcp_workspace(tools)
             cmd += ["--agent", "hermes"]
+
+        if continue_session:
+            if session_id:
+                cmd += ["--session", session_id]
+            else:
+                cmd += ["--continue"]
 
         if prompt:
             cmd += [prompt]
@@ -702,33 +714,17 @@ class MiMoCodeClient:
                             yield {"type": "text", "text": _clean_tool_text(data)}
                         elif kind == "tool_call":
                             for tc in data:
-                                _func = tc.get("function", {})
-                                _raw_args = _func.get("arguments", "{}")
-                                if isinstance(_raw_args, str):
-                                    try:
-                                        _parsed_args = json.loads(_raw_args)
-                                    except json.JSONDecodeError:
-                                        _parsed_args = {"raw": _raw_args}
-                                else:
-                                    _parsed_args = _raw_args
-                                yield {
-                                    "type": "tool_call",
-                                    "call_id": tc.get("id", uuid.uuid4().hex),
-                                    "name": _func.get("name", "unknown"),
-                                    "arguments": _parsed_args
-                                    if isinstance(_parsed_args, dict)
-                                    else {},
-                                }
+                                yield _tool_call_dict_to_event(tc, tools=tools)
                 elif etype == "tool_use":
                     call_id = part.get("callID", uuid.uuid4().hex)
                     tool_name = part.get("tool", "unknown")
                     tool_input = part.get("state", {}).get("input", {})
-                    yield {
+                    yield _post_process_tool_call({
                         "type": "tool_call",
                         "call_id": call_id,
                         "name": tool_name,
                         "arguments": tool_input if isinstance(tool_input, dict) else {},
-                    }
+                    }, tools)
                 elif etype == "step_finish":
                     tokens = part.get("tokens", {})
                     yield {
@@ -749,23 +745,7 @@ class MiMoCodeClient:
                             yield {"type": "text", "text": _clean_tool_text(data)}
                     elif kind == "tool_call":
                         for tc in data:
-                            _func = tc.get("function", {})
-                            _raw_args = _func.get("arguments", "{}")
-                            if isinstance(_raw_args, str):
-                                try:
-                                    _parsed_args = json.loads(_raw_args)
-                                except json.JSONDecodeError:
-                                    _parsed_args = {"raw": _raw_args}
-                            else:
-                                _parsed_args = _raw_args
-                            yield {
-                                "type": "tool_call",
-                                "call_id": tc.get("id", uuid.uuid4().hex),
-                                "name": _func.get("name", "unknown"),
-                                "arguments": _parsed_args
-                                if isinstance(_parsed_args, dict)
-                                else {},
-                            }
+                            yield _tool_call_dict_to_event(tc, tools=tools)
 
             # After events: check timeout
             if time.monotonic() >= deadline:
@@ -1083,6 +1063,143 @@ def _clean_tool_text(text: str) -> str:
     text = _re_c.sub(r"```\w*\s*\n?\s*```", "", text)
     text = _re_c.sub(r"\n{3,}", "\n\n", text)
     return text
+
+
+_SKILL_TOOLS: frozenset[str] = frozenset({"skill_view", "skill_manage", "use_skill"})
+
+
+def _fixup_skill_params(name: str, args: dict) -> dict:
+    """Auto-remap skill_name → name for mimo's built-in skill tools."""
+    if name not in _SKILL_TOOLS:
+        return args
+    if "skill_name" in args and "name" not in args:
+        args = dict(args)
+        args["name"] = args.pop("skill_name")
+    return args
+
+
+def _coerce_args_to_schema(args: dict, tool_name: str, tools: list[dict]) -> dict:
+    """Coerce argument values to match the tool JSON schema when possible.
+
+    Handles OpenAI-style tools ({"function": {"parameters": ...}}) and MCP /
+    Anthropic-style tools ({"input_schema": ...}). Coercion is conservative:
+    values are only changed for simple scalar type mismatches.
+    """
+    if not isinstance(args, dict) or not tools:
+        return args
+    schema = None
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", t)
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name") or t.get("name")
+        if name == tool_name:
+            schema = fn.get("parameters") or t.get("input_schema")
+            break
+    if not isinstance(schema, dict):
+        return args
+    props = schema.get("properties", {})
+    if not isinstance(props, dict) or not props:
+        return args
+    result: dict[str, Any] = {}
+    for key, value in args.items():
+        expected = props.get(key, {}).get("type", "") if isinstance(props.get(key), dict) else ""
+        if isinstance(expected, list):
+            expected = next((t for t in expected if t != "null"), expected[0] if expected else "")
+        if expected == "string" and value is not None and not isinstance(value, str):
+            result[key] = str(value)
+        elif expected == "integer" and isinstance(value, str):
+            try:
+                result[key] = int(value)
+            except (TypeError, ValueError):
+                result[key] = value
+        elif expected == "number" and isinstance(value, str):
+            try:
+                result[key] = float(value)
+            except (TypeError, ValueError):
+                result[key] = value
+        elif expected == "boolean" and isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "1", "yes"):
+                result[key] = True
+            elif lowered in ("false", "0", "no"):
+                result[key] = False
+            else:
+                result[key] = value
+        else:
+            result[key] = value
+    return result
+
+
+def _args_to_kwargs_str(args_json: str | dict) -> str:
+    """Convert JSON args to kwargs text for TOOL_CALL: round-tripping."""
+    if isinstance(args_json, str):
+        try:
+            args = json.loads(args_json)
+        except (json.JSONDecodeError, ValueError):
+            return json.dumps(args_json)
+    else:
+        args = args_json
+    if not isinstance(args, dict):
+        return json.dumps(args, ensure_ascii=False)
+    parts: list[str] = []
+    for key, value in args.items():
+        if isinstance(value, bool):
+            parts.append(f"{key}={'True' if value else 'False'}")
+        elif value is None:
+            parts.append(f"{key}=None")
+        elif isinstance(value, str):
+            escaped = (
+                value.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+            )
+            parts.append(f'{key}="{escaped}"')
+        else:
+            parts.append(f"{key}={json.dumps(value, ensure_ascii=False)}")
+    return ", ".join(parts)
+
+
+def _tool_call_dict_to_event(tc: dict, *, tools: list[dict] | None = None) -> dict:
+    """Convert an OpenAI-format tool_call dict to stream_events format."""
+    func = tc.get("function", {}) if isinstance(tc, dict) else {}
+    raw_args = func.get("arguments", "{}") if isinstance(func, dict) else "{}"
+    if isinstance(raw_args, str):
+        try:
+            parsed_args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            parsed_args = {"raw": raw_args}
+    else:
+        parsed_args = raw_args
+    return _post_process_tool_call({
+        "type": "tool_call",
+        "call_id": tc.get("id", uuid.uuid4().hex) if isinstance(tc, dict) else uuid.uuid4().hex,
+        "name": func.get("name", "unknown") if isinstance(func, dict) else "unknown",
+        "arguments": parsed_args if isinstance(parsed_args, dict) else {},
+    }, tools)
+
+
+def _post_process_tool_call(ev_data: dict, tools: list[dict] | None) -> dict:
+    """Apply schema coercion and small compatibility fixups to tool_call events."""
+    if ev_data.get("type") != "tool_call":
+        return ev_data
+    name = str(ev_data.get("name") or "")
+    args = ev_data.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    if tools:
+        args = _coerce_args_to_schema(args, name, tools)
+    args = _fixup_skill_params(name, args)
+    return {**ev_data, "arguments": args}
 
 
 class _StreamSieve:
