@@ -6580,7 +6580,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # — they may fail for other reasons. If all KNOWN models are too small
             # (or on cooldown), we return 413 rather than burning through the chain
             # and producing a 503.
-            if _approx_tokens > 0 and len(_passthrough_models) > 0:
+            _has_external_cli_passthrough = any(
+                _pm == "claude-code-cli"
+                or _pm.startswith("claude-code-cli/")
+                or _pm == "mimocode-cli"
+                or _pm.startswith("mimocode-cli/")
+                for _pm in _passthrough_models
+            )
+            if _approx_tokens > 0 and len(_passthrough_models) > 0 and not _has_external_cli_passthrough:
                 _max_known_ctx = 0
                 _any_viable = False
                 _known_models = []
