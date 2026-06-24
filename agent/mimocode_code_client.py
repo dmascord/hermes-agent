@@ -372,17 +372,25 @@ class MiMoCodeClient:
             else:
                 cmd += ["--continue"]
 
-        if prompt:
-            cmd += [prompt]
+        # Pass prompt via stdin instead of argv to avoid OS arg-length limits
+        prompt_bytes = prompt.encode("utf-8") if prompt else None
 
         env = _build_subprocess_env()
-        _logger.info("[mimocode-cli] running: %s cwd=%s", " ".join(cmd[:8]), cwd)
+        _logger.info("[mimocode-cli] running: %s cwd=%s prompt_via_stdin=%s", " ".join(cmd[:8]), cwd, bool(prompt_bytes))
 
         proc = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            cmd, stdin=subprocess.PIPE if prompt_bytes else subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env, text=False,
             cwd=cwd,
         )
+
+        # Write prompt to stdin and close it
+        if prompt_bytes and proc.stdin:
+            try:
+                proc.stdin.write(prompt_bytes)
+                proc.stdin.close()
+            except Exception:
+                pass
 
         text_parts = []
         tool_calls = []
@@ -628,17 +636,26 @@ class MiMoCodeClient:
             else:
                 cmd += ["--continue"]
 
-        if prompt:
-            cmd += [prompt]
+        # Pass prompt via stdin instead of argv to avoid OS arg-length limits
+        # (~128KB). Large prompts with many tools exceed argv limits.
+        prompt_bytes = prompt.encode("utf-8") if prompt else None
 
         env = _build_subprocess_env()
-        _logger.info("[mimocode-cli] stream_events: %s cwd=%s", " ".join(cmd[:8]), cwd)
+        _logger.info("[mimocode-cli] stream_events: %s cwd=%s prompt_via_stdin=%s", " ".join(cmd[:8]), cwd, bool(prompt_bytes))
 
         proc = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            cmd, stdin=subprocess.PIPE if prompt_bytes else subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env, text=False,
             cwd=cwd,
         )
+
+        # Write prompt to stdin and close it so the process can read it
+        if prompt_bytes and proc.stdin:
+            try:
+                proc.stdin.write(prompt_bytes)
+                proc.stdin.close()
+            except Exception:
+                pass
 
         # Drain stderr in a background thread
         stderr_lines: list[str] = []
