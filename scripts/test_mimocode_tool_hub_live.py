@@ -11,7 +11,7 @@ Tests the full pipeline:
 7. Mimo subprocess continues and produces final response
 
 Usage:
-  export API_SERVER_KEY=b49a80d538b98987e2f0c385bba137c79f017051cef9b95efd61929791dd4218
+  export API_SERVER_KEY=<your gateway API key>
   python3 scripts/test_mimocode_tool_hub_live.py
 """
 
