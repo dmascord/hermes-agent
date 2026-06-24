@@ -1855,7 +1855,7 @@ def _enrich_client_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
     else:
         return tc
 
-    if name in {"bash", "terminal"}:
+    if name in {"bash", "terminal", "mcp_bash"}:
         parsed = _external_tool_call_arguments(name, parsed)
 
     fn["arguments"] = json.dumps(parsed, ensure_ascii=False)
@@ -1880,7 +1880,7 @@ def _has_empty_bash_tool_call(tool_calls: list) -> bool:
     """
     for tc in tool_calls:
         name = tc.get("function", {}).get("name", "")
-        if name != "bash":
+        if name not in ("bash", "mcp_bash"):
             continue
         args_raw = tc.get("function", {}).get("arguments", "{}")
         if isinstance(args_raw, str):
@@ -2100,8 +2100,14 @@ def _enrich_client_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
 def _normalize_external_tool_name(name: Any) -> str:
     """Map Hermes/internal tool names to client-exposed OpenCode tool names."""
     raw = str(name or "").strip()
-    if raw == "terminal":
+    if raw in ("terminal", "mcp_bash"):
         return "bash"
+    if raw in ("mcp_read",):
+        return "read"
+    if raw in ("mcp_write",):
+        return "write"
+    if raw in ("mcp_edit",):
+        return "edit"
     return raw
 
 
