@@ -233,6 +233,9 @@ DEFAULT_CONTEXT_LENGTHS = {
     "hy3-preview": 262144,
     # Nemotron — NVIDIA's open-weights series (128K context across all sizes)
     "nemotron": 131072,
+    "nemotron-3-ultra-550b-a55b": 1000000,  # 1M context, OpenRouter free
+    "nemotron-3-super-120b-a12b": 1000000,  # 1M context, OpenRouter free
+    "laguna-m": 262144,                      # 256K context, Poolside via OpenRouter
     # Arcee
     "trinity": 262144,
     # OpenRouter
