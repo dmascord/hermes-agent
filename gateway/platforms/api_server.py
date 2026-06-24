@@ -6264,16 +6264,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 _passthrough_has_reasoning, _has_rc_msgs, len(history),
             )
 
-            # Fabricate reasoning_content for consistency when history is mixed.
-            # This prevents models that require reasoning echo from being skipped
-            # when some assistant messages have reasoning_content and some don't.
-            _mixed_rc = _passthrough_has_reasoning and 0 < len(_has_rc_msgs) < sum(
-                1 for m in passthrough_messages if isinstance(m, dict) and m.get("role") == "assistant"
-            )
-            if _mixed_rc:
-                passthrough_messages = _fabricate_reasoning_for_consistency(passthrough_messages)
-                _passthrough_has_reasoning = True  # now all have it
-
             def _strip_reasoning(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 """Return a shallow copy of msgs with reasoning_content removed from assistant turns."""
                 out = []
@@ -6325,6 +6315,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         m = {**m, "reasoning_content": " "}
                     out.append(m)
                 return out
+
+            # Fabricate reasoning_content for consistency when history is mixed.
+            # This prevents models that require reasoning echo from being skipped
+            # when some assistant messages have reasoning_content and some don't.
+            _mixed_rc = _passthrough_has_reasoning and 0 < len(_has_rc_msgs) < sum(
+                1 for m in passthrough_messages if isinstance(m, dict) and m.get("role") == "assistant"
+            )
+            if _mixed_rc:
+                passthrough_messages = _fabricate_reasoning_for_consistency(passthrough_messages)
+                _passthrough_has_reasoning = True  # now all have it
 
             def _truncate_messages_for_context(msgs: List[Dict[str, Any]], target_tokens: int) -> List[Dict[str, Any]]:
                 """Truncate conversation to fit within target_tokens by removing middle messages.
