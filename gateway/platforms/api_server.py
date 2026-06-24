@@ -6264,6 +6264,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 _passthrough_has_reasoning, _has_rc_msgs, len(history),
             )
 
+            # Fabricate reasoning_content for consistency when history is mixed.
+            # This prevents models that require reasoning echo from being skipped
+            # when some assistant messages have reasoning_content and some don't.
+            _mixed_rc = _passthrough_has_reasoning and 0 < len(_has_rc_msgs) < sum(
+                1 for m in passthrough_messages if isinstance(m, dict) and m.get("role") == "assistant"
+            )
+            if _mixed_rc:
+                passthrough_messages = _fabricate_reasoning_for_consistency(passthrough_messages)
+                _passthrough_has_reasoning = True  # now all have it
+
             def _strip_reasoning(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 """Return a shallow copy of msgs with reasoning_content removed from assistant turns."""
                 out = []
@@ -6295,6 +6305,75 @@ class APIServerAdapter(BasePlatformAdapter):
                         m = {**m, "reasoning_content": ""}
                     out.append(m)
                 return out
+
+            def _fabricate_reasoning_for_consistency(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                """Add a placeholder reasoning_content to assistant messages that lack it.
+
+                When a conversation has mixed history (some assistant messages have
+                reasoning_content, some don't), models that require reasoning echo
+                (DeepSeek, MiMo, etc.) are skipped.  This function adds a minimal
+                placeholder to make the history consistent so these models can be used.
+                The placeholder is stripped by _strip_reasoning for providers that reject it.
+                """
+                out = []
+                for m in msgs:
+                    if (
+                        isinstance(m, dict)
+                        and m.get("role") == "assistant"
+                        and "reasoning_content" not in m
+                    ):
+                        m = {**m, "reasoning_content": " "}
+                    out.append(m)
+                return out
+
+            def _truncate_messages_for_context(msgs: List[Dict[str, Any]], target_tokens: int) -> List[Dict[str, Any]]:
+                """Truncate conversation to fit within target_tokens by removing middle messages.
+
+                Keeps the head (system + first user-assistant exchange) and tail
+                (recent messages), removing the middle.  Inserts a summary marker
+                so the model understands context was compacted.
+                """
+                from agent.model_metadata import estimate_messages_tokens_rough
+                current = estimate_messages_tokens_rough(msgs)
+                if current <= target_tokens:
+                    return msgs
+
+                # Find head boundary: system prompt + first user message + first assistant response
+                head_end = 0
+                for i, m in enumerate(msgs):
+                    if isinstance(m, dict) and m.get("role") == "assistant":
+                        head_end = i + 1
+                        break
+                head_end = max(head_end, 2)  # at least system + first user
+
+                # Find tail: work backwards from end, keeping messages until we hit target
+                tail_start = len(msgs)
+                tail_tokens = 0
+                tail_budget = int(target_tokens * 0.4)  # 40% for tail
+                for i in range(len(msgs) - 1, head_end - 1, -1):
+                    msg_tokens = estimate_messages_tokens_rough([msgs[i]])
+                    if tail_tokens + msg_tokens > tail_budget:
+                        break
+                    tail_tokens += msg_tokens
+                    tail_start = i
+
+                if tail_start <= head_end:
+                    # Can't compress enough — return as-is and let provider fail
+                    return msgs
+
+                # Build compressed message list
+                head = msgs[:head_end]
+                tail = msgs[tail_start:]
+                compressed = head + [
+                    {"role": "system", "content": "[CONTEXT COMPACTED — middle messages removed to fit model context window. Continuing from recent conversation.]"}
+                ] + tail
+
+                new_tokens = estimate_messages_tokens_rough(compressed)
+                logger.warning(
+                    "[hermes-code] auto-truncated context: %d msgs (%d tokens) → %d msgs (%d tokens)",
+                    len(msgs), current, len(compressed), new_tokens,
+                )
+                return compressed
 
             def _requires_reasoning_echo(model_id: str, provider: str = "", base_url: str = "") -> bool:
                 """Return True for models that require reasoning_content echoed back.
@@ -6574,12 +6653,12 @@ class APIServerAdapter(BasePlatformAdapter):
             # ── Context overflow guard ──────────────────────────────────────────────
             # When ALL passthrough models have KNOWN context windows too small for the
             # estimated token count, OR all context-capable models are on cooldown,
-            # return 413 telling the client to compact.
+            # auto-truncate the conversation to fit the largest available context.
+            # If truncation still isn't enough, return 413 telling the client to compact.
             #
             # NOTE: Models with UNKNOWN context are NOT assumed to handle the request
             # — they may fail for other reasons. If all KNOWN models are too small
-            # (or on cooldown), we return 413 rather than burning through the chain
-            # and producing a 503.
+            # (or on cooldown), we try truncation first, then 413.
             _has_external_cli_passthrough = any(
                 _pm == "claude-code-cli"
                 or _pm.startswith("claude-code-cli/")
@@ -6611,6 +6690,35 @@ class APIServerAdapter(BasePlatformAdapter):
                                     pass
                             if not _on_cooldown:
                                 _any_viable = True
+                if not _any_viable and _max_known_ctx < _approx_tokens:
+                    # Context too large — auto-truncate to fit largest available model
+                    _target_tokens = int(_max_known_ctx * 0.85)  # 85% margin
+                    passthrough_messages = _truncate_messages_for_context(passthrough_messages, _target_tokens)
+                    # Re-estimate tokens after truncation
+                    from agent.model_metadata import estimate_messages_tokens_rough
+                    _approx_tokens = estimate_messages_tokens_rough(passthrough_messages)
+                    logger.info(
+                        "[hermes-code] auto-truncated to ~%d tokens for max context %d",
+                        _approx_tokens, _max_known_ctx,
+                    )
+                    # Re-check viability with truncated messages
+                    _any_viable = False
+                    for _pm in _passthrough_models:
+                        _ctx = _model_context_length(_pm)
+                        if _ctx > 0 and _model_can_handle_context(_pm, _approx_tokens):
+                            _prov = _pm.split("/")[0] if "/" in _pm else ""
+                            _on_cooldown = False
+                            if _prov:
+                                try:
+                                    from agent.model_cooldown_db import model_cooldown_remaining
+                                    _rem = model_cooldown_remaining(_prov, _pm)
+                                    if _rem and _rem > 0:
+                                        _on_cooldown = True
+                                except Exception:
+                                    pass
+                            if not _on_cooldown:
+                                _any_viable = True
+                                break
                 if not _any_viable:
                     _models_summary = ", ".join(
                         f"{m}({f'{c:,}'})" for m, c in _known_models[:5]
