@@ -7506,63 +7506,28 @@ class APIServerAdapter(BasePlatformAdapter):
                                             _bridge_resp_failed = True
                                             _bridge_error_msg = "SSE write failed during tool_call_request"
                                             break
-                                        # Wait for the client to POST the result to
-                                        # /v1/sessions/{session_id}/tool_responses, OR a
-                                        # 300s timeout. Until then the MCP bridge stays
-                                        # blocked on the result file.
-                                        _pending_call = None
-                                        _tool_result_payload: dict = {"content": "[Tool execution timed out — no response from connected client]"}
+                                        # Register with the hub for clients that support the
+                                        # optional tool_call_request side-channel (e.g. the
+                                        # OMP daemon polling /pending-tool-calls).
+                                        # Do NOT block waiting for a hub result — the stream
+                                        # must close immediately with finish_reason=tool_calls
+                                        # so standard OpenAI clients receive the tool_calls
+                                        # and can send a follow-up request with tool results.
                                         if session_id:
                                             try:
                                                 from gateway.platforms import tool_call_hub
-                                                _t_register = time.monotonic()
-                                                _pending_call = tool_call_hub.register_call(
+                                                tool_call_hub.register_call(
                                                     session_id, _call_id, tool_name=_tool_name,
                                                     arguments=_tool_args,
                                                 )
                                                 logger.info(
-                                                    "[TIMING][req=%s][claude-stream] T+%.3fs registered tool_call_hub call_id=%s tool=%s args_keys=%s",
-                                                    _req_id, _t_register - _req_start,
-                                                    _call_id, _tool_name, list(_tool_args.keys()) if isinstance(_tool_args, dict) else [],
-                                                )
-                                                # Run the blocking wait in an executor so the
-                                                # asyncio event loop stays responsive (we're
-                                                # inside an `await _bridge_events.get()` loop).
-                                                def _wait_for_response(_p=_pending_call, _cid=_call_id, _t0=_t_register, _rid=_req_id):
-                                                    _waited = _p.event.wait(timeout=300)
-                                                    _t_done = time.monotonic()
-                                                    logger.info(
-                                                        "[TIMING][req=%s][claude-stream] T+%.3fs hub.wait returned call_id=%s waited=%.3fs status=%s",
-                                                        _rid, _t_done - _req_start, _cid, _t_done - _t0, _p.status,
-                                                    )
-                                                    return _p
-                                                _pending_call = await _s_loop.run_in_executor(None, _wait_for_response)
-                                                if _pending_call.status == "ok":
-                                                    _tool_result_payload = {"content": _pending_call.result if _pending_call.result is not None else ""}
-                                                elif _pending_call.status == "error":
-                                                    _tool_result_payload = {"error": _pending_call.result or "client-side tool error"}
-                                                else:
-                                                    _tool_result_payload = {"content": f"[Tool execution timed out — no response from connected client]"}
-                                                logger.info(
-                                                    "[TIMING][req=%s][claude-stream] T+%.3fs result written call_id=%s status=%s result_len=%d",
-                                                    _req_id, time.monotonic() - _req_start, _call_id, _pending_call.status,
-                                                    len(str(_pending_call.result or "")),
+                                                    "[TIMING][req=%s][claude-stream] T+%.3fs registered tool_call_hub call_id=%s tool=%s",
+                                                    _req_id, time.monotonic() - _req_start,
+                                                    _call_id, _tool_name,
                                                 )
                                             except Exception as _hub_exc:
-                                                logger.warning("[hermes-code] bridge: tool_call_hub error: %s", _hub_exc)
-                                                _tool_result_payload = {"content": f"[Tool hub error: {_hub_exc}]"}
-                                        # Write the REAL client-supplied result to the result
-                                        # file so the MCP bridge unblocks and the CLI sees
-                                        # the actual output (not a placeholder).
-                                        if _cc_client._queue_out_dir:
-                                            _result_path = os.path.join(_cc_client._queue_out_dir, f"{_call_id}.json")
-                                            try:
-                                                with open(_result_path, "w") as _rf:
-                                                    json.dump(_tool_result_payload, _rf)
-                                                logger.info("[hermes-code] bridge: wrote real result for %s (%d bytes)", _call_id, len(json.dumps(_tool_result_payload)))
-                                            except Exception as _re:
-                                                logger.warning("[hermes-code] bridge: failed to write result: %s", _re)
-                                        logger.info("[hermes-code] bridge: streamed tool_call %s to OMP", _call_id)
+                                                logger.warning("[hermes-code] bridge: tool_call_hub register failed: %s", _hub_exc)
+                                        logger.info("[hermes-code] bridge: streamed tool_call %s (non-blocking)", _call_id)
                                     elif _bt in ("text", "assistant_text"):
                                         _text = _be.get("text", "")
                                         if _text:
@@ -7775,65 +7740,26 @@ class APIServerAdapter(BasePlatformAdapter):
                                             _bridge_resp_failed = True
                                             _bridge_error_msg = "SSE write failed during tool_call_request"
                                             break
-                                        _pending_call = None
-                                        _tool_result_payload: dict = {"content": "[Tool execution timed out — no response from connected client]"}
+                                        # Register with the hub for clients that support the
+                                        # optional tool_call_request side-channel.
+                                        # Do NOT block waiting for a hub result — the stream
+                                        # must close immediately with finish_reason=tool_calls
+                                        # so standard OpenAI clients receive the tool_calls
+                                        # and can send a follow-up request with tool results.
                                         if session_id:
                                             try:
                                                 from gateway.platforms import tool_call_hub
-                                                _t_register = time.monotonic()
-                                                _pending_call = tool_call_hub.register_call(
+                                                tool_call_hub.register_call(
                                                     session_id, _call_id, tool_name=_tool_name,
                                                     arguments=_tool_args,
                                                 )
                                                 logger.info(
-                                                    "[TIMING][req=%s][mimo-stream] T+%.3fs registered tool_call_hub call_id=%s tool=%s args_keys=%s",
-                                                    _req_id, _t_register - _req_start,
-                                                    _call_id, _tool_name, list(_tool_args.keys()) if isinstance(_tool_args, dict) else [],
-                                                )
-                                                def _wait_for_response_mc(_p=_pending_call, _cid=_call_id, _t0=_t_register, _rid=_req_id):
-                                                    _waited = _p.event.wait(timeout=300)
-                                                    _t_done = time.monotonic()
-                                                    logger.info(
-                                                        "[TIMING][req=%s][mimo-stream] T+%.3fs hub.wait returned call_id=%s waited=%.3fs status=%s",
-                                                        _rid, _t_done - _req_start, _cid, _t_done - _t0, _p.status,
-                                                    )
-                                                    return _p
-                                                _pending_call = await _s_loop.run_in_executor(None, _wait_for_response_mc)
-                                                if _pending_call.status == "ok":
-                                                    _tool_result_payload = {"content": _pending_call.result if _pending_call.result is not None else ""}
-                                                elif _pending_call.status == "error":
-                                                    _tool_result_payload = {"error": _pending_call.result or "client-side tool error"}
-                                                else:
-                                                    _tool_result_payload = {"content": f"[Tool execution timed out — no response from connected client]"}
-                                                logger.info(
-                                                    "[TIMING][req=%s][mimo-stream] T+%.3fs result written call_id=%s status=%s result_len=%d",
-                                                    _req_id, time.monotonic() - _req_start, _call_id, _pending_call.status,
-                                                    len(str(_pending_call.result or "")),
-                                                )
-                                                # Cache the latest tool result so we can
-                                                # synthesize a final assistant text if
-                                                # mimo exits without producing one.
-                                                _bridge_last_tool_result = (
-                                                    _pending_call.result
-                                                    if _pending_call.result is not None
-                                                    else ""
+                                                    "[TIMING][req=%s][mimo-stream] T+%.3fs registered tool_call_hub call_id=%s tool=%s",
+                                                    _req_id, time.monotonic() - _req_start,
+                                                    _call_id, _tool_name,
                                                 )
                                             except Exception as _hub_exc:
-                                                logger.warning("[hermes-code] mimocode-cli bridge: tool_call_hub error: %s", _hub_exc)
-                                                _tool_result_payload = {"content": f"[Tool hub error: {_hub_exc}]"}
-                                                _bridge_last_tool_result = _tool_result_payload.get("content", "")
-                                        if _mc_client._queue_out_dir:
-                                            _result_path = os.path.join(_mc_client._queue_out_dir, f"{_call_id}.json")
-                                            try:
-                                                # Make sure the result dir still exists
-                                                # (it may have been cleaned up between
-                                                # mimo subprocess exit and bridge write).
-                                                os.makedirs(_mc_client._queue_out_dir, exist_ok=True)
-                                                with open(_result_path, "w") as _rf:
-                                                    json.dump(_tool_result_payload, _rf)
-                                                logger.info("[hermes-code] mimocode-cli bridge: wrote real result for %s (%d bytes)", _call_id, len(json.dumps(_tool_result_payload)))
-                                            except Exception as _re:
-                                                logger.warning("[hermes-code] mimocode-cli bridge: failed to write result: %s", _re)
+                                                logger.warning("[hermes-code] mimocode-cli bridge: tool_call_hub register failed: %s", _hub_exc)
                                     elif _bt in ("text", "assistant_text"):
                                         _chunk_text = _be.get("text", "")
                                         _bridge_final_text += _chunk_text
