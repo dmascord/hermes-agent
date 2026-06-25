@@ -4249,17 +4249,23 @@ def _detect_and_nudge_tool_loop(
     """Detect a potential tool-call loop and inject a synthetic recovery
     message into ``passthrough_messages`` to break it.
 
-    A loop is defined as the assistant invoking the same set of function names
-    ``threshold`` or more consecutive times.  Each round-trip is:
+    A loop is defined as the assistant invoking the **exact same tool call**
+    (same function name AND same arguments) ``threshold`` or more consecutive
+    times.  Each round-trip is:
 
         assistant (tool_calls=[...]) → one or more tool results
 
     We walk the message list backwards from the tail, collecting these
     round-trips until we hit a user message (new instruction resets the count).
 
+    Only considers rounds where **all** tool calls in the round match the
+    previous round's calls (same names and arguments).  Using the same tool
+    with different arguments (e.g. different bash commands) is normal usage
+    and does NOT trigger the detector.
+
     Returns True if a loop was detected AND a recovery message was injected.
     """
-    rounds: List[frozenset] = []
+    rounds: List[tuple] = []
     recent_results: List[str] = []
     collecting_results = True
     i = len(passthrough_messages) - 1
@@ -4285,12 +4291,20 @@ def _detect_and_nudge_tool_loop(
             tcs = msg.get("tool_calls")
             if not isinstance(tcs, list) or not tcs:
                 break
-            fn_names: frozenset = frozenset(
-                tc.get("function", {}).get("name", "") or ""
+            # Build a signature of (function_name, arguments) tuples for the round.
+            # This ensures that different arguments (e.g. different bash commands)
+            # are NOT treated as identical — only truly identical tool calls loop.
+            sig: tuple = tuple(
+                (
+                    tc.get("function", {}).get("name", "") or "",
+                    tc.get("function", {}).get("arguments", "") or "",
+                )
                 for tc in tcs
                 if isinstance(tc, dict)
             )
-            rounds.append(fn_names)
+            if not sig:
+                break
+            rounds.append(sig)
             i -= 1
             continue
         i -= 1
@@ -4302,13 +4316,25 @@ def _detect_and_nudge_tool_loop(
     if len(set(recent)) != 1:
         return False
 
-    fn_list = ", ".join(sorted(next(iter(recent)))) or "<unknown>"
+    # Extract the looped tool name(s) for the recovery message.
+    sig = recent[0]
+    fn_names = ", ".join(sorted({name for name, _ in sig})) or "<unknown>"
+    # Show a brief preview of the repeated command.
+    preview = ""
+    for name, args in sig:
+        if name == "bash" and args:
+            # Try to extract the command from JSON args
+            import re as _re
+            cmd_match = _re.search(r'"command"\s*:\s*"([^"]{1,80})', args)
+            if cmd_match:
+                preview = f" — command: {cmd_match.group(1)}"
+                break
     is_polling = any(_looks_like_polling_result(r) for r in recent_results)
     loop_type = "polling-loop" if is_polling else "stuck-loop"
     logger.warning(
-        "[hermes-code] [ACTIVE] %s detected: tool(s) [%s] called %d+ times "
+        "[hermes-code] [ACTIVE] %s detected: tool(s) [%s]%s called %d+ times "
         "in a row (total_rounds_seen=%d, total_messages=%d) — injecting recovery message",
-        loop_type, fn_list, threshold, len(rounds), len(passthrough_messages),
+        loop_type, fn_names, preview, threshold, len(rounds), len(passthrough_messages),
     )
     # Inject a synthetic system message at the end of passthrough_messages
     # to break the loop.  The model will see this on the next provider call
@@ -4316,8 +4342,8 @@ def _detect_and_nudge_tool_loop(
     recovery_msg = {
         "role": "system",
         "content": (
-            f"[hermes-gateway] TOOL LOOP DETECTED: You have invoked the same tool(s) "
-            f"[{fn_list}] {len(rounds)} times consecutively with identical calls. "
+            f"[hermes-gateway] TOOL LOOP DETECTED: You have invoked the same tool call(s) "
+            f"[{fn_names}]{preview} {len(rounds)} times consecutively with identical arguments. "
             f"The tool results are already in the conversation above — do NOT re-issue "
             f"the same tool call. Instead, analyze the results you already received and "
             f"provide a text summary or move on to the next step."
