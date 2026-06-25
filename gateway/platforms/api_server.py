@@ -4246,8 +4246,8 @@ def _detect_and_nudge_tool_loop(
     passthrough_messages: List[Dict[str, Any]],
     threshold: int = 3,
 ) -> bool:
-    """Audit-mode: detect a potential tool-call loop and log it, but do NOT
-    mutate passthrough_messages or inject anything into the conversation.
+    """Detect a potential tool-call loop and inject a synthetic recovery
+    message into ``passthrough_messages`` to break it.
 
     A loop is defined as the assistant invoking the same set of function names
     ``threshold`` or more consecutive times.  Each round-trip is:
@@ -4257,8 +4257,7 @@ def _detect_and_nudge_tool_loop(
     We walk the message list backwards from the tail, collecting these
     round-trips until we hit a user message (new instruction resets the count).
 
-    Returns True if a loop was detected (for logging at the call site).
-    The caller must NOT act on the return value to mutate the stream.
+    Returns True if a loop was detected AND a recovery message was injected.
     """
     rounds: List[frozenset] = []
     recent_results: List[str] = []
@@ -4307,10 +4306,24 @@ def _detect_and_nudge_tool_loop(
     is_polling = any(_looks_like_polling_result(r) for r in recent_results)
     loop_type = "polling-loop" if is_polling else "stuck-loop"
     logger.warning(
-        "[hermes-code] [AUDIT] potential %s detected: tool(s) [%s] called %d+ times "
-        "in a row (total_rounds_seen=%d, total_messages=%d) — NOT injecting, observing only",
+        "[hermes-code] [ACTIVE] %s detected: tool(s) [%s] called %d+ times "
+        "in a row (total_rounds_seen=%d, total_messages=%d) — injecting recovery message",
         loop_type, fn_list, threshold, len(rounds), len(passthrough_messages),
     )
+    # Inject a synthetic system message at the end of passthrough_messages
+    # to break the loop.  The model will see this on the next provider call
+    # and be forced to acknowledge it cannot re-issue the same tool call.
+    recovery_msg = {
+        "role": "system",
+        "content": (
+            f"[hermes-gateway] TOOL LOOP DETECTED: You have invoked the same tool(s) "
+            f"[{fn_list}] {len(rounds)} times consecutively with identical calls. "
+            f"The tool results are already in the conversation above — do NOT re-issue "
+            f"the same tool call. Instead, analyze the results you already received and "
+            f"provide a text summary or move on to the next step."
+        ),
+    }
+    passthrough_messages.append(recovery_msg)
     return True
 
 
