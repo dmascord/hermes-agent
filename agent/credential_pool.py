@@ -220,6 +220,16 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
+def _is_codex_device_code_source(source: str) -> bool:
+    normalized = (source or "").strip().lower()
+    return normalized == "device_code" or normalized.startswith("manual:device_code")
+
+
+def _codex_source_adopts_singleton_tokens(source: str) -> bool:
+    normalized = (source or "").strip().lower()
+    return normalized in {"device_code", "manual:device_code"}
+
+
 def _rate_limit_cooldown_seconds() -> float:
     """Fallback cooldown for exhausted credentials when the provider sends no timing hint.
 
@@ -477,7 +487,7 @@ class CredentialPool:
                 cooldown_seconds = _rate_limit_cooldown_seconds()
             mark_model_cooldown(
                 provider=self.provider,
-                model=entry.model or "*",
+                model=str(getattr(entry, "model", "") or "*"),
                 credential_id=entry.label or entry.id,
                 cooldown_seconds=cooldown_seconds,
                 reason=normalized_error.get("reason") or "rate_limit_exhausted",
@@ -543,7 +553,7 @@ class CredentialPool:
         Error markers are still cleared for all device_code-sourced entries
         so a re-auth gives every pool entry a fresh selection chance.
         """
-        if self.provider != "openai-codex" or not str(entry.source or "").endswith("device_code"):
+        if self.provider != "openai-codex" or not _is_codex_device_code_source(entry.source):
             return entry
         try:
             with _auth_store_lock():
@@ -558,10 +568,11 @@ class CredentialPool:
             store_refresh = tokens.get("refresh_token", "")
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
-            # Only adopt auth.json tokens for the singleton device_code entry.
-            # Manual entries have their own accounts — syncing the singleton's
-            # tokens into them would destroy the other accounts' credentials.
-            if entry.source == "device_code" and store_access and (
+            # Only adopt auth.json tokens for singleton/legacy device_code
+            # entries. Labelled manual entries have their own accounts —
+            # syncing the singleton's tokens into them would destroy the
+            # other accounts' credentials.
+            if _codex_source_adopts_singleton_tokens(entry.source) and store_access and (
                 store_access != entry_access
                 or (store_refresh and store_refresh != entry_refresh)
             ):
@@ -890,6 +901,24 @@ class CredentialPool:
                     self._persist()
                     self._sync_device_code_entry_to_auth_store(updated)
                     return updated
+            if self.provider == "openai-codex":
+                error_context = {
+                    "reason": "refresh_failed",
+                    "message": str(exc)[:500],
+                }
+                if isinstance(exc, auth_mod.AuthError):
+                    if exc.code:
+                        error_context["reason"] = f"refresh_failed:{exc.code}"
+                    if exc.relogin_required:
+                        error_context["reset_at"] = time.time() + 86400.0
+                elif auth_mod.is_rate_limited_auth_error(exc):
+                    error_context["reason"] = "refresh_rate_limited"
+                self._mark_exhausted(
+                    entry,
+                    401 if getattr(exc, "relogin_required", False) else None,
+                    error_context,
+                )
+                return None
             self._mark_exhausted(entry, None)
             return None
 
@@ -997,7 +1026,7 @@ class CredentialPool:
                     from agent.model_cooldown_db import model_cooldown_remaining
                     remaining = model_cooldown_remaining(
                         provider=self.provider,
-                        model=entry.model or "*",
+                        model=str(getattr(entry, "model", "") or "*"),
                         credential_id=entry.label,
                     )
                     if remaining > 0:
@@ -1382,14 +1411,32 @@ class CredentialPool:
                 from hermes_cli.auth import _is_terminal_codex_oauth_refresh_error
                 if _is_terminal_codex_oauth_refresh_error(self._last_refresh_error):
                     # Remove the dead device_code entry from the pool
-                    self._entries = [e for e in self._entries if e is not entry]
+                    self._entries = [e for e in self._entries if e.id != entry.id]
                     self._current_id = None
                     self._persist()
-                    # Clear auth.json tokens so _seed_from_singletons()
-                    # doesn't resurrect the dead entry on next pool load
+                    # Clear only the singleton provider tokens so
+                    # _seed_from_singletons() doesn't resurrect the dead
+                    # device_code entry on next pool load.  Do not call the
+                    # logout-style provider clearer here: it deletes the whole
+                    # credential_pool.openai-codex list, including independent
+                    # labelled accounts.
                     try:
-                        from hermes_cli.auth import _clear_auth_store_provider
-                        _clear_auth_store_provider(self.provider)
+                        with _auth_store_lock():
+                            auth_store = _load_auth_store()
+                            providers = auth_store.setdefault("providers", {})
+                            if isinstance(providers, dict):
+                                providers[self.provider] = {
+                                    "auth_mode": "chatgpt",
+                                    "tokens": {},
+                                    "last_auth_error": {
+                                        "code": getattr(self._last_refresh_error, "code", "codex_refresh_failed"),
+                                        "message": str(self._last_refresh_error),
+                                        "relogin_required": bool(getattr(self._last_refresh_error, "relogin_required", True)),
+                                    },
+                                }
+                            if auth_store.get("active_provider") == self.provider:
+                                auth_store["active_provider"] = None
+                            _save_auth_store(auth_store)
                     except Exception:
                         pass
                     logger.warning(

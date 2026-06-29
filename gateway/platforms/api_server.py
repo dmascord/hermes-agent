@@ -2191,7 +2191,7 @@ def _fallback_provider_for_model(model_id: str) -> tuple[str, str]:
     prefix, rest = raw.split("/", 1)
     prefix = prefix.strip().lower()
     rest = rest.strip()
-    if prefix == "openai":
+    if prefix in ("openai", "openai-codex"):
         return "openai-codex", raw
     if prefix in {"github-copilot", "opencode-go", "opencode-zen", "zai", "minimax", "xiaomi", "ollama", "arliai"}:
         # CRITICAL FIX: Return bare model name (rest) without provider prefix for OpenCode providers
@@ -2844,24 +2844,15 @@ def _hermes_code_model_is_selectable(model: str) -> bool:
             pool = load_pool("openai-codex")
             if not pool.has_available():
                 return False
-            # Use pool-wide min-exhausted reset: the cooldown DB record stores the
-            # pool-level minimum _exhausted_until across all entries (computed in
-            # mark_exhausted_and_rotate).  Pass entry.label as the model key so the
-            # lookup matches that record.  If no cooldown record exists (keyed by
-            # entry.label), model_cooldown_remaining returns 0 and the check passes.
             entries = [entry for entry in pool.entries() if getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")]
             if not entries:
                 return False
-            # Use the first entry's label for the cooldown DB key lookup.  The pool-wide
-            # cooldown is keyed to the label of the entry that triggered mark_exhausted_and_rotate.
-            entry_label = str(entries[0].label or entries[0].id)
-            base_url = str(getattr(entries[0], "runtime_base_url", None) or getattr(entries[0], "base_url", "") or os.getenv("OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"))
-            remaining = model_cooldown_remaining("openai-codex", entry_label, base_url=base_url)
-            if remaining and remaining > 0:
-                return False
             # Also check model-specific cooldown (e.g., empty bash blacklist for gpt-5.5).
             # This catches per-model cooling set when a model returns empty bash commands.
-            _model_remaining = model_cooldown_remaining("openai", raw)
+            _model_remaining = max(
+                model_cooldown_remaining("openai", raw),
+                model_cooldown_remaining("openai-codex", raw),
+            )
             if _model_remaining and _model_remaining > 0:
                 return False
             return True
@@ -3558,9 +3549,10 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                 runtime_kwargs["base_url"] = "mimocode://codex"
                 runtime_kwargs["api_key"] = "mimocode-cli"
                 runtime_kwargs["provider"] = "mimocode-cli"
-        elif provider_prefix == "openai":
-            openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
-            openai_base = os.getenv("OPENAI_BASE_URL", "").strip()
+        elif provider_prefix in ("openai", "openai-codex"):
+            explicit_codex = provider_prefix == "openai-codex"
+            openai_api_key = "" if explicit_codex else os.getenv("OPENAI_API_KEY", "").strip()
+            openai_base = "" if explicit_codex else os.getenv("OPENAI_BASE_URL", "").strip()
             codex_key = (
                 os.getenv("OPENAI_CODEX_API_KEY", "").strip()
                 or os.getenv("OPENAI_OAUTH_TOKEN", "").strip()

@@ -2641,6 +2641,36 @@ def test_sync_codex_entry_noop_when_tokens_match(tmp_path, monkeypatch):
     assert synced is entry
 
 
+def test_sync_codex_manual_label_clears_expired_blank_exhaustion(tmp_path, monkeypatch):
+    """Labelled Codex device-code entries must get the same stale-status
+    recovery as the singleton entry, without adopting singleton tokens.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_auth_store("singleton-access", "singleton-refresh"))
+
+    from agent.credential_pool import CredentialPool, PooledCredential, STATUS_EXHAUSTED
+
+    entry = PooledCredential.from_dict("openai-codex", {
+        "id": "manual-labelled",
+        "label": "damien.01@tusker.net.au",
+        "source": "manual:device_code:damien.01@tusker.net.au",
+        "auth_type": "oauth",
+        "access_token": "account-access",
+        "refresh_token": "account-refresh",
+        "last_status": STATUS_EXHAUSTED,
+        "last_status_at": time.time() - 7200,
+    })
+    pool = CredentialPool("openai-codex", [entry])
+
+    synced = pool._sync_codex_entry_from_auth_store(entry)
+
+    assert synced is not entry
+    assert synced.access_token == "account-access"
+    assert synced.refresh_token == "account-refresh"
+    assert synced.last_status is None
+    assert synced.last_error_reset_at is None
+
+
 def test_codex_exhausted_entry_recovers_via_auth_store_sync(tmp_path, monkeypatch):
     """An exhausted Codex entry should recover when auth.json has newer tokens.
 
@@ -2688,6 +2718,150 @@ def test_codex_exhausted_entry_recovers_via_auth_store_sync(tmp_path, monkeypatc
     assert available[0].refresh_token == "refresh-FRESH"
     assert available[0].last_status is None
     assert available[0].last_error_reset_at is None
+
+
+def test_codex_exhaustion_records_per_credential_cooldown(tmp_path, monkeypatch):
+    """A Codex 429 should persist the exhausted account cooldown under the
+    wildcard model key.
+
+    Regression: ``PooledCredential`` has no ``model`` attribute, so the
+    best-effort cooldown write raised ``AttributeError`` and was silently
+    skipped.  Other pool instances then had less information for recovery and
+    diagnostics.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "codex-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code:primary",
+                        "access_token": "access-primary",
+                        "refresh_token": "refresh-primary",
+                    },
+                    {
+                        "id": "codex-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code:secondary",
+                        "access_token": "access-secondary",
+                        "refresh_token": "refresh-secondary",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from agent.model_cooldown_db import model_cooldown_remaining
+
+    pool = load_pool("openai-codex")
+    assert pool.select().label == "primary"
+
+    pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"reason": "token_quota_exceeded", "message": "quota exceeded"},
+    )
+
+    remaining = model_cooldown_remaining(
+        "openai-codex",
+        "*",
+        credential_id="primary",
+    )
+    assert remaining > 0
+
+
+def test_hermes_code_selectable_when_first_codex_account_is_cooling_down(tmp_path, monkeypatch):
+    """The hermes-code selector must not reject the whole Codex provider just
+    because the first stored account is cooling down.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    base_url = "https://chatgpt.com/backend-api/codex"
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "codex-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code:primary",
+                        "access_token": "access-primary",
+                        "refresh_token": "refresh-primary",
+                        "base_url": base_url,
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reset_at": time.time() + 3600,
+                    },
+                    {
+                        "id": "codex-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code:secondary",
+                        "access_token": "access-secondary",
+                        "refresh_token": "refresh-secondary",
+                        "base_url": base_url,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.model_cooldown_db import mark_model_cooldown
+    from gateway.platforms.api_server import _hermes_code_model_is_selectable
+
+    mark_model_cooldown(
+        "openai-codex",
+        "primary",
+        base_url=base_url,
+        cooldown_seconds=3600,
+        reason="exhausted_429",
+    )
+
+    assert _hermes_code_model_is_selectable("openai/gpt-5.5") is True
+
+
+def test_runtime_kwargs_resolves_explicit_openai_codex_prefix(monkeypatch):
+    """The live Hermes fallback uses openai-codex/<model>; that prefix must
+    route through the Codex OAuth resolver, not the generic custom-provider
+    fallback with an empty API key.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    import hermes_cli.runtime_provider as runtime_provider
+    from gateway.platforms.api_server import _runtime_kwargs_for_model_id
+
+    def _fake_resolve_runtime_provider(*, requested=None, **_kwargs):
+        assert requested == "openai-codex"
+        return {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+        }
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", _fake_resolve_runtime_provider)
+
+    runtime_kwargs, resolved_model = _runtime_kwargs_for_model_id("openai-codex/gpt-5.4")
+
+    assert resolved_model == "gpt-5.4"
+    assert runtime_kwargs["provider"] == "openai-codex"
+    assert runtime_kwargs["api_mode"] == "codex_responses"
+    assert runtime_kwargs["api_key"] == "codex-token"
 
 
 def test_codex_exhausted_entry_stays_stuck_without_auth_store_update(tmp_path, monkeypatch):

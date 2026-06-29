@@ -3366,7 +3366,14 @@ def _sync_codex_pool_entries(
     # Sources whose tokens should be rewritten by a fresh Codex device-code
     # OAuth re-auth.  ``manual:api_key`` and unknown sources are intentionally
     # excluded — they represent independent credentials.
-    REFRESHABLE_SOURCES = {"device_code", "manual:device_code"}
+    def _is_codex_device_code_source(source: Any) -> bool:
+        normalized = str(source or "").strip().lower()
+        return normalized == "device_code" or normalized.startswith("manual:device_code")
+
+    def _codex_source_adopts_singleton_tokens(source: Any) -> bool:
+        normalized = str(source or "").strip().lower()
+        return normalized in {"device_code", "manual:device_code"}
+
     import time as _time
     _sync_expires_at_ms: Optional[int] = None
     if isinstance(expires_in, (int, float)) and expires_in > 0:
@@ -3375,7 +3382,7 @@ def _sync_codex_pool_entries(
         if not isinstance(entry, dict):
             continue
         source = entry.get("source")
-        if source not in REFRESHABLE_SOURCES:
+        if not _is_codex_device_code_source(source):
             continue
         # Only sync tokens to the device_code singleton entry.  Manual
         # device_code entries (manual:device_code:<label>) represent
@@ -3384,7 +3391,7 @@ def _sync_codex_pool_entries(
         # other accounts' credentials — the core cause of device token
         # burning.  Error markers are still cleared for all entries so
         # a re-auth gives every pool entry a fresh selection chance.
-        if source == "device_code":
+        if _codex_source_adopts_singleton_tokens(source):
             entry["access_token"] = access_token
             if refresh_token:
                 entry["refresh_token"] = refresh_token

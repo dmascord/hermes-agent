@@ -382,6 +382,61 @@ def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatc
     assert "refresh_token" not in api_key or api_key.get("refresh_token") is None
 
 
+def test_save_codex_tokens_clears_labelled_manual_device_code_errors(tmp_path, monkeypatch):
+    """Re-auth clears stale error markers on labelled manual Codex accounts
+    without overwriting their independent token pair.
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"access_token": "old-at", "refresh_token": "old-rt"},
+                "last_refresh": "2026-01-01T00:00:00Z",
+                "auth_mode": "chatgpt",
+            },
+        },
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "seeded",
+                    "source": "device_code",
+                    "auth_type": "oauth",
+                    "access_token": "old-at",
+                    "refresh_token": "old-rt",
+                },
+                {
+                    "id": "labelled",
+                    "source": "manual:device_code:damien.01@tusker.net.au",
+                    "auth_type": "oauth",
+                    "access_token": "labelled-at",
+                    "refresh_token": "labelled-rt",
+                    "last_status": "exhausted",
+                    "last_error_code": 401,
+                    "last_error_reason": "refresh_failed",
+                    "last_error_reset_at": 9999999999,
+                },
+            ],
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _save_codex_tokens({"access_token": "fresh-at", "refresh_token": "fresh-rt"},
+                       last_refresh="2026-05-28T00:00:00Z")
+
+    auth = json.loads((hermes_home / "auth.json").read_text())
+    pool = auth["credential_pool"]["openai-codex"]
+    labelled = next(e for e in pool if e["id"] == "labelled")
+
+    assert labelled["access_token"] == "labelled-at"
+    assert labelled["refresh_token"] == "labelled-rt"
+    assert labelled["last_status"] is None
+    assert labelled["last_error_code"] is None
+    assert labelled["last_error_reason"] is None
+    assert labelled["last_error_reset_at"] is None
+
+
 def test_import_codex_cli_tokens(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex-cli"
     codex_home.mkdir(parents=True, exist_ok=True)
