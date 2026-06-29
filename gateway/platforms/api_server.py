@@ -998,6 +998,7 @@ _SWARM_BALANCED_MODEL_HINTS = (
     "opencode-go/minimax-m2.7",
     "ollama/glm-5.1",
     "ollama-mac/qwopus3.6-35b-a3b:latest",  # local M4 Max, 58 tok/s, free
+    "ollama-mac/shirdel-coder-9b-claude-fable-5:latest",  # local M4 Max, 9B Nemotron coder, Q6_K, free
     # Xiaomi balanced models: good all-rounders and multimodal omni
     "xiaomi/mimo-v2-omni",
     "xiaomi/mimo-v2.5",
@@ -1011,6 +1012,7 @@ _SWARM_CHEAP_MODEL_HINTS = (
     "opencode-zen/minimax-m2.5-free",
     "opencode-zen/hy3-preview-free",
     "ollama/qwen3-coder-next",
+    "ollama-mac/shirdel-coder-9b-claude-fable-5:latest",  # local M4 Max, 9B, free
     # Xiaomi free tier (MiMo Auto) — zero cost
     "xiaomi/mimo-auto",
     # Xiaomi low-cost flash model (fast, lower-capacity)
