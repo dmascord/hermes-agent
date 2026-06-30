@@ -226,6 +226,36 @@ class TestGetModelContextLengthHonorsOverride:
         assert ctx == DEFAULT_FALLBACK_CONTEXT
 
 
+class TestGetModelContextLengthCopilotEnterprise:
+    def test_github_copilot_enterprise_uses_live_copilot_context(self, monkeypatch):
+        from agent import model_metadata as mm
+
+        calls = []
+
+        def fake_copilot_context(model, api_key=None):
+            calls.append((model, api_key))
+            return 128_000
+
+        monkeypatch.setattr(mm, "get_cached_context_length", lambda *a, **k: None)
+        monkeypatch.setattr(mm, "fetch_endpoint_model_metadata", lambda *a, **k: {})
+        monkeypatch.setattr(mm, "fetch_model_metadata", lambda *a, **k: {})
+        monkeypatch.setattr(mm, "_query_ollama_api_show", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "hermes_cli.models.get_copilot_model_context",
+            fake_copilot_context,
+        )
+
+        ctx = mm.get_model_context_length(
+            "gpt-5.4",
+            base_url="https://api.githubcopilot.com",
+            api_key="copilot-token",
+            provider="github-copilot-enterprise",
+        )
+
+        assert ctx == 128_000
+        assert calls == [("gpt-5.4", "copilot-token")]
+
+
 class TestContextProbeTiers:
     def test_256k_is_top_tier_and_default(self):
         """The stepdown probe starts at 256K and 256K is the new default."""

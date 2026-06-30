@@ -1670,7 +1670,7 @@ def get_model_context_length(
     # This catches account-specific models (e.g. claude-opus-4.6-1m) that
     # don't exist in models.dev. For models that ARE in models.dev, this
     # returns the provider-enforced limit which is what users can actually use.
-    if effective_provider in {"copilot", "copilot-acp", "github-copilot"}:
+    if effective_provider in {"copilot", "copilot-acp", "github-copilot", "github-copilot-enterprise"}:
         try:
             from hermes_cli.models import get_copilot_model_context
             ctx = get_copilot_model_context(model, api_key=api_key)
