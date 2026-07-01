@@ -143,6 +143,9 @@ _PROVIDER_ALIASES = {
     "x-ai": "xai",
     "x.ai": "xai",
     "grok": "xai",
+    "grok-oauth": "xai-oauth",
+    "x-ai-oauth": "xai-oauth",
+    "xai-grok-oauth": "xai-oauth",
     "glm": "zai",
     "z-ai": "zai",
     "z.ai": "zai",
@@ -188,6 +191,49 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
         else:
             return "custom"
     return _PROVIDER_ALIASES.get(normalized, normalized)
+
+
+_AUX_UNHEALTHY_TTL_SECONDS = 600.0
+_aux_unhealthy_until: Dict[str, float] = {}
+_aux_unhealthy_logged_at: Dict[str, float] = {}
+
+
+def _reset_aux_unhealthy_cache() -> None:
+    _aux_unhealthy_until.clear()
+    _aux_unhealthy_logged_at.clear()
+
+
+def _mark_provider_unhealthy(provider: Optional[str], ttl: float = _AUX_UNHEALTHY_TTL_SECONDS) -> None:
+    normalized = _normalize_aux_provider(provider)
+    if not normalized or normalized == "auto":
+        return
+    _aux_unhealthy_until[normalized] = time.monotonic() + max(0.0, float(ttl))
+
+
+def _is_provider_unhealthy(provider: Optional[str]) -> bool:
+    normalized = _normalize_aux_provider(provider)
+    until = _aux_unhealthy_until.get(normalized)
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        _aux_unhealthy_until.pop(normalized, None)
+        _aux_unhealthy_logged_at.pop(normalized, None)
+        return False
+    return True
+
+
+def _log_unhealthy_skip(provider: str, task: Optional[str] = None) -> None:
+    normalized = _normalize_aux_provider(provider)
+    now = time.monotonic()
+    last = _aux_unhealthy_logged_at.get(normalized, 0.0)
+    if now - last < 30.0:
+        return
+    _aux_unhealthy_logged_at[normalized] = now
+    remaining = max(0, int(_aux_unhealthy_until.get(normalized, now) - now))
+    logger.info(
+        "Auxiliary %s: skipping recently unhealthy provider %s (%ss remaining)",
+        task or "call", normalized, remaining,
+    )
 
 
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
@@ -313,6 +359,7 @@ auxiliary_is_nous: bool = False
 # so we default to the :free suffix variant via OpenRouter.
 _OPENROUTER_MODEL = os.getenv("HERMES_AUX_OPENROUTER_MODEL", "google/gemini-2.5-flash:free")
 _NOUS_MODEL = os.getenv("HERMES_AUX_NOUS_MODEL", "google/gemini-2.5-flash:free")
+_NOUS_STALE_MODEL_FALLBACK = "google/gemini-3-flash-preview"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
@@ -445,6 +492,48 @@ def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
         or fallback
     )
     return str(url or "").strip().rstrip("/")
+
+
+def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
+    try:
+        from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL, _read_xai_oauth_tokens
+    except Exception:
+        DEFAULT_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
+        _read_xai_oauth_tokens = None
+
+    env_base = (
+        os.getenv("HERMES_XAI_BASE_URL", "").strip()
+        or os.getenv("XAI_BASE_URL", "").strip()
+    ).rstrip("/")
+
+    pool_present, entry = _select_pool_entry("xai-oauth")
+    if pool_present and entry is not None:
+        token = _pool_runtime_api_key(entry)
+        base_url = env_base or _pool_runtime_base_url(entry, DEFAULT_XAI_OAUTH_BASE_URL)
+        if token and base_url:
+            return token, base_url.rstrip("/")
+
+    if _read_xai_oauth_tokens is not None:
+        try:
+            tokens = _read_xai_oauth_tokens()
+            token = str(tokens.get("access_token") or "").strip()
+            base_url = env_base or str(
+                tokens.get("base_url") or DEFAULT_XAI_OAUTH_BASE_URL
+            ).strip().rstrip("/")
+            if token and base_url:
+                return token, base_url
+        except Exception as exc:
+            logger.debug("Auxiliary client: xAI OAuth token read failed: %s", exc)
+
+    return None
+
+
+def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+    runtime = _resolve_xai_oauth_for_aux()
+    if runtime is None:
+        return None, None
+    token, base_url = runtime
+    return OpenAI(api_key=token, base_url=_to_openai_base_url(base_url)), model
 
 
 # ── Codex Responses → chat.completions adapter ─────────────────────────────
@@ -1430,6 +1519,28 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     )
 
 
+def _refresh_nous_recommended_model(
+    vision: bool = False,
+    stale_model: Optional[str] = None,
+) -> Optional[str]:
+    """Pick a fresh Nous-recommended auxiliary model after a stale-model failure."""
+    stale = (stale_model or "").strip()
+    try:
+        from hermes_cli.models import get_nous_recommended_aux_model
+
+        recommended = (get_nous_recommended_aux_model(vision=vision) or "").strip()
+    except Exception as exc:
+        logger.debug("Auxiliary Nous model refresh failed: %s", exc)
+        recommended = ""
+
+    candidate = recommended or _NOUS_STALE_MODEL_FALLBACK
+    if candidate == stale:
+        candidate = _NOUS_STALE_MODEL_FALLBACK
+    if candidate == stale:
+        return None
+    return candidate
+
+
 def _read_main_model() -> str:
     """Read the user's configured main model from config.yaml.
 
@@ -1768,12 +1879,32 @@ def _is_payment_error(exc: Exception) -> bool:
     err_lower = str(exc).lower()
     # OpenRouter and other providers include "credits" or "afford" in 402 bodies,
     # but sometimes wrap them in 429 or other codes.
-    if status in (402, 429, None):
+    if status in (402, 404, 429, None):
         if any(kw in err_lower for kw in ("credits", "insufficient funds",
-                                           "can only afford", "billing",
-                                           "payment required")):
+                                           "out of funds", "can only afford",
+                                           "billing", "payment required",
+                                           "free tier", "upgrade")):
             return True
     return False
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Detect recoverable provider rate limits distinct from billing/quota exhaustion."""
+    if _is_payment_error(exc):
+        return False
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    err_type = type(exc).__name__.lower()
+    err_lower = str(exc).lower()
+    if "ratelimit" in err_type or "rate_limit" in err_type:
+        return True
+    return any(marker in err_lower for marker in (
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "exceeded the rate",
+    ))
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -1784,10 +1915,13 @@ def _is_connection_error(exc: Exception) -> bool:
     distinct from API errors (4xx/5xx) which indicate the provider IS
     reachable but returned an error.
     """
-    from openai import APIConnectionError, APITimeoutError
+    try:
+        from openai import APIConnectionError, APITimeoutError
 
-    if isinstance(exc, (APIConnectionError, APITimeoutError)):
-        return True
+        if isinstance(exc, (APIConnectionError, APITimeoutError)):
+            return True
+    except Exception:
+        pass
     # urllib3 / httpx / httpcore connection errors
     err_type = type(exc).__name__
     if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
@@ -1863,6 +1997,26 @@ def _is_model_unavailable_error(exc: Exception) -> bool:
     ))
 
 
+def _is_model_not_found_error(exc: Exception) -> bool:
+    """Detect stale/invalid model IDs without overlapping billing/rate-limit errors."""
+    if _is_payment_error(exc) or _is_rate_limit_error(exc):
+        return False
+    status = getattr(exc, "status_code", None)
+    if status not in (400, 404, 422):
+        return False
+    err_lower = str(exc).lower()
+    return any(marker in err_lower for marker in (
+        "model_not_found",
+        "model not found",
+        "model id",
+        "valid model",
+        "no such model",
+        "does not exist",
+        "unknown model",
+        "invalid model",
+    ))
+
+
 def _is_auth_error(exc: Exception) -> bool:
     """Detect auth failures that should trigger provider-specific refresh."""
     status = getattr(exc, "status_code", None)
@@ -1870,6 +2024,45 @@ def _is_auth_error(exc: Exception) -> bool:
         return True
     err_lower = str(exc).lower()
     return "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower()
+
+
+def _is_recoverable_provider_error(exc: Exception) -> bool:
+    return (
+        _is_payment_error(exc)
+        or _is_rate_limit_error(exc)
+        or _is_connection_error(exc)
+        or _is_model_unavailable_error(exc)
+        or _is_auth_error(exc)
+        or _is_server_error(exc)
+    )
+
+
+def _provider_label_from_client(provider: str, client: Any = None) -> str:
+    normalized = _normalize_aux_provider(provider)
+    if normalized and normalized != "auto":
+        return normalized
+    base_url = str(getattr(client, "base_url", "") or "").lower()
+    if base_url_host_matches(base_url, "openrouter.ai"):
+        return "openrouter"
+    if base_url_host_matches(base_url, "inference-api.nousresearch.com"):
+        return "nous"
+    if base_url.startswith(_CODEX_AUX_BASE_URL.lower()):
+        return "openai-codex"
+    if base_url:
+        return "local/custom"
+    return normalized
+
+
+def _fallback_failure_reason(exc: Exception) -> str:
+    if _is_payment_error(exc):
+        return "payment error"
+    if _is_connection_error(exc):
+        return "connection error"
+    if _is_auth_error(exc):
+        return "auth error"
+    if _is_server_error(exc):
+        return "server error"
+    return "model unavailable"
 
 
 def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
@@ -2008,7 +2201,19 @@ def _try_payment_fallback(
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
             continue
-        client, model = try_fn()
+        if _is_provider_unhealthy(label):
+            _log_unhealthy_skip(label, task)
+            tried.append(f"{label}(unhealthy)")
+            continue
+        try:
+            client, model = try_fn()
+        except Exception as exc:
+            logger.info(
+                "Auxiliary %s: fallback probe %s failed while handling %s on %s: %s",
+                task or "call", label, reason, failed_provider, exc,
+            )
+            tried.append(f"{label}(error)")
+            continue
         if client is not None:
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
@@ -2022,6 +2227,103 @@ def _try_payment_fallback(
         task or "call", reason, failed_provider, ", ".join(tried),
     )
     return None, None, ""
+
+
+def _configured_fallback_chain() -> List[Dict[str, Any]]:
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        return get_fallback_chain(load_config())
+    except Exception as exc:
+        logger.debug("Auxiliary fallback: could not load configured chain: %s", exc)
+        return []
+
+
+def _resolve_fallback_entry(
+    entry: Dict[str, Any],
+    *,
+    label: str,
+    task: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    provider = _normalize_aux_provider(entry.get("provider"))
+    model = str(entry.get("model") or "").strip()
+    if not provider or not model:
+        return None, None, ""
+    if _is_provider_unhealthy(provider):
+        _log_unhealthy_skip(provider, task)
+        return None, None, ""
+
+    explicit_base_url = str(entry.get("base_url") or "").strip() or None
+    explicit_api_key = str(entry.get("api_key") or "").strip() or None
+    if not explicit_api_key:
+        key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+        if key_env:
+            explicit_api_key = os.getenv(key_env, "").strip() or None
+
+    try:
+        client, resolved_model = resolve_provider_client(
+            provider,
+            model=model,
+            explicit_base_url=explicit_base_url,
+            explicit_api_key=explicit_api_key,
+        )
+    except Exception as exc:
+        logger.info(
+            "Auxiliary %s: could not resolve fallback %s (%s/%s): %s",
+            task or "call", label, provider, model, exc,
+        )
+        return None, None, ""
+    if client is None:
+        return None, None, ""
+    return client, resolved_model or model, label
+
+
+def _try_configured_fallback_chain(
+    failed_provider: str,
+    task: str = None,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    failed = _normalize_aux_provider(failed_provider)
+    for index, entry in enumerate(_configured_fallback_chain()):
+        provider = _normalize_aux_provider(entry.get("provider"))
+        model = str(entry.get("model") or "").strip()
+        if provider == failed and not model:
+            continue
+        client, resolved_model, label = _resolve_fallback_entry(
+            entry,
+            label=f"fallback_chain[{index}]({provider})",
+            task=task,
+        )
+        if client is not None:
+            return client, resolved_model, label
+    return None, None, ""
+
+
+def _try_main_agent_model_fallback(
+    failed_provider: str,
+    task: str = None,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    main_provider = _normalize_aux_provider(_read_main_provider())
+    main_model = _read_main_model()
+    failed = _normalize_aux_provider(failed_provider)
+    if not main_provider or main_provider in {"auto", "main"} or not main_model:
+        return None, None, ""
+    if main_provider == failed:
+        return None, None, ""
+    if _is_provider_unhealthy(main_provider):
+        _log_unhealthy_skip(main_provider, task)
+        return None, None, ""
+    try:
+        client, resolved_model = resolve_provider_client(main_provider, main_model)
+    except Exception as exc:
+        logger.info(
+            "Auxiliary %s: could not resolve main-agent fallback %s/%s: %s",
+            task or "call", main_provider, main_model, exc,
+        )
+        return None, None, ""
+    if client is None:
+        return None, None, ""
+    return client, resolved_model or main_model, f"main-agent({main_provider})"
 
 
 def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -2077,28 +2379,35 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
     main_model = runtime_model or _read_main_model()
     if (main_provider and main_model
             and main_provider not in ("auto", "")):
-        resolved_provider = main_provider
-        explicit_base_url = None
-        explicit_api_key = None
-        if runtime_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
-            resolved_provider = "custom"
-            explicit_base_url = runtime_base_url
-            explicit_api_key = runtime_api_key or None
-        client, resolved = resolve_provider_client(
-            resolved_provider,
-            main_model,
-            explicit_base_url=explicit_base_url,
-            explicit_api_key=explicit_api_key,
-            api_mode=runtime_api_mode or None,
-        )
-        if client is not None:
-            logger.info("Auxiliary auto-detect: using main provider %s (%s)",
-                        main_provider, resolved or main_model)
-            return client, resolved or main_model
+        if _is_provider_unhealthy(main_provider):
+            _log_unhealthy_skip(main_provider)
+        else:
+            resolved_provider = main_provider
+            explicit_base_url = None
+            explicit_api_key = None
+            if runtime_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
+                resolved_provider = "custom"
+                explicit_base_url = runtime_base_url
+                explicit_api_key = runtime_api_key or None
+            client, resolved = resolve_provider_client(
+                resolved_provider,
+                main_model,
+                explicit_base_url=explicit_base_url,
+                explicit_api_key=explicit_api_key,
+                api_mode=runtime_api_mode or None,
+            )
+            if client is not None:
+                logger.info("Auxiliary auto-detect: using main provider %s (%s)",
+                            main_provider, resolved or main_model)
+                return client, resolved or main_model
 
     # ── Step 2: aggregator / fallback chain ──────────────────────────────
     tried = []
     for label, try_fn in _get_provider_chain():
+        if _is_provider_unhealthy(label):
+            _log_unhealthy_skip(label)
+            tried.append(f"{label}(unhealthy)")
+            continue
         client, model = try_fn()
         if client is not None:
             if tried:
@@ -2430,6 +2739,27 @@ def resolve_provider_client(
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
+
+    # ── xAI Grok OAuth (SuperGrok / Premium+) ────────────────────────
+    if provider == "xai-oauth":
+        final_model = _normalize_resolved_model(
+            model or _read_main_model(),
+            provider,
+        )
+        if not final_model:
+            logger.warning(
+                "resolve_provider_client: xai-oauth requested without a model"
+            )
+            return None, None
+        client, resolved = _build_xai_oauth_aux_client(final_model)
+        if client is None:
+            logger.warning(
+                "resolve_provider_client: xai-oauth requested but no OAuth token found "
+                "(run: hermes auth add xai-oauth)"
+            )
+            return None, None
+        return (_to_async_client(client, resolved or final_model, is_vision=is_vision) if async_mode
+                else (client, resolved or final_model))
 
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
     if provider == "custom":
@@ -3712,8 +4042,15 @@ def _inject_keepalive_transport(client: Any) -> None:
 
         # Drill through wrapper objects to find the underlying OpenAI client.
         _underlying = client
-        while hasattr(_underlying, "_client"):
-            _underlying = _underlying._client
+        _seen_ids = set()
+        for _ in range(8):
+            if id(_underlying) in _seen_ids:
+                break
+            _seen_ids.add(id(_underlying))
+            _next = getattr(_underlying, "_client", None)
+            if _next is None or _next is _underlying:
+                break
+            _underlying = _next
 
         # SyncHttpxClientWrapper exposes _transport; replace it.
         if hasattr(_underlying, "_transport"):
@@ -3812,6 +4149,193 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
             f"adapter or custom endpoint compatibility."
         ) from exc
     return response
+
+
+def _provider_from_fallback_label(label: str) -> str:
+    text = str(label or "").strip()
+    if "(" in text and text.endswith(")"):
+        return _normalize_aux_provider(text.rsplit("(", 1)[1][:-1])
+    return _normalize_aux_provider(text)
+
+
+def _sync_fallback_candidates(
+    *,
+    failed_provider: str,
+    task: Optional[str],
+    include_auto_chain: bool,
+) -> List[Tuple[Any, Optional[str], str]]:
+    candidates: List[Tuple[Any, Optional[str], str]] = []
+
+    if include_auto_chain:
+        client, model, label = _try_payment_fallback(
+            failed_provider,
+            task,
+            reason="provider failure",
+        )
+        if client is not None:
+            candidates.append((client, model, label))
+
+    client, model, label = _try_configured_fallback_chain(failed_provider, task)
+    if client is not None:
+        if include_auto_chain:
+            candidates.append((client, model, label))
+        else:
+            candidates.insert(0, (client, model, label))
+
+    client, model, label = _try_main_agent_model_fallback(failed_provider, task)
+    if client is not None:
+        candidates.append((client, model, label))
+
+    return candidates
+
+
+def _call_sync_recovery_fallbacks(
+    *,
+    failed_provider: str,
+    task: Optional[str],
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    timeout: float,
+    extra_body: Dict[str, Any],
+    include_auto_chain: bool,
+    is_vision: bool = False,
+) -> Optional[Any]:
+    attempts = max(1, int(os.getenv("HERMES_AUX_RECOVERY_ATTEMPTS", "8")))
+    seen: set[Tuple[str, str, str]] = set()
+    last_error: Optional[Exception] = None
+
+    for _ in range(attempts):
+        candidates = _sync_fallback_candidates(
+            failed_provider=failed_provider,
+            task=task,
+            include_auto_chain=include_auto_chain,
+        )
+        progressed = False
+        for fb_client, fb_model, fb_label in candidates:
+            provider_for_kwargs = _provider_from_fallback_label(fb_label)
+            base = str(getattr(fb_client, "base_url", "") or "")
+            identity = (provider_for_kwargs, fb_model or "", base)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            progressed = True
+            logger.info(
+                "Auxiliary %s: trying recovery fallback %s (%s)",
+                task or "call", fb_label, fb_model or "default",
+            )
+            fb_kwargs = _build_call_kwargs(
+                provider_for_kwargs,
+                fb_model,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                base_url=base,
+            )
+            if _is_anthropic_compat_endpoint(provider_for_kwargs, base):
+                fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+            try:
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
+            except Exception as fb_err:
+                last_error = fb_err
+                if not _is_recoverable_provider_error(fb_err):
+                    raise
+                _mark_provider_unhealthy(provider_for_kwargs)
+                logger.warning(
+                    "Auxiliary %s: fallback %s failed with %s; trying next provider",
+                    task or "call", fb_label, _fallback_failure_reason(fb_err),
+                )
+        if not progressed:
+            break
+
+    if last_error is not None:
+        logger.warning(
+            "Auxiliary %s: recovery fallbacks exhausted after %d candidate(s)",
+            task or "call", len(seen),
+        )
+    return None
+
+
+async def _call_async_recovery_fallbacks(
+    *,
+    failed_provider: str,
+    task: Optional[str],
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    timeout: float,
+    extra_body: Dict[str, Any],
+    include_auto_chain: bool,
+    is_vision: bool = False,
+) -> Optional[Any]:
+    attempts = max(1, int(os.getenv("HERMES_AUX_RECOVERY_ATTEMPTS", "8")))
+    seen: set[Tuple[str, str, str]] = set()
+    last_error: Optional[Exception] = None
+
+    for _ in range(attempts):
+        candidates = _sync_fallback_candidates(
+            failed_provider=failed_provider,
+            task=task,
+            include_auto_chain=include_auto_chain,
+        )
+        progressed = False
+        for fb_client, fb_model, fb_label in candidates:
+            provider_for_kwargs = _provider_from_fallback_label(fb_label)
+            base = str(getattr(fb_client, "base_url", "") or "")
+            identity = (provider_for_kwargs, fb_model or "", base)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            progressed = True
+            logger.info(
+                "Auxiliary %s (async): trying recovery fallback %s (%s)",
+                task or "call", fb_label, fb_model or "default",
+            )
+            fb_kwargs = _build_call_kwargs(
+                provider_for_kwargs,
+                fb_model,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                base_url=base,
+            )
+            if _is_anthropic_compat_endpoint(provider_for_kwargs, base):
+                fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+            async_fb, async_fb_model = _to_async_client(
+                fb_client, fb_model or "", is_vision=is_vision
+            )
+            if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                fb_kwargs["model"] = async_fb_model
+            try:
+                return _validate_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs), task)
+            except Exception as fb_err:
+                last_error = fb_err
+                if not _is_recoverable_provider_error(fb_err):
+                    raise
+                _mark_provider_unhealthy(provider_for_kwargs)
+                logger.warning(
+                    "Auxiliary %s (async): fallback %s failed with %s; trying next provider",
+                    task or "call", fb_label, _fallback_failure_reason(fb_err),
+                )
+        if not progressed:
+            break
+
+    if last_error is not None:
+        logger.warning(
+            "Auxiliary %s (async): recovery fallbacks exhausted after %d candidate(s)",
+            task or "call", len(seen),
+        )
+    return None
 
 
 def call_llm(
@@ -4077,36 +4601,38 @@ def call_llm(
         # the auto-detection chain.
         should_fallback = (
             _is_payment_error(first_err)
+            or _is_rate_limit_error(first_err)
             or _is_connection_error(first_err)
             or _is_model_unavailable_error(first_err)
             or _is_auth_error(first_err)
+            or _is_server_error(first_err)
         )
-        # Only try alternative providers when the user didn't explicitly
-        # configure this task's provider.  Explicit provider = hard constraint;
-        # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in ("auto", "", None)
-        if should_fallback and is_auto:
-            if _is_payment_error(first_err):
-                reason = "payment error"
-            elif _is_connection_error(first_err):
-                reason = "connection error"
-            elif _is_auth_error(first_err):
-                reason = "auth error"
-            else:
-                reason = "model unavailable"
+        if should_fallback:
+            reason = _fallback_failure_reason(first_err)
+            failed_label = _provider_label_from_client(resolved_provider, client)
+            _mark_provider_unhealthy(failed_label)
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
-            fb_client, fb_model, fb_label = _try_payment_fallback(
-                resolved_provider, task, reason=reason)
-            if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
+                        task or "call", reason, failed_label, first_err)
+            recovered = _call_sync_recovery_fallbacks(
+                failed_provider=failed_label,
+                task=task,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=effective_timeout,
+                extra_body=effective_extra_body,
+                include_auto_chain=is_auto,
+                is_vision=(task == "vision"),
+            )
+            if recovered is not None:
+                return recovered
+            if not is_auto:
+                logger.warning(
+                    "Auxiliary %s: %s on explicit provider %s and all fallbacks exhausted",
+                    task or "call", reason, failed_label,
+                )
         raise
 
 
@@ -4398,37 +4924,36 @@ async def async_call_llm(
         # ── Payment / connection / auth fallback (mirrors sync call_llm) ─────
         should_fallback = (
             _is_payment_error(first_err)
+            or _is_rate_limit_error(first_err)
             or _is_connection_error(first_err)
             or _is_model_unavailable_error(first_err)
             or _is_auth_error(first_err)
+            or _is_server_error(first_err)
         )
         is_auto = resolved_provider in ("auto", "", None)
-        if should_fallback and is_auto:
-            if _is_payment_error(first_err):
-                reason = "payment error"
-            elif _is_connection_error(first_err):
-                reason = "connection error"
-            elif _is_auth_error(first_err):
-                reason = "auth error"
-            else:
-                reason = "model unavailable"
+        if should_fallback:
+            reason = _fallback_failure_reason(first_err)
+            failed_label = _provider_label_from_client(resolved_provider, client)
+            _mark_provider_unhealthy(failed_label)
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
-            fb_client, fb_model, fb_label = _try_payment_fallback(
-                resolved_provider, task, reason=reason)
-            if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
-                # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
+                        task or "call", reason, failed_label, first_err)
+            recovered = await _call_async_recovery_fallbacks(
+                failed_provider=failed_label,
+                task=task,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=effective_timeout,
+                extra_body=effective_extra_body,
+                include_auto_chain=is_auto,
+                is_vision=(task == "vision"),
+            )
+            if recovered is not None:
+                return recovered
+            if not is_auto:
+                logger.warning(
+                    "Auxiliary %s (async): %s on explicit provider %s and all fallbacks exhausted",
+                    task or "call", reason, failed_label,
                 )
-                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
-                    fb_kwargs["model"] = async_fb_model
-                return _validate_llm_response(
-                    await async_fb.chat.completions.create(**fb_kwargs), task)
         raise
