@@ -1874,12 +1874,13 @@ class _CodexPassthroughSkip(Exception):
 
 
 def _has_empty_bash_tool_call(tool_calls: list) -> bool:
-    """Check if any bash tool call has an empty/blank command argument.
+    """Check if any bash tool call has an unusable command argument.
 
     Some models (notably gpt-5.4/gpt-5.5 via codex backend) return valid
     tool call JSON with ``{"command": ""}`` — a tool call that will always
-    fail.  Treat these the same as text-only responses and skip to the next
-    provider.
+    fail. Others return malformed or partial bash arguments with metadata
+    fields like timeout/cwd/async but no command. Treat these the same as
+    text-only responses and skip to the next provider.
     """
     for tc in tool_calls:
         name = tc.get("function", {}).get("name", "")
@@ -1890,11 +1891,13 @@ def _has_empty_bash_tool_call(tool_calls: list) -> bool:
             try:
                 args = json.loads(args_raw)
             except json.JSONDecodeError:
-                continue
+                return True
         elif isinstance(args_raw, dict):
             args = args_raw
         else:
-            continue
+            return True
+        if not isinstance(args, dict):
+            return True
         cmd = args.get("command", "")
         if not cmd or not cmd.strip():
             return True
@@ -7182,6 +7185,23 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _args_preview,
                                 len(content_out) if content_out else 0,
                             )
+                            if passthrough_tools and _has_empty_bash_tool_call(tool_calls_out):
+                                logger.warning(
+                                    "[hermes-code] %s returned bash with missing/empty/malformed command; "
+                                    "raising _CodexPassthroughSkip to try next provider",
+                                    provider_model,
+                                )
+                                try:
+                                    from agent.model_cooldown_db import mark_model_cooldown
+                                    mark_model_cooldown(
+                                        provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
+                                        model=provider_model,
+                                        cooldown_seconds=120.0,
+                                        reason="empty_bash",
+                                    )
+                                except Exception:
+                                    pass
+                                raise _CodexPassthroughSkip()
                             if passthrough_tools and not tool_calls_out:
                                 # Write full content to file for analysis
                                 try:

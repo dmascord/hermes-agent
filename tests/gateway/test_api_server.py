@@ -32,6 +32,7 @@ from gateway.platforms.api_server import (
     _align_runtime_with_explicit_model,
     _cooldown_seconds_for_429,
     _derive_chat_session_id,
+    _has_empty_bash_tool_call,
     _is_provider_exhaustion_content,
     _is_provider_exhaustion_error,
     _sanitize_passthrough_error_for_client,
@@ -125,6 +126,49 @@ class TestPassthroughProviderExhaustion:
         cd = _cooldown_seconds_for_429(exc)
         assert cd <= 3600.0, f"synthetic cooldown too long: {cd}s"
         assert cd >= 60.0
+
+
+class TestBashToolCallValidation:
+    def test_missing_command_is_invalid_bash_tool_call(self):
+        tool_calls = [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": json.dumps({
+                    "timeout": 120,
+                    "cwd": "/tmp",
+                    "async": False,
+                }),
+            },
+        }]
+
+        assert _has_empty_bash_tool_call(tool_calls) is True
+
+    def test_malformed_bash_arguments_are_invalid(self):
+        tool_calls = [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": '{"timeout": 120, "cwd": "/tmp", "async":',
+            },
+        }]
+
+        assert _has_empty_bash_tool_call(tool_calls) is True
+
+    def test_valid_command_is_accepted(self):
+        tool_calls = [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": json.dumps({
+                    "command": "cd /tmp && tail -40 app.log",
+                    "timeout": 60,
+                    "cwd": "/tmp",
+                }),
+            },
+        }]
+
+        assert _has_empty_bash_tool_call(tool_calls) is False
 
 
 class TestExplicitModelRuntimeAlignment:
