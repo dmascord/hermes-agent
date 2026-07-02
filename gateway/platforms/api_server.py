@@ -1904,6 +1904,109 @@ def _has_empty_bash_tool_call(tool_calls: list) -> bool:
     return False
 
 
+def _invalid_bash_tool_call_summary(tool_calls: list) -> Optional[str]:
+    """Return a compact description of the first unusable bash tool call."""
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        name = tc.get("function", {}).get("name", "")
+        if _normalize_external_tool_name(name) != "bash":
+            continue
+        args_raw = tc.get("function", {}).get("arguments", "{}")
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw)
+            except json.JSONDecodeError:
+                return f"bash arguments were not valid JSON: {args_raw[:300]}"
+        elif isinstance(args_raw, dict):
+            args = args_raw
+        else:
+            return f"bash arguments had unsupported type: {type(args_raw).__name__}"
+        if not isinstance(args, dict):
+            return f"bash arguments decoded to {type(args).__name__}, not an object"
+        cmd = args.get("command", "")
+        if not cmd or not str(cmd).strip():
+            return f"bash arguments omitted a non-empty command field: {json.dumps(args, ensure_ascii=False)[:300]}"
+    return None
+
+
+_MINIMAX_M3_BASH_TOOL_PROMPT = (
+    "Hermes tool-calling contract for MiniMax-M3:\n"
+    "- When calling the bash tool, function.arguments MUST be valid JSON.\n"
+    "- The JSON MUST include a non-empty string field named \"command\" containing the full shell command or pipeline.\n"
+    "- cwd, timeout, and async are optional metadata only; never send them without command.\n"
+    "- Correct example: {\"command\":\"cd /tmp && tail -40 app.log\",\"cwd\":\"/tmp\",\"timeout\":60}."
+)
+
+
+def _bash_tool_retry_prompt(tool_calls: list) -> str:
+    summary = _invalid_bash_tool_call_summary(tool_calls) or "the previous bash tool call was invalid"
+    return (
+        "Hermes rejected your previous bash tool call because it cannot be executed.\n"
+        f"Invalid call: {summary}\n"
+        "Retry the same task now. If you call bash, function.arguments must be valid JSON "
+        "with a non-empty string field named \"command\" containing the full shell command. "
+        "Do not send cwd, timeout, or async without command."
+    )
+
+
+def _messages_with_retry_tool_prompt(
+    messages: List[Dict[str, Any]],
+    tool_calls: list,
+) -> List[Dict[str, Any]]:
+    prompt = _bash_tool_retry_prompt(tool_calls)
+    if messages and messages[0].get("role") == "system" and isinstance(messages[0].get("content"), str):
+        patched = [dict(messages[0])]
+        patched[0]["content"] = f"{messages[0].get('content')}\n\n{prompt}"
+        patched.extend(messages[1:])
+        return patched
+    return [{"role": "system", "content": prompt}, *messages]
+
+
+def _tool_schema_contains_bash(tools: Optional[list]) -> bool:
+    if not tools:
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name", name)
+        if _normalize_external_tool_name(str(name or "")) == "bash":
+            return True
+    return False
+
+
+def _is_minimax_m3_model(provider_model: str, provider: str, resolved_model: str = "") -> bool:
+    provider_model_l = (provider_model or "").lower()
+    provider_l = (provider or "").lower()
+    resolved_l = (resolved_model or "").lower()
+    combined = f"{provider_model_l} {resolved_l}"
+    return "minimax-m3" in combined and (provider_l == "minimax" or "minimax/" in provider_model_l)
+
+
+def _messages_with_provider_tool_prompt(
+    messages: List[Dict[str, Any]],
+    *,
+    provider_model: str,
+    provider: str,
+    resolved_model: str = "",
+    tools: Optional[list] = None,
+) -> List[Dict[str, Any]]:
+    """Add narrow provider guidance for models with known tool-call quirks."""
+    if not (_tool_schema_contains_bash(tools) and _is_minimax_m3_model(provider_model, provider, resolved_model)):
+        return messages
+
+    if messages and messages[0].get("role") == "system" and isinstance(messages[0].get("content"), str):
+        patched = [dict(messages[0])]
+        patched[0]["content"] = f"{messages[0].get('content')}\n\n{_MINIMAX_M3_BASH_TOOL_PROMPT}"
+        patched.extend(messages[1:])
+        return patched
+
+    return [{"role": "system", "content": _MINIMAX_M3_BASH_TOOL_PROMPT}, *messages]
+
+
 def _call_codex_passthrough(
     messages: List[Dict[str, Any]],
     model: str,
@@ -7452,6 +7555,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         prov = runtime_kwargs.get("provider", "")
                         api_key = runtime_kwargs.get("api_key", "")
                         base_url = runtime_kwargs.get("base_url", "") or None
+                        _provider_messages = _messages_with_provider_tool_prompt(
+                            passthrough_messages,
+                            provider_model=provider_model,
+                            provider=prov,
+                            resolved_model=resolved_model,
+                            tools=passthrough_tools,
+                        )
                         if not api_key:
                             continue
                         _s_loop = asyncio.get_running_loop()
@@ -7461,10 +7571,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         # Initialize _skip_normal_call so it's always defined regardless
                         # of which provider branch is taken (copilot/claude/gemini/else).
                         _skip_normal_call = False
-                        # Initialize _msgs_to_send with a default (passthrough_messages)
+                        # Initialize _msgs_to_send with a default provider-specific message list
                         # so it's always defined for the call_llm fallback path, even if
                         # the provider branch (openai-codex/claude-code-cli) doesn't set it.
-                        _msgs_to_send = passthrough_messages
+                        _msgs_to_send = _provider_messages
                         # Initialize _acquired_stream for the same reason — the
                         # provider-specific branches (openai-codex/claude-code-cli) don't
                         # go through the parallel stream limiter, so this stays False.
@@ -7475,7 +7585,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _gc = GeminiNativeClient(api_key=api_key, base_url=base_url)
                                 return _gc._create_chat_completion(
                                     model=resolved_model,
-                                    messages=_strip_reasoning(passthrough_messages) if _passthrough_has_reasoning else passthrough_messages,
+                                    messages=_strip_reasoning(_provider_messages) if _passthrough_has_reasoning else _provider_messages,
                                     max_tokens=16384,
                                     tools=passthrough_tools,
                                     timeout=300,
@@ -7487,7 +7597,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 None,
                                 lambda: _call_codex_passthrough(
                                     messages=_strip_unsupported_content_for_openai(
-                                        _strip_reasoning(passthrough_messages) if _passthrough_has_reasoning else passthrough_messages
+                                        _strip_reasoning(_provider_messages) if _passthrough_has_reasoning else _provider_messages
                                     ),
                                     model=resolved_model,
                                     api_key=api_key,
@@ -7529,7 +7639,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 # Run the bridge generator in a thread, collect events via asyncio queue
                                 _bridge_events: asyncio.Queue = asyncio.Queue()
                                 _bridge_error: list[Exception] = []
-                                def _run_bridge(_c=_cc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                                def _run_bridge(_c=_cc_client, _m=resolved_model, _msgs=_provider_messages, _tools=passthrough_tools):
                                     try:
                                         gen = _c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools)
                                         for event in gen:
@@ -7785,7 +7895,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 if session_id:
                                     _bridge_sse_headers["X-Hermes-Session-Id"] = session_id
                                 _bridge_events: asyncio.Queue = asyncio.Queue()
-                                def _run_mc_bridge(_c=_mc_client, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools, _q=_bridge_events):
+                                def _run_mc_bridge(_c=_mc_client, _m=resolved_model, _msgs=_provider_messages, _tools=passthrough_tools, _q=_bridge_events):
                                     try:
                                         gen = _c.stream_events(model=_m, messages=_msgs, tools=_tools)
                                         for event in gen:
@@ -8141,7 +8251,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 return response
                         else:
                             _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
-                            _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
+                            _msgs_to_send = (_provider_messages if _echo_rc else _strip_reasoning(_provider_messages)) if _passthrough_has_reasoning else _provider_messages
                             _msgs_to_send = _strip_unsupported_content_for_openai(_msgs_to_send)
                             # For providers that require reasoning_content echo (DeepSeek via
                             # opencode-zen/opencode-go), ensure every assistant turn that
@@ -8394,6 +8504,56 @@ class APIServerAdapter(BasePlatformAdapter):
                         # Restore original tool_call_ids for arliai responses.
                         if _mapper is not None and tool_calls_out:
                             tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
+
+                        _bad_bash_summary = _invalid_bash_tool_call_summary(tool_calls_out)
+                        if passthrough_tools and _bad_bash_summary and not _skip_normal_call:
+                            logger.warning(
+                                "[hermes-code][req=%s] %s returned invalid bash tool call; retrying once with corrective prompt: %s",
+                                _req_id, provider_model, _bad_bash_summary,
+                            )
+                            _retry_msgs_to_send = _messages_with_retry_tool_prompt(_msgs_to_send, tool_calls_out)
+                            _retry_start = _time.time()
+                            response_obj = await _await_passthrough_provider_call(
+                                _s_loop.run_in_executor(
+                                    None,
+                                    lambda: call_llm(
+                                        task="chat",
+                                        messages=_retry_msgs_to_send,
+                                        provider=prov,
+                                        model=resolved_model,
+                                        base_url=base_url,
+                                        api_key=api_key,
+                                        max_tokens=16384,
+                                        timeout=_call_timeout,
+                                        tools=passthrough_tools,
+                                    ),
+                                ),
+                                provider_model,
+                            )
+                            logger.info(
+                                "[hermes-code][req=%s] stream: corrective retry completed for %s in %.1fs",
+                                _req_id, provider_model, _time.time() - _retry_start,
+                            )
+                            msg = response_obj.choices[0].message
+                            content_out = extract_content_or_reasoning(response_obj).strip()
+                            reasoning_content_out = _extract_reasoning_content_from_msg(msg)
+                            tool_calls_raw = getattr(msg, "tool_calls", []) or []
+                            tool_calls_out = []
+                            for tc in tool_calls_raw:
+                                if hasattr(tc, "model_dump"):
+                                    tool_calls_out.append(tc.model_dump())
+                                elif hasattr(tc, "dict"):
+                                    tool_calls_out.append(tc.dict())
+                                elif isinstance(tc, dict):
+                                    tool_calls_out.append(tc)
+                                else:
+                                    _func = getattr(tc, "function", None)
+                                    _func_name = str(getattr(_func, "name", getattr(tc, "name", "")))
+                                    _func_args = str(getattr(_func, "arguments", getattr(tc, "arguments", "{}")))
+                                    tool_calls_out.append({"id": str(getattr(tc, "id", "")), "type": "function", "function": {"name": _func_name, "arguments": _func_args}})
+                            tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                            if _mapper is not None and tool_calls_out:
+                                tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
 
                         # If any provider returned no tool calls (or empty bash commands)
                         # despite having tools, skip to next. Apply a short cooldown so
@@ -9131,6 +9291,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     api_key = runtime_kwargs.get("api_key", "")
                     base_url = runtime_kwargs.get("base_url", "") or None
                     api_mode = runtime_kwargs.get("api_mode", "")
+                    _provider_messages = _messages_with_provider_tool_prompt(
+                        passthrough_messages,
+                        provider_model=provider_model,
+                        provider=prov,
+                        resolved_model=resolved_model,
+                        tools=passthrough_tools,
+                    )
 
                     logger.debug(
                         "[hermes-code] passthrough: trying provider=%s model=%s base_url=%s messages=%d",
@@ -9158,13 +9325,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
 
                     _ns_loop = asyncio.get_running_loop()
+                    _mapper_ns = None
+                    _msgs_to_send = None
                     if _needs_audio and prov == "google":
                         def _gemini_audio_call_ns():
                             from agent.gemini_native_adapter import GeminiNativeClient
                             _gc = GeminiNativeClient(api_key=api_key, base_url=base_url)
                             return _gc._create_chat_completion(
                                 model=resolved_model,
-                                messages=_strip_reasoning(passthrough_messages) if _passthrough_has_reasoning else passthrough_messages,
+                                messages=_strip_reasoning(_provider_messages) if _passthrough_has_reasoning else _provider_messages,
                                 max_tokens=16384,
                                 tools=passthrough_tools,
                                 timeout=300,
@@ -9175,7 +9344,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             None,
                             lambda: _call_codex_passthrough(
                                 messages=_strip_unsupported_content_for_openai(
-                                    _strip_reasoning(passthrough_messages) if _passthrough_has_reasoning else passthrough_messages
+                                    _strip_reasoning(_provider_messages) if _passthrough_has_reasoning else _provider_messages
                                 ),
                                 model=resolved_model,
                                 api_key=api_key,
@@ -9218,7 +9387,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             _bridge_tool_calls_ns: list[dict] = []
                             _bridge_error_msg_ns: str | None = None
                             _ns_events_q: asyncio.Queue = asyncio.Queue()
-                            def _run_bridge_ns(_c=_cc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools):
+                            def _run_bridge_ns(_c=_cc_client_ns, _m=resolved_model, _msgs=_provider_messages, _tools=passthrough_tools):
                                 try:
                                     for event in _c.run_with_tool_bridge(model=_m, messages=_msgs, tools=_tools):
                                         _ns_events_q.put_nowait(event)
@@ -9367,7 +9536,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # can be proxied through the hub to the connected client.
                             _ns_events_q: asyncio.Queue = asyncio.Queue()
                             _bridge_error_msg_ns: str | None = None
-                            def _run_mc_bridge_ns(_c=_mc_client_ns, _m=resolved_model, _msgs=passthrough_messages, _tools=passthrough_tools, _q=_ns_events_q):
+                            def _run_mc_bridge_ns(_c=_mc_client_ns, _m=resolved_model, _msgs=_provider_messages, _tools=passthrough_tools, _q=_ns_events_q):
                                 try:
                                     for event in _c.stream_events(model=_m, messages=_msgs, tools=_tools):
                                         _q.put_nowait(event)
@@ -9484,7 +9653,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             continue
                     else:
                         _echo_rc = _passthrough_has_reasoning and _requires_reasoning_echo(resolved_model, provider=prov, base_url=base_url)
-                        _msgs_to_send = (passthrough_messages if _echo_rc else _strip_reasoning(passthrough_messages)) if _passthrough_has_reasoning else passthrough_messages
+                        _msgs_to_send = (_provider_messages if _echo_rc else _strip_reasoning(_provider_messages)) if _passthrough_has_reasoning else _provider_messages
                         _msgs_to_send = _strip_unsupported_content_for_openai(_msgs_to_send)
                         # For providers that require reasoning_content echo (DeepSeek via
                         # opencode-zen/opencode-go), ensure every assistant turn that
@@ -9517,7 +9686,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                 logger.debug("[hermes-code] ns: stripped %d hermes_ts packed ids for %s", _ts_fixed, provider_model)
 
                         # ── arliai tool_call_id sanitization ────────────────────
-                        _mapper_ns = None
                         if base_url and "arliai" in (base_url or "").lower():
                             try:
                                 from agent._tool_id_sanitizer import ToolCallIdMapper
@@ -9615,6 +9783,54 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _tc_dict["call_id"] = _packed_id
                         tool_calls_out.append(_tc_dict)
                     tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+
+                    _bad_bash_summary_ns = _invalid_bash_tool_call_summary(tool_calls_out)
+                    if passthrough_tools and _bad_bash_summary_ns and locals().get("_msgs_to_send") is not None:
+                        logger.warning(
+                            "[hermes-code][req=%s] %s returned invalid bash tool call; retrying once with corrective prompt: %s",
+                            _req_id, provider_model, _bad_bash_summary_ns,
+                        )
+                        _retry_msgs_to_send_ns = _messages_with_retry_tool_prompt(_msgs_to_send, tool_calls_out)
+                        response_obj = await _ns_loop.run_in_executor(
+                            None,
+                            lambda: call_llm(
+                                task="chat",
+                                messages=_retry_msgs_to_send_ns,
+                                provider=prov,
+                                model=resolved_model,
+                                base_url=base_url,
+                                api_key=api_key,
+                                max_tokens=16384,
+                                timeout=300,
+                                tools=passthrough_tools,
+                            ),
+                        )
+                        msg = response_obj.choices[0].message
+                        content = extract_content_or_reasoning(response_obj).strip()
+                        reasoning_content = _extract_reasoning_content_from_msg(msg)
+                        tool_calls_raw = getattr(msg, "tool_calls", []) or []
+                        tool_calls_out = []
+                        for tc in tool_calls_raw:
+                            if hasattr(tc, "model_dump"):
+                                _tc_dict = tc.model_dump()
+                            elif hasattr(tc, "dict"):
+                                _tc_dict = tc.dict()
+                            elif isinstance(tc, dict):
+                                _tc_dict = tc
+                            else:
+                                _func = getattr(tc, "function", None)
+                                _tc_dict = {
+                                    "id": str(getattr(tc, "id", "")),
+                                    "type": "function",
+                                    "function": {
+                                        "name": str(getattr(_func, "name", getattr(tc, "name", ""))),
+                                        "arguments": str(getattr(_func, "arguments", getattr(tc, "arguments", "{}"))),
+                                    },
+                                }
+                            tool_calls_out.append(_tc_dict)
+                        tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                        if _mapper_ns is not None and tool_calls_out:
+                            tool_calls_out = _mapper_ns.unsanitize_tool_calls(tool_calls_out)
 
                     # If any provider returned no tool calls (or empty bash commands)
                     # despite having tools, skip to next. Apply a short cooldown so

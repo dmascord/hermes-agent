@@ -33,8 +33,11 @@ from gateway.platforms.api_server import (
     _cooldown_seconds_for_429,
     _derive_chat_session_id,
     _has_empty_bash_tool_call,
+    _invalid_bash_tool_call_summary,
     _is_provider_exhaustion_content,
     _is_provider_exhaustion_error,
+    _messages_with_retry_tool_prompt,
+    _messages_with_provider_tool_prompt,
     _sanitize_passthrough_error_for_client,
     check_api_server_requirements,
     cors_middleware,
@@ -169,6 +172,115 @@ class TestBashToolCallValidation:
         }]
 
         assert _has_empty_bash_tool_call(tool_calls) is False
+
+    def test_invalid_bash_summary_describes_missing_command(self):
+        tool_calls = [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": json.dumps({
+                    "timeout": 120,
+                    "cwd": "/tmp",
+                    "async": False,
+                }),
+            },
+        }]
+
+        summary = _invalid_bash_tool_call_summary(tool_calls)
+
+        assert summary is not None
+        assert "command" in summary
+        assert "timeout" in summary
+
+    def test_retry_prompt_is_added_without_mutating_original_messages(self):
+        messages = [
+            {"role": "system", "content": "Original system."},
+            {"role": "user", "content": "Check logs."},
+        ]
+        tool_calls = [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": json.dumps({"timeout": 120, "cwd": "/tmp"}),
+            },
+        }]
+
+        patched = _messages_with_retry_tool_prompt(messages, tool_calls)
+
+        assert patched is not messages
+        assert patched[0]["content"].startswith("Original system.")
+        assert "Retry the same task now" in patched[0]["content"]
+        assert '"command"' in patched[0]["content"]
+        assert messages[0]["content"] == "Original system."
+
+
+class TestProviderToolPrompt:
+    def test_minimax_m3_gets_bash_tool_contract_in_existing_system_prompt(self):
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "List logs."},
+        ]
+        tools = [{"type": "function", "function": {"name": "bash"}}]
+
+        patched = _messages_with_provider_tool_prompt(
+            messages,
+            provider_model="minimax/MiniMax-M3",
+            provider="minimax",
+            resolved_model="MiniMax-M3",
+            tools=tools,
+        )
+
+        assert patched is not messages
+        assert patched[0]["role"] == "system"
+        assert patched[0]["content"].startswith("You are concise.")
+        assert "function.arguments MUST be valid JSON" in patched[0]["content"]
+        assert '"command"' in patched[0]["content"]
+        assert patched[1:] == messages[1:]
+        assert messages[0]["content"] == "You are concise."
+
+    def test_minimax_m3_without_system_prompt_gets_inserted_contract(self):
+        messages = [{"role": "user", "content": "List logs."}]
+        tools = [{"type": "function", "function": {"name": "terminal"}}]
+
+        patched = _messages_with_provider_tool_prompt(
+            messages,
+            provider_model="minimax/MiniMax-M3",
+            provider="minimax",
+            resolved_model="MiniMax-M3",
+            tools=tools,
+        )
+
+        assert patched[0]["role"] == "system"
+        assert "bash tool" in patched[0]["content"]
+        assert patched[1:] == messages
+
+    def test_non_minimax_model_is_unchanged(self):
+        messages = [{"role": "user", "content": "List logs."}]
+        tools = [{"type": "function", "function": {"name": "bash"}}]
+
+        patched = _messages_with_provider_tool_prompt(
+            messages,
+            provider_model="openai/gpt-5.1",
+            provider="openai",
+            resolved_model="gpt-5.1",
+            tools=tools,
+        )
+
+        assert patched is messages
+
+    def test_minimax_m3_without_bash_tool_is_unchanged(self):
+        messages = [{"role": "user", "content": "List logs."}]
+        tools = [{"type": "function", "function": {"name": "read_file"}}]
+
+        patched = _messages_with_provider_tool_prompt(
+            messages,
+            provider_model="minimax/MiniMax-M3",
+            provider="minimax",
+            resolved_model="MiniMax-M3",
+            tools=tools,
+        )
+
+        assert patched is messages
 
 
 class TestExplicitModelRuntimeAlignment:
