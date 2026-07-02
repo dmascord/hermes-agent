@@ -6575,6 +6575,86 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream,
                 len(passthrough_tools) if passthrough_tools else 0,
             )
+
+            _passthrough_sse_response = None
+            _passthrough_sse_completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            _passthrough_sse_created = int(time.time())
+
+            async def _ensure_passthrough_sse_response():
+                """Open the client SSE stream and send the role chunk once."""
+                nonlocal _passthrough_sse_response
+                if _passthrough_sse_response is not None:
+                    return _passthrough_sse_response
+
+                sse_headers = {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                }
+                if session_id:
+                    sse_headers["X-Hermes-Session-Id"] = session_id
+
+                response = web.StreamResponse(status=200, headers=sse_headers)
+                await response.prepare(request)
+                role_chunk = {
+                    "id": _passthrough_sse_completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": _passthrough_sse_created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+                _passthrough_sse_response = response
+                logger.info("[hermes-code][req=%s] opened passthrough SSE heartbeat stream", _req_id)
+                return response
+
+            async def _emit_passthrough_thinking_sse(provider_model: str) -> None:
+                """Emit an OpenAI-compatible no-op chunk to keep clients/proxies alive."""
+                response = await _ensure_passthrough_sse_response()
+                thinking_chunk = {
+                    "id": _passthrough_sse_completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                }
+                await response.write(b": thinking\n\n")
+                await response.write(f"data: {json.dumps(thinking_chunk)}\n\n".encode())
+                logger.debug("[hermes-code][req=%s] sent passthrough thinking heartbeat for %s", _req_id, provider_model)
+
+            async def _await_passthrough_provider_call(awaitable, provider_model: str):
+                """Wait for a blocking provider call, sending heartbeat chunks every 30s."""
+                if not stream:
+                    return await awaitable
+                while True:
+                    try:
+                        return await asyncio.wait_for(asyncio.shield(awaitable), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
+                    except asyncio.TimeoutError:
+                        await _emit_passthrough_thinking_sse(provider_model)
+
+            async def _finish_passthrough_sse_error(message: str):
+                response = await _ensure_passthrough_sse_response()
+                error_chunk = {
+                    "id": _passthrough_sse_completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"content": message}, "finish_reason": None}],
+                }
+                finish_chunk = {
+                    "id": _passthrough_sse_completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+                await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
+                await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+                await response.write(b"data: [DONE]\n\n")
+                await response.write_eof()
+                return response
+
             # Build passthrough provider chain from HERMES_CODE_MODEL and HERMES_CODE_FALLBACK_*
             # Put user's requested model FIRST, then HERMES_CODE_MODEL as primary, then fallbacks
             _passthrough_models: List[str] = []
@@ -6923,6 +7003,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     if provider_model.startswith("github-copilot") or provider_model.startswith("copilot-"):
                         try:
                             runtime_kwargs, resolved_model = _runtime_kwargs_for_model_id(provider_model)
+                            _copilot_provider = provider_model.split("/")[0]
                             api_key = runtime_kwargs.get("api_key", "")
                             base_url = runtime_kwargs.get("base_url", "") or None
                             api_mode = runtime_kwargs.get("api_mode", "anthropic_messages")
@@ -6949,9 +7030,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                     api_kwargs["tools"] = anthropic_tools
 
                                 _s_loop = asyncio.get_running_loop()
-                                response_obj = await _s_loop.run_in_executor(
-                                    None,
-                                    lambda: anthropic_client.messages.create(**api_kwargs),
+                                response_obj = await _await_passthrough_provider_call(
+                                    _s_loop.run_in_executor(
+                                        None,
+                                        lambda: anthropic_client.messages.create(**api_kwargs),
+                                    ),
+                                    provider_model,
                                 )
 
                                 # Parse Anthropic response
@@ -6996,28 +7080,34 @@ class APIServerAdapter(BasePlatformAdapter):
                                     # Responses API (GPT-5.x): wrap in CodexAuxiliaryClient
                                     from agent.auxiliary_client import CodexAuxiliaryClient
                                     wrapped = CodexAuxiliaryClient(client, resolved_model)
-                                    response_obj = await _s_loop.run_in_executor(
-                                        None,
-                                        lambda: wrapped.chat.completions.create(
-                                            messages=_copilot_messages(passthrough_messages),
-                                            model=resolved_model,
-                                            max_tokens=16384,
-                                            tools=passthrough_tools,
+                                    response_obj = await _await_passthrough_provider_call(
+                                        _s_loop.run_in_executor(
+                                            None,
+                                            lambda: wrapped.chat.completions.create(
+                                                messages=_copilot_messages(passthrough_messages),
+                                                model=resolved_model,
+                                                max_tokens=16384,
+                                                tools=passthrough_tools,
+                                            ),
                                         ),
+                                        provider_model,
                                     )
                                 else:
                                     # Chat Completions API (GPT-5-mini, GPT-4o-mini, etc.)
                                     from hermes_cli.timeouts import get_provider_request_timeout
-                                    _chat_timeout = get_provider_request_timeout(prov, resolved_model) or 300.0
-                                    response_obj = await _s_loop.run_in_executor(
-                                        None,
-                                        lambda: client.chat.completions.create(
-                                            model=resolved_model,
-                                            messages=_copilot_messages(passthrough_messages),
-                                            max_tokens=16384,
-                                            tools=passthrough_tools,
-                                            timeout=_chat_timeout,
+                                    _chat_timeout = get_provider_request_timeout(_copilot_provider, resolved_model) or 300.0
+                                    response_obj = await _await_passthrough_provider_call(
+                                        _s_loop.run_in_executor(
+                                            None,
+                                            lambda: client.chat.completions.create(
+                                                model=resolved_model,
+                                                messages=_copilot_messages(passthrough_messages),
+                                                max_tokens=16384,
+                                                tools=passthrough_tools,
+                                                timeout=_chat_timeout,
+                                            ),
                                         ),
+                                        provider_model,
                                     )
 
                                 # Parse OpenAI-style response
@@ -7076,8 +7166,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 content=content_out,
                                 stream=True,
                             )
-                            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-                            created = int(time.time())
+                            completion_id = _passthrough_sse_completion_id
+                            created = _passthrough_sse_created
                             _args_preview = [
                                 (tc.get("function", {}).get("name", ""),
                                  tc.get("function", {}).get("arguments", "")[:200])
@@ -7132,23 +7222,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
 
                             # ── SSE serialisation (shared by all api_modes) ──
-                            sse_headers = {
-                                "Content-Type": "text/event-stream",
-                                "Cache-Control": "no-cache",
-                                "X-Accel-Buffering": "no",
-                            }
-                            if session_id:
-                                sse_headers["X-Hermes-Session-Id"] = session_id
-
-                            response = web.StreamResponse(status=200, headers=sse_headers)
-                            await response.prepare(request)
-
-                            role_chunk = {
-                                "id": completion_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model_name,
-                                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                            }
-                            await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+                            response = await _ensure_passthrough_sse_response()
 
                             # Stream reasoning_content deltas (OpenAI models only)
                             if reasoning_content_out:
@@ -8226,19 +8300,22 @@ class APIServerAdapter(BasePlatformAdapter):
                             _call_timeout = get_provider_request_timeout(prov, resolved_model) or 300.0
                             logger.info("[hermes-code][req=%s] stream: calling call_llm for %s timeout=%ss", _req_id, prov, _call_timeout)
                             try:
-                                response_obj = await _s_loop.run_in_executor(
-                                    None,
-                                    lambda: call_llm(
-                                        task="chat",
-                                        messages=_msgs_to_send,
-                                        provider=prov,
-                                        model=resolved_model,
-                                        base_url=base_url,
-                                        api_key=api_key,
-                                        max_tokens=16384,
-                                        timeout=_call_timeout,
-                                        tools=passthrough_tools,
+                                response_obj = await _await_passthrough_provider_call(
+                                    _s_loop.run_in_executor(
+                                        None,
+                                        lambda: call_llm(
+                                            task="chat",
+                                            messages=_msgs_to_send,
+                                            provider=prov,
+                                            model=resolved_model,
+                                            base_url=base_url,
+                                            api_key=api_key,
+                                            max_tokens=16384,
+                                            timeout=_call_timeout,
+                                            tools=passthrough_tools,
+                                        ),
                                     ),
+                                    provider_model,
                                 )
                                 _call_duration = _time.time() - _call_start
                                 _total_duration = _time.time() - _stream_start
@@ -8409,26 +8486,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-                        created = int(time.time())
-
-                        sse_headers = {
-                            "Content-Type": "text/event-stream",
-                            "Cache-Control": "no-cache",
-                            "X-Accel-Buffering": "no",
-                        }
-                        if session_id:
-                            sse_headers["X-Hermes-Session-Id"] = session_id
-
-                        response = web.StreamResponse(status=200, headers=sse_headers)
-                        await response.prepare(request)
-
-                        role_chunk = {
-                            "id": completion_id, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name,
-                            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                        }
-                        await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+                        completion_id = _passthrough_sse_completion_id
+                        created = _passthrough_sse_created
+                        response = await _ensure_passthrough_sse_response()
 
                         # Stream reasoning_content deltas first (for DeepSeek thinking mode etc.)
                         if reasoning_content_out:
@@ -8683,6 +8743,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     logger.warning("[hermes-code] passthrough stream exhausted providers: %s", _err_msg)
+                if _passthrough_sse_response is not None:
+                    return await _finish_passthrough_sse_error(
+                        f"hermes-code passthrough exhausted all configured providers: {_err_msg}"
+                    )
                 return web.json_response(
                     _openai_error(
                         f"hermes-code passthrough exhausted all configured providers: {_err_msg}",
