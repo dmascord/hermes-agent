@@ -7084,7 +7084,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _s_loop.run_in_executor(
                                             None,
                                             lambda: wrapped.chat.completions.create(
-                                                messages=_copilot_messages(passthrough_messages),
+                                                messages=passthrough_messages,
                                                 model=resolved_model,
                                                 max_tokens=16384,
                                                 tools=passthrough_tools,

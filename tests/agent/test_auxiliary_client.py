@@ -2755,6 +2755,80 @@ class TestVisionAutoSkipsKimiCoding:
 
 
 class TestCodexAuxiliaryAdapterTimeout:
+    def test_preserves_tool_history_as_responses_function_items(self):
+        class FakeResponse:
+            status_code = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def iter_lines(self):
+                yield (
+                    'data: {"type":"response.output_item.done","item":{"type":"message",'
+                    '"content":[{"type":"output_text","text":"ok"}]}}'
+                )
+
+        class FakeRawClient:
+            def __init__(self):
+                self.request_json = None
+
+            def stream(self, method, url, json, headers):
+                self.request_json = json
+                return FakeResponse()
+
+        raw_client = FakeRawClient()
+        fake_client = SimpleNamespace(
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_key="tok",
+            _client=raw_client,
+        )
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "run adb devices"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"cmd\":\"adb devices\"}",
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_abc",
+                    "content": "List of devices attached\n",
+                },
+            ],
+            tools=[{
+                "type": "function",
+                "function": {"name": "bash", "parameters": {"type": "object"}},
+            }],
+        )
+
+        items = raw_client.request_json["input"]
+        assert {
+            "type": "function_call",
+            "call_id": "call_abc",
+            "name": "bash",
+            "arguments": "{\"cmd\":\"adb devices\"}",
+        } in items
+        assert {
+            "type": "function_call_output",
+            "call_id": "call_abc",
+            "output": "List of devices attached\n",
+        } in items
+        assert response.choices[0].message.content == "ok"
+
     def test_forwards_timeout_to_responses_create(self):
         message_item = SimpleNamespace(
             type="message",

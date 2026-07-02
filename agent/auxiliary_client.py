@@ -600,30 +600,35 @@ class _CodexCompletionsAdapter:
 
     def create(self, **kwargs) -> Any:
         import sys
-        print(f"[HTTP_LOG] _CodexCompletionsAdapter.create called model={kwargs.get('model', self._model)} base_url={self._client.base_url}", file=sys.stderr, flush=True)
+        base_url = getattr(self._client, "base_url", "")
+        print(f"[HTTP_LOG] _CodexCompletionsAdapter.create called model={kwargs.get('model', self._model)} base_url={base_url}", file=sys.stderr, flush=True)
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
-        # Separate system/instructions from conversation messages.
-        # Convert chat.completions multimodal content blocks to Responses
-        # API format (input_text / input_image instead of text / image_url).
+        # Separate system/instructions from conversation messages.  Preserve
+        # assistant tool_calls and role=tool results so the Responses API sees
+        # real function_call/function_call_output items on continuation turns.
+        from agent.codex_responses_adapter import (
+            _chat_messages_to_responses_input,
+            _responses_tools,
+        )
+
         instructions = "You are a helpful assistant."
-        input_msgs: List[Dict[str, Any]] = []
+        conversation_msgs: List[Dict[str, Any]] = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content") or ""
             if role == "system":
                 instructions = content if isinstance(content, str) else str(content)
             else:
-                input_msgs.append({
-                    "role": role,
-                    "content": _convert_content_for_responses(content),
-                })
+                conversation_msgs.append(msg)
+
+        input_items = _chat_messages_to_responses_input(conversation_msgs)
 
         resp_kwargs: Dict[str, Any] = {
             "model": model,
             "instructions": instructions,
-            "input": input_msgs or [{"role": "user", "content": ""}],
+            "input": input_items or [{"role": "user", "content": ""}],
             "store": False,
         }
 
@@ -660,18 +665,7 @@ class _CodexCompletionsAdapter:
         # Tools support for auxiliary callers (e.g. skills_hub) that pass function schemas
         tools = kwargs.get("tools")
         if tools:
-            converted = []
-            for t in tools:
-                fn = t.get("function", {}) if isinstance(t, dict) else {}
-                name = fn.get("name")
-                if not name:
-                    continue
-                converted.append({
-                    "type": "function",
-                    "name": name,
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
-                })
+            converted = _responses_tools(tools)
             if converted:
                 resp_kwargs["tools"] = converted
 
@@ -691,72 +685,105 @@ class _CodexCompletionsAdapter:
             collected_text_deltas: List[str] = []
             has_function_calls = False
             _final_response = None  # set if SITA returns non-SSE JSON
-            print(f"[HTTP_LOG] REQUEST provider=copilot model={model} url={self._client.base_url}/responses messages={len(input_msgs)}", flush=True)
+            print(f"[HTTP_LOG] REQUEST provider=copilot model={model} url={base_url}/responses messages={len(input_items)}", flush=True)
             # HACK: OpenAI SDK's responses.stream() adds ".stream" suffix to the URL,
             # but chatgpt.com/backend-api/codex does NOT have a /responses.stream route.
             # Use raw httpx streaming to the correct /responses endpoint.
-            import httpx
-            _raw_client = self._client._client  # underlying httpx.Client (SyncHttpxClientWrapper)
-            _url = f"{str(self._client.base_url).rstrip('/')}/responses"
-            # The OpenAI SDK adds Authorization via _build_request, not via default_headers on httpx.
-            # We must add it explicitly when going around the SDK.
-            _req_headers = {"Authorization": f"Bearer {self._client.api_key}"}
-            with _raw_client.stream("POST", _url, json=resp_kwargs, headers=_req_headers) as _resp:
-                if _resp.status_code >= 400:
-                    _body = b"".join(_resp.iter_bytes())[:500]
-                    raise RuntimeError(f"codex stream HTTP {_resp.status_code}: {_body!r}")
-                for _line in _resp.iter_lines():
-                    if not _line:
-                        continue
-                    # httpx iter_lines() returns str in newer versions; in older
-                    # versions it returns bytes. Normalize to str before decoding.
-                    if isinstance(_line, bytes):
-                        _text = _line.decode("utf-8", errors="replace").strip()
-                    else:
-                        _text = str(_line).strip()
-                    # Some endpoints (notably SITA's /responses when not in SSE
-                    # mode) return a single JSON object as one line, not SSE
-                    # events prefixed with "data: ". Detect that case and parse
-                    # the whole line as the response.
-                    if not _text.startswith("data: "):
-                        if _text.startswith("{") and not collected_output_items:
-                            try:
-                                _obj = json.loads(_text)
-                                # Treat the whole response as one final object —
-                                # extract output items and any usage it carries.
-                                for _it in _obj.get("output", []) or []:
-                                    collected_output_items.append(_it)
-                                _final_response = _obj
-                            except json.JSONDecodeError:
-                                pass
-                        continue
-                    try:
-                        _data = json.loads(_text[6:])
-                    except json.JSONDecodeError:
-                        continue
-                    _etype = _data.get("type", "")
-                    if _etype == "response.output_item.done":
-                        _done = _data.get("item")
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = _data.get("delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                # Synthesize a final response object from collected items
-                # If we captured a whole JSON response (non-SSE), use its
-                # usage too so the caller sees prompt/completion tokens.
-                _final_kwargs = {"output": collected_output_items}
+            timeout = kwargs.get("timeout")
+            _raw_client = getattr(self._client, "_client", None)
+            if _raw_client is not None and hasattr(_raw_client, "stream"):
+                _url = f"{str(base_url).rstrip('/')}/responses"
+                # The OpenAI SDK adds Authorization via _build_request, not via
+                # default_headers on httpx.  We must add it explicitly when
+                # going around the SDK.
+                _api_key = getattr(self._client, "api_key", "")
+                _req_headers = {"Authorization": f"Bearer {_api_key}"}
+                _stream_kwargs = {"json": resp_kwargs, "headers": _req_headers}
+                if timeout is not None:
+                    _stream_kwargs["timeout"] = timeout
+                with _raw_client.stream("POST", _url, **_stream_kwargs) as _resp:
+                    if _resp.status_code >= 400:
+                        _body = b"".join(_resp.iter_bytes())[:500]
+                        raise RuntimeError(f"codex stream HTTP {_resp.status_code}: {_body!r}")
+                    for _line in _resp.iter_lines():
+                        if not _line:
+                            continue
+                        # httpx iter_lines() returns str in newer versions; in
+                        # older versions it returns bytes. Normalize to str.
+                        if isinstance(_line, bytes):
+                            _text = _line.decode("utf-8", errors="replace").strip()
+                        else:
+                            _text = str(_line).strip()
+                        # Some endpoints (notably SITA's /responses when not in
+                        # SSE mode) return a single JSON object as one line.
+                        if not _text.startswith("data: "):
+                            if _text.startswith("{") and not collected_output_items:
+                                try:
+                                    _obj = json.loads(_text)
+                                    for _it in _obj.get("output", []) or []:
+                                        collected_output_items.append(_it)
+                                    _final_response = _obj
+                                except json.JSONDecodeError:
+                                    pass
+                            continue
+                        try:
+                            _data = json.loads(_text[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        _etype = _data.get("type", "")
+                        if _etype == "response.output_item.done":
+                            _done = _data.get("item")
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = _data.get("delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
+            else:
+                create_kwargs = dict(resp_kwargs)
+                create_kwargs["stream"] = True
+                if timeout is not None:
+                    create_kwargs["timeout"] = timeout
+                stream_obj = self._client.responses.create(**create_kwargs)
+                deadline = time.monotonic() + float(timeout) if timeout is not None else None
                 try:
-                    if _final_response is not None:
-                        _final_kwargs["usage"] = _final_response.get("usage")
-                except NameError:
-                    pass
-                final = SimpleNamespace(**_final_kwargs)
-                _stream_elapsed = time.time() - _adapter_start
-                print(f"[HTTP_LOG] RESPONSE_OK provider=copilot model={model} elapsed={_stream_elapsed:.2f}s stream=true", flush=True)
+                    for event in stream_obj:
+                        if deadline is not None and time.monotonic() > deadline:
+                            close = getattr(stream_obj, "close", None)
+                            if callable(close):
+                                close()
+                            raise TimeoutError(f"Codex auxiliary request exceeded {timeout}s")
+                        _etype = getattr(event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
+                        elif _etype == "response.completed":
+                            _final_response = getattr(event, "response", None)
+                finally:
+                    close = getattr(stream_obj, "close", None)
+                    if callable(close):
+                        close()
+
+            # Synthesize a final response object from collected items. If we
+            # captured a whole response, carry usage through for callers.
+            _final_kwargs = {"output": collected_output_items}
+            if _final_response is not None:
+                if isinstance(_final_response, dict):
+                    _final_kwargs["usage"] = _final_response.get("usage")
+                else:
+                    _final_kwargs["usage"] = getattr(_final_response, "usage", None)
+            final = SimpleNamespace(**_final_kwargs)
+            _stream_elapsed = time.time() - _adapter_start
+            print(f"[HTTP_LOG] RESPONSE_OK provider=copilot model={model} elapsed={_stream_elapsed:.2f}s stream=true", flush=True)
         except Exception as _codex_exc:
             _stream_elapsed = time.time() - _adapter_start
             _codex_status = getattr(_codex_exc, "status_code", None)
@@ -800,7 +827,7 @@ class _CodexCompletionsAdapter:
                 val = obj.get(key, default)
             return val if val is not None else default
 
-        for item in getattr(final, "output", []):
+        for item in (getattr(final, "output", None) or []):
             item_type = _item_get(item, "type")
             if item_type == "message":
                 for part in (_item_get(item, "content") or []):
