@@ -19,6 +19,20 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+_TEXT_TOOL_CALL_MARKERS = (
+    "<tool_call",
+    "<function_calls",
+    "<invoke name=",
+    "<tool_invocation",
+    "<function=",
+    "TOOL_CALL:",
+    "MiMoML",
+    "mimoml",
+    "DSML",
+    "dsml",
+)
+
+
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
     """Translate Hermes/OpenRouter-style reasoning config to Gemini thinkingConfig."""
     if reasoning_config is None or not isinstance(reasoning_config, dict):
@@ -617,6 +631,18 @@ class ChatCompletionsTransport(ProviderTransport):
                         provider_data=tc_provider_data or None,
                     )
                 )
+        else:
+            parsed_text_tool_call = _parse_text_tool_call_content(msg.content)
+            if parsed_text_tool_call is not None:
+                function = parsed_text_tool_call.get("function") or {}
+                tool_calls = [
+                    ToolCall(
+                        id=parsed_text_tool_call.get("id"),
+                        name=str(function.get("name") or "unknown"),
+                        arguments=str(function.get("arguments") or "{}"),
+                    )
+                ]
+                finish_reason = "tool_calls"
 
         usage = None
         if hasattr(response, "usage") and response.usage:
@@ -646,7 +672,7 @@ class ChatCompletionsTransport(ProviderTransport):
             provider_data["reasoning_details"] = rd
 
         return NormalizedResponse(
-            content=msg.content,
+            content=_strip_text_tool_call_content(msg.content) if tool_calls else msg.content,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             reasoning=reasoning,
@@ -677,6 +703,31 @@ class ChatCompletionsTransport(ProviderTransport):
         if cached or written:
             return {"cached_tokens": cached, "creation_tokens": written}
         return None
+
+
+def _has_text_tool_call_marker(content: Any) -> bool:
+    return isinstance(content, str) and any(marker in content for marker in _TEXT_TOOL_CALL_MARKERS)
+
+
+def _parse_text_tool_call_content(content: Any) -> dict[str, Any] | None:
+    if not _has_text_tool_call_marker(content):
+        return None
+    try:
+        from agent.mimocode_code_client import _parse_tool_call_xml
+        return _parse_tool_call_xml(content)
+    except Exception:
+        return None
+
+
+def _strip_text_tool_call_content(content: Any) -> Any:
+    if not _has_text_tool_call_marker(content):
+        return content
+    try:
+        from agent.mimocode_code_client import _clean_tool_text
+        cleaned = _clean_tool_text(content).strip()
+        return cleaned or None
+    except Exception:
+        return content
 
 
 # Auto-register on import

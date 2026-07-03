@@ -974,6 +974,7 @@ def _strip_mimoml(text: str) -> str:
       <mimoml-tool_calls>      <tool_calls>     (hyphen)
       <mimoml_tool_calls>      <tool_calls>     (underscore)
       <|MiMoML|function_calls> <function_calls> (function_calls variant)
+      <｜DSML｜function_calls>  <function_calls> (DeepSeek DSML variant)
 
     Skips content inside ``` and ~~~ markdown fences (those are
     documentation examples, not actual tool calls).
@@ -1056,7 +1057,7 @@ def _clean_tool_text(text: str) -> str:
 
     Removes leftover:
       - TOOL_CALL: name(...) lines
-      - <|MiMoML|*> tags
+      - <|MiMoML|*> / <|DSML|*> tags
       - <tool_call>...</tool_call>
       - <function=...>...</function>
       - <parameter=...>...</parameter>
@@ -1069,10 +1070,17 @@ def _clean_tool_text(text: str) -> str:
     import re as _re_c
     text = _re_c.sub(r"TOOL_CALL:\s*\w+\s*\([^)]*(?:\([^)]*\)[^)]*)*\)", "", text, flags=_re_c.IGNORECASE)
     text = _re_c.sub(r"TOOL_CALL:.*$", "", text, flags=_re_c.MULTILINE | _re_c.IGNORECASE)
-    text = _re_c.sub(r"</?\|?MiMoML\|?[^>]*>", "", text)
-    text = _re_c.sub(r"<tool_calls?>.*?</tool_calls?>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
-    text = _re_c.sub(r"<(?:\|?MiMoML\|?)?invoke[^>]*>.*?</(?:\|?MiMoML\|?)?invoke>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
-    text = _re_c.sub(r"<(?:\|?MiMoML\|?)?parameter[^>]*>.*?</(?:\|?MiMoML\|?)?parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    if "MiMoML" in text or "mimoml" in text or "DSML" in text or "dsml" in text:
+        text = _strip_mimoml(text)
+    text = _re_c.sub(r"</?[|｜]?(?:MiMoML|DSML)[|｜]?[^>]*>", "", text, flags=_re_c.IGNORECASE)
+    text = _re_c.sub(
+        r"<(?:tool_calls?|function_calls)>.*?</(?:tool_calls?|function_calls)>",
+        "",
+        text,
+        flags=_re_c.DOTALL | _re_c.IGNORECASE,
+    )
+    text = _re_c.sub(r"<(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?invoke[^>]*>.*?</(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?invoke>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?parameter[^>]*>.*?</(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<tool_call>.*?</tool_call>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<function=\w+>.*?</function>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<parameter=\w+>.*?</parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
@@ -1490,6 +1498,8 @@ or (claude-style):
         and "TOOL_CALL:" not in text
         and "MiMoML" not in text
         and "mimoml" not in text
+        and "DSML" not in text
+        and "dsml" not in text
         and "<function=" not in text
     ):
         return None
@@ -1843,17 +1853,19 @@ or (claude-style):
                     },
                 }
 
-    # Format 12: MiMoML native format (with noise tolerance)
+    # Format 12: MiMoML / DSML native format (with noise tolerance)
     # <|MiMoML|tool_calls>
     #   <|MiMoML|invoke name="X">
     #     <|MiMoML|parameter name="Y"><![CDATA[V]]></|MiMoML|parameter>
     #   </|MiMoML|invoke>
     # </|MiMoML|tool_calls>
-    if "MiMoML" in text or "mimoml" in text:
+    if "MiMoML" in text or "mimoml" in text or "DSML" in text or "dsml" in text:
         normalised = _strip_mimoml(text)
-        # Now look for normalised <tool_calls><invoke name="X">...</invoke></tool_calls>
+        # Now look for normalised <tool_calls>/<function_calls> with invoke.
         m12 = re.search(
-            r"<tool_calls>(.*?)</tool_calls>", normalised, re.DOTALL | re.IGNORECASE
+            r"<(?:tool_calls|function_calls)>(.*?)</(?:tool_calls|function_calls)>",
+            normalised,
+            re.DOTALL | re.IGNORECASE,
         )
         if m12:
             inner = m12.group(1)
@@ -1966,7 +1978,7 @@ def _parse_mimoml_params(inner: str) -> dict[str, Any]:
     import re as _re_p
     args: dict[str, Any] = {}
     for m in _re_p.finditer(
-        r'<parameter\s+name=["\']([^"\']+)["\']>(.*?)</parameter>',
+        r'<parameter\b[^>]*\bname=["\']([^"\']+)["\'][^>]*>(.*?)</parameter>',
         inner,
         _re_p.DOTALL | _re_p.IGNORECASE,
     ):

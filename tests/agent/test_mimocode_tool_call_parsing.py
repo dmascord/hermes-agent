@@ -443,6 +443,27 @@ class TestParseToolCallXml:
         assert result is not None
         assert result["function"]["name"] == "mcp_bash"
 
+    def test_format_12_dsml_function_calls_fullwidth_pipe(self):
+        text = (
+            "<｜DSML｜function_calls>"
+            '<｜DSML｜invoke name="bash">'
+            '<｜DSML｜parameter name="i" string="true">Check container health</｜DSML｜parameter>'
+            '<｜DSML｜parameter name="command" string="true">'
+            'ssh wildduck.tusker.net.au "sudo docker ps --filter '
+            "'name=immich_server' --format '{{.Status}}'"
+            '"</｜DSML｜parameter>'
+            '<｜DSML｜parameter name="timeout" string="false">15</｜DSML｜parameter>'
+            "</｜DSML｜invoke>"
+            "</｜DSML｜function_calls>"
+        )
+        result = _parse_tool_call_xml(text)
+        assert result is not None
+        assert result["function"]["name"] == "bash"
+        args = json.loads(result["function"]["arguments"])
+        assert args["i"] == "Check container health"
+        assert "immich_server" in args["command"]
+        assert args["timeout"] == 15
+
     def test_no_tool_call_returns_none(self):
         assert _parse_tool_call_xml("just plain text response") is None
 
