@@ -1059,6 +1059,7 @@ def _clean_tool_text(text: str) -> str:
       - TOOL_CALL: name(...) lines
       - <|MiMoML|*> / <|DSML|*> tags
       - <tool_call>...</tool_call>
+      - <tool_use id="...">...</tool_use>
       - <function=...>...</function>
       - <parameter=...>...</parameter>
       - <tool_invocation .../> self-closing tags
@@ -1079,6 +1080,7 @@ def _clean_tool_text(text: str) -> str:
         text,
         flags=_re_c.DOTALL | _re_c.IGNORECASE,
     )
+    text = _re_c.sub(r"<tool_use\b[^>]*>.*?</tool_use>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?invoke[^>]*>.*?</(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?invoke>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?parameter[^>]*>.*?</(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<tool_call>.*?</tool_call>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
@@ -1488,6 +1490,7 @@ or (claude-style):
     import re
     if (
         "<tool_call>" not in text
+        and "<tool_use" not in text
         and "<function_calls>" not in text
         and "<invoke name=" not in text
         and "<tool_invocation" not in text
@@ -1529,6 +1532,26 @@ or (claude-style):
             }
         except (json.JSONDecodeError, KeyError):
             pass
+
+    # Format 1b: <tool_use id="bash"><parameter name="command">...</parameter></tool_use>
+    m1b = re.search(
+        r'<tool_use\s+id=["\']([^"\']+)["\']\s*>(.*?)</tool_use>',
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if m1b:
+        import uuid as _uuid
+        name = m1b.group(1).strip()
+        args = _parse_mimoml_params(m1b.group(2))
+        resolved = _resolve_tool_name(name, tool_names) or name
+        return {
+            "id": f"call_{_uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": resolved,
+                "arguments": json.dumps(args),
+            },
+        }
 
     # Format 2: <function=name><parameter=key>value</parameter>...</function>
     # Handles multiple <parameter=key>value</parameter> pairs.

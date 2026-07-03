@@ -21,6 +21,7 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 _TEXT_TOOL_CALL_MARKERS = (
     "<tool_call",
+    "<tool_use",
     "<function_calls",
     "<invoke name=",
     "<tool_invocation",

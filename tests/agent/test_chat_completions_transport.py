@@ -47,6 +47,34 @@ def test_normalize_response_converts_dsml_content_to_tool_call():
     assert args["timeout"] == 15
 
 
+def test_normalize_response_converts_tool_use_content_to_tool_call():
+    content = (
+        "※ recap: Fixed the Immich 404.\n\n"
+        '<tool_use id="bash">\n'
+        '<parameter name="i">Check container health</parameter>\n'
+        '<parameter name="command">'
+        'ssh wildduck.tusker.net.au "sudo docker ps --filter '
+        "'name=immich_server' --format '{{.Status}}'; echo '--- logs tail ---'; "
+        'sudo docker logs immich_server --tail 5"'
+        "</parameter>\n"
+        '<parameter name="timeout">15</parameter>\n'
+        "</tool_use>"
+    )
+
+    normalized = ChatCompletionsTransport().normalize_response(_response(content))
+
+    assert normalized.finish_reason == "tool_calls"
+    assert normalized.content == "※ recap: Fixed the Immich 404."
+    assert normalized.tool_calls is not None
+    assert len(normalized.tool_calls) == 1
+    tool_call = normalized.tool_calls[0]
+    assert tool_call.name == "bash"
+    args = json.loads(tool_call.arguments)
+    assert args["i"] == "Check container health"
+    assert "immich_server" in args["command"]
+    assert args["timeout"] == 15
+
+
 def test_normalize_response_leaves_plain_text_alone():
     normalized = ChatCompletionsTransport().normalize_response(
         _response("Use JSON examples carefully.")

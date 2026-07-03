@@ -318,6 +318,24 @@ class TestParseToolCallXml:
         args = json.loads(result["function"]["arguments"])
         assert args == {"command": "ls"}
 
+    def test_format_1b_tool_use_id(self):
+        text = (
+            '<tool_use id="bash">'
+            '<parameter name="i">Check container health</parameter>'
+            "<parameter name=\"command\">"
+            "ssh wildduck.tusker.net.au \"sudo docker ps --filter 'name=immich_server'\""
+            "</parameter>"
+            '<parameter name="timeout">15</parameter>'
+            "</tool_use>"
+        )
+        result = _parse_tool_call_xml(text)
+        assert result is not None
+        assert result["function"]["name"] == "bash"
+        args = json.loads(result["function"]["arguments"])
+        assert args["i"] == "Check container health"
+        assert "immich_server" in args["command"]
+        assert args["timeout"] == 15
+
     def test_format_2_function_param(self):
         text = '<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>'
         result = _parse_tool_call_xml(text)
