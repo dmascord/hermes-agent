@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
+from agent.conversation_loop import _collapse_repeated_assistant_text
 
 import run_agent
 from run_agent import AIAgent
@@ -52,6 +53,32 @@ def test_is_destructive_command_treats_cp_as_mutating():
 
 def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
+
+
+def test_collapse_repeated_assistant_text_blocks_planning_loop():
+    repeated = (
+        "Hmm, I've been going in circles for too long. Let me just fix the model.\n\n"
+        "Actually, wait. I should look at the create_nonclustered_index macro.\n\n"
+        "OK I'm going to read the ETA version of the macro now.\n\n"
+    )
+    collapsed, meta = _collapse_repeated_assistant_text(repeated * 4)
+
+    assert meta == {
+        "start_block": 0,
+        "unit_blocks": 3,
+        "repeat_count": 4,
+        "removed_blocks": 9,
+    }
+    assert collapsed.count("Hmm, I've been going in circles") == 1
+    assert "Hermes stopped a repeated assistant-text loop after 4 repeats" in collapsed
+
+
+def test_collapse_repeated_assistant_text_ignores_short_echo():
+    text = "yes\n\nyes\n\nyes"
+    collapsed, meta = _collapse_repeated_assistant_text(text)
+
+    assert collapsed == text
+    assert meta is None
 
 
 @pytest.fixture()
@@ -3291,6 +3318,35 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_repeated_text_loop_is_collapsed_before_final_response(self, agent):
+        self._setup_agent(agent)
+        repeated = (
+            "Hmm, I've been going in circles for too long. Let me just fix the model.\n\n"
+            "Actually, wait. I should look at the create_nonclustered_index macro.\n\n"
+            "OK I'm going to read the ETA version of the macro now.\n\n"
+        )
+        resp = _mock_response(content=repeated * 4, finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("fix the dbt model")
+
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == (
+            "assistant_text_loop_collapsed(repeats=4,unit_blocks=3)"
+        )
+        assert result["final_response"].count("Hmm, I've been going in circles") == 1
+        assert (
+            "Hermes stopped a repeated assistant-text loop after 4 repeats"
+            in result["final_response"]
+        )
+        final_messages = [m for m in result["messages"] if m.get("role") == "assistant"]
+        assert final_messages[-1]["content"] == result["final_response"]
+        assert final_messages[-1]["_assistant_text_loop_collapsed"]["repeat_count"] == 4
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)

@@ -64,6 +64,87 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _collapse_repeated_assistant_text(
+    text: str,
+    *,
+    min_repeats: int = 3,
+    max_unit_blocks: int = 8,
+    min_unit_chars: int = 60,
+) -> tuple[str, dict[str, int] | None]:
+    """Collapse repeated final-answer text produced inside one model response.
+
+    Tool-loop guardrails only see repeated tool calls. Some models instead get
+    stuck emitting the same planning paragraphs in a single no-tool response,
+    which would otherwise be treated as a normal final answer and persisted.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text, None
+
+    parts = re.split(r"(\n\s*\n+)", text)
+    blocks: list[dict[str, Any]] = []
+    for idx in range(0, len(parts), 2):
+        block = parts[idx]
+        if not block.strip():
+            continue
+        sep = parts[idx + 1] if idx + 1 < len(parts) else ""
+        blocks.append(
+            {
+                "text": block,
+                "sep": sep,
+                "norm": re.sub(r"\s+", " ", block).strip().lower(),
+            }
+        )
+
+    if len(blocks) < min_repeats:
+        return text, None
+
+    best: tuple[int, int, int] | None = None  # start, unit_size, repeat_count
+    for start in range(len(blocks)):
+        remaining = len(blocks) - start
+        for unit_size in range(1, min(max_unit_blocks, remaining // min_repeats) + 1):
+            unit = [b["norm"] for b in blocks[start:start + unit_size]]
+            unit_chars = sum(len(item) for item in unit)
+            if unit_chars < min_unit_chars:
+                continue
+
+            repeat_count = 1
+            while (
+                start + (repeat_count + 1) * unit_size <= len(blocks)
+                and [b["norm"] for b in blocks[
+                    start + repeat_count * unit_size:
+                    start + (repeat_count + 1) * unit_size
+                ]] == unit
+            ):
+                repeat_count += 1
+
+            if repeat_count < min_repeats:
+                continue
+            if best is None or repeat_count * unit_size > best[2] * best[1]:
+                best = (start, unit_size, repeat_count)
+
+    if best is None:
+        return text, None
+
+    start, unit_size, repeat_count = best
+    repeated_blocks = unit_size * repeat_count
+    collapsed_blocks = (
+        blocks[:start]
+        + blocks[start:start + unit_size]
+        + blocks[start + repeated_blocks:]
+    )
+    collapsed = "".join(str(b["text"]) + str(b["sep"]) for b in collapsed_blocks).strip()
+    note = (
+        f"\n\n[Hermes stopped a repeated assistant-text loop after "
+        f"{repeat_count} repeats.]"
+    )
+    return collapsed + note, {
+        "start_block": start,
+        "unit_blocks": unit_size,
+        "repeat_count": repeat_count,
+        "removed_blocks": repeated_blocks - unit_size,
+    }
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -4374,6 +4455,24 @@ def run_conversation(
                 final_response = agent._strip_think_blocks(final_response).strip()
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+
+                final_response, _repeat_guard = _collapse_repeated_assistant_text(final_response)
+                if _repeat_guard is not None:
+                    _turn_exit_reason = (
+                        "assistant_text_loop_collapsed"
+                        f"(repeats={_repeat_guard['repeat_count']},"
+                        f"unit_blocks={_repeat_guard['unit_blocks']})"
+                    )
+                    final_msg["content"] = final_response
+                    final_msg["_assistant_text_loop_collapsed"] = _repeat_guard
+                    logger.warning(
+                        "Collapsed repeated assistant text loop: "
+                        "repeats=%d unit_blocks=%d removed_blocks=%d model=%s",
+                        _repeat_guard["repeat_count"],
+                        _repeat_guard["unit_blocks"],
+                        _repeat_guard["removed_blocks"],
+                        agent.model,
+                    )
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending the final response.  These
