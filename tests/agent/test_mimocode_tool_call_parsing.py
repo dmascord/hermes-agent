@@ -375,6 +375,28 @@ class TestParseToolCallXml:
         assert result is not None
         assert result["function"]["name"] == "mcp__bash"
 
+    def test_format_5_invoke_with_typed_parameter_attributes(self):
+        text = (
+            "<function_calls>\n"
+            '<invoke name="bash">\n'
+            '<parameter name="command" string="true">'
+            "kubectl --kubeconfig ~/.kube/config exec -n esphome "
+            "esphome-7c5575dc55-64c5z -- esphome upload --device "
+            "10.0.0.239:6053 /config/bt-proxy.yaml 2>&1 | head -80"
+            "</parameter>\n"
+            '<parameter name="i" string="true">Upload via native API device flag</parameter>\n'
+            '<parameter name="timeout" string="false">60</parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        result = _parse_tool_call_xml(text)
+        assert result is not None
+        assert result["function"]["name"] == "bash"
+        args = json.loads(result["function"]["arguments"])
+        assert args["command"].startswith("kubectl --kubeconfig")
+        assert args["i"] == "Upload via native API device flag"
+        assert args["timeout"] == 60
+
     def test_format_6_tool_invocation(self):
         text = '<tool_invocation name="mcp__bash" arguments={"command": "ls"} />'
         result = _parse_tool_call_xml(text)
@@ -537,6 +559,62 @@ class TestStreamSieve:
         args = json.loads(tc["function"]["arguments"])
         assert args == {"command": "ls"}
 
+    def test_catches_function_calls_block_with_typed_parameter_attributes(self):
+        text = (
+            "<function_calls>\n"
+            '<invoke name="bash">\n'
+            '<parameter name="command" string="true">ls</parameter>\n'
+            '<parameter name="timeout" string="false">60</parameter>\n'
+            "</invoke>\n"
+            "</function_calls>"
+        )
+        sieve = _StreamSieve(self._parse, tool_names=["bash"])
+        events = sieve.feed(text[:40]) + sieve.feed(text[40:]) + sieve.flush()
+        assert not any(k == "text" and "<function_calls>" in d for k, d in events)
+        tool_events = [d for k, d in events if k == "tool_call"]
+        assert len(tool_events) == 1
+        args = json.loads(tool_events[0][0]["function"]["arguments"])
+        assert args == {"command": "ls", "timeout": 60}
+
+    def test_catches_eval_function_calls_block_with_multiline_code(self):
+        text = (
+            "Let me craft the service call. Let's test.\n\n"
+            "<function_calls>\n"
+            '<invoke name="eval">\n'
+            '<parameter name="code" string="true">'
+            "import json, urllib.request, pathlib, re\n"
+            "HA_URL = 'https://ha.tusker.net.au'\n"
+            "HEADERS = {'Authorization': f'Bearer {TOKEN}', "
+            "'Content-Type': 'application/json'}\n\n"
+            "url = f'{HA_URL}/api/services/esphome/upload'\n"
+            "try:\n"
+            "    print('ok')\n"
+            "except Exception as e:\n"
+            "    print(f'Error: {e}')"
+            "</parameter>\n"
+            '<parameter name="language" string="true">py</parameter>\n'
+            '<parameter name="timeout" string="false">15</parameter>\n'
+            '<parameter name="title" string="true">Try ESPHome upload service</parameter>\n'
+            "</invoke>\n"
+            "</function_calls>\n\n"
+            "※ recap: next action is native API upload."
+        )
+        sieve = _StreamSieve(self._parse, tool_names=["eval"])
+        events = sieve.feed(text[:80]) + sieve.feed(text[80:300]) + sieve.feed(text[300:]) + sieve.flush()
+        rendered = "".join(d for k, d in events if k == "text")
+        assert "<function_calls>" not in rendered
+        assert "Let me craft the service call" in rendered
+        assert "※ recap" in rendered
+        tool_events = [d for k, d in events if k == "tool_call"]
+        assert len(tool_events) == 1
+        tool_call = tool_events[0][0]
+        assert tool_call["function"]["name"] == "eval"
+        args = json.loads(tool_call["function"]["arguments"])
+        assert args["language"] == "py"
+        assert args["timeout"] == 15
+        assert args["title"] == "Try ESPHome upload service"
+        assert "api/services/esphome/upload" in args["code"]
+
     def test_holds_suspicious_trailing(self):
         """The sieve should hold a trailing '<' until the next chunk arrives."""
         sieve = _StreamSieve(self._parse)
@@ -570,6 +648,23 @@ class TestStreamSieve:
         # The tool call inside the fence should NOT be extracted
         tool_calls = [d for k, d in events if k == "tool_call"]
         assert len(tool_calls) == 0
+
+    def test_unparseable_tool_call_display_summary_is_scrubbed(self):
+        text = (
+            "<tool_call>\n\n"
+            " • Read (2)\n"
+            "   ├─ /Volumes/dev/dev/opencode/hermes-agent/agent/mimocode_code_client.py\n"
+            "   └─ /Volumes/dev/dev/opencode/hermes-agent/agent/transports/chat_completions.py\n\n"
+            "Let me check the actual marker list and parsing regex.\n\n"
+            "mcp__hermes-tools__read"
+        )
+        sieve = _StreamSieve(self._parse, tool_names=["read"])
+        events = sieve.feed(text) + sieve.flush()
+        rendered = "".join(d for k, d in events if k == "text")
+        assert "<tool_call>" not in rendered
+        assert "• Read" not in rendered
+        assert "mcp__hermes-tools__read" not in rendered
+        assert "Let me check the actual marker list" in rendered
 
 
 class TestTier2Helpers:

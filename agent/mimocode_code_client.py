@@ -1087,6 +1087,29 @@ def _clean_tool_text(text: str) -> str:
     text = _re_c.sub(r"<function=\w+>.*?</function>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<parameter=\w+>.*?</parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<tool_invocation[^>]*/>", "", text)
+    # OMP/OpenCode can render a tool call as a display summary in assistant
+    # text when an upstream model leaks an incomplete <tool_call> marker:
+    #
+    #   <tool_call>
+    #    • Read (2)
+    #      ├─ /path/a
+    #      └─ /path/b
+    #   mcp__hermes-tools__read
+    #
+    # This is not parseable as a tool call, but it is still internal tool UI
+    # residue and should not be shown back to the user.
+    text = _re_c.sub(r"^\s*<tool_call>\s*$", "", text, flags=_re_c.MULTILINE | _re_c.IGNORECASE)
+    text = _re_c.sub(
+        r"(?m)^\s*[•*-]\s+[^\n]+?\(\d+\)\s*\n"
+        r"(?:^\s*[├└╰╭│┬┴─╎╏].*\n?)+",
+        "",
+        text,
+    )
+    text = _re_c.sub(
+        r"(?m)^\s*mcp__[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+\s*$",
+        "",
+        text,
+    )
     text = _re_c.sub(r"```\w*\s*\n?\s*```", "", text)
     text = _re_c.sub(r"\n{3,}", "\n\n", text)
     return text
@@ -1322,7 +1345,9 @@ class _StreamSieve:
                     events.append(("text", suf))
             else:
                 if self._capture_buf:
-                    events.append(("text", self._capture_buf))
+                    cleaned = _clean_tool_text(self._capture_buf)
+                    if cleaned:
+                        events.append(("text", cleaned))
             self._capturing = False
             self._capture_buf = ""
         if self._buf:
@@ -1410,7 +1435,11 @@ class _StreamSieve:
                 return True
             if "<tool_calls>" in buf and "</tool_calls>" in buf:
                 return True
+            if "<function_calls>" in buf and "</function_calls>" in buf:
+                return True
             if "<|MiMoML|tool_calls>" in buf and "</|MiMoML|tool_calls>" in buf:
+                return True
+            if "<|MiMoML|function_calls>" in buf and "</|MiMoML|function_calls>" in buf:
                 return True
             if "<function=" in buf and "</function>" in buf:
                 return True
@@ -1434,16 +1463,20 @@ class _StreamSieve:
                 end = start + nl + 1
         elif "[调用工具:" in rest:
             end = start + rest.find("]") + 1
+        elif "<tool_calls>" in rest:
+            end = start + rest.find("</tool_calls>") + len("</tool_calls>")
+        elif "<function_calls>" in rest:
+            end = start + rest.find("</function_calls>") + len("</function_calls>")
         elif "<tool_call" in rest:
             end = start + rest.find("</tool_call>") + len("</tool_call>")
         elif "<function=" in rest:
             end = start + rest.find("</function>") + len("</function>")
         elif "<function_call" in rest:
             end = start + rest.find("</function_call>") + len("</function_call>")
-        elif "<tool_calls>" in rest:
-            end = start + rest.find("</tool_calls>") + len("</tool_calls>")
         elif "<|MiMoML|tool_calls>" in rest:
             end = start + rest.find("</|MiMoML|tool_calls>") + len("</|MiMoML|tool_calls>")
+        elif "<|MiMoML|function_calls>" in rest:
+            end = start + rest.find("</|MiMoML|function_calls>") + len("</|MiMoML|function_calls>")
         elif "<tool_invocation" in rest:
             end = start + rest.find("/>") + 2
         if end < 0:
@@ -1625,14 +1658,13 @@ or (claude-style):
         import uuid as _uuid
         name = m5.group(1).strip()
         args_block = m5.group(2)
-        args = {}
-        for am in re.finditer(r"<parameter\s+name=\"([^\"]+)\">(.*?)</parameter>", args_block, re.DOTALL):
-            args[am.group(1)] = am.group(2).strip()
+        args = _parse_mimoml_params(args_block)
+        resolved = _resolve_tool_name(name, tool_names) or name
         return {
             "id": f"call_{_uuid.uuid4().hex[:16]}",
             "type": "function",
             "function": {
-                "name": name,
+                "name": resolved,
                 "arguments": json.dumps(args),
             },
         }
