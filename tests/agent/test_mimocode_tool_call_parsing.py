@@ -39,6 +39,7 @@ from agent.mimocode_code_client import (  # noqa: E402
     _parse_python_kwargs,
     _parse_mimoml_params,
     _parse_tool_call_xml,
+    _parse_tool_calls_xml,
     _StreamSieve,
     _args_to_kwargs_str,
     _coerce_args_to_schema,
@@ -504,6 +505,43 @@ class TestParseToolCallXml:
         assert "immich_server" in args["command"]
         assert args["timeout"] == 15
 
+    def test_format_12_dsml_function_calls_multiple_invokes(self):
+        text = (
+            "<｜DSML｜function_calls>\n"
+            '<｜DSML｜invoke name="bash">\n'
+            '<｜DSML｜parameter name="command" string="true">'
+            'curl -sS "http://10.94.14.132:8080/api/v1/etl/backfill/'
+            '551d2ecc-d066-4c52-82cf-94692120147b" | python3 -m json.tool 2>&1 | head\n'
+            "-40"
+            "</｜DSML｜parameter>\n"
+            '<｜DSML｜parameter name="cwd" string="true">/tmp</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="description" string="true">Check status of the failed job</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="bash">\n'
+            '<｜DSML｜parameter name="command" string="true">'
+            'curl -sS "http://10.94.14.132:8080/api/v1/etl/backfill/'
+            'b55d1a12-efcd-40e0-aa87-05d8d91faf11" | python3 -m json.tool 2>&1 | head\n'
+            "-40"
+            "</｜DSML｜parameter>\n"
+            '<｜DSML｜parameter name="cwd" string="true">/tmp</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="description" string="true">Check status of successful July 4 job</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+        results = _parse_tool_calls_xml(text)
+        assert results is not None
+        assert len(results) == 2
+        first_args = json.loads(results[0]["function"]["arguments"])
+        second_args = json.loads(results[1]["function"]["arguments"])
+        assert results[0]["function"]["name"] == "bash"
+        assert results[1]["function"]["name"] == "bash"
+        assert "551d2ecc-d066-4c52-82cf-94692120147b" in first_args["command"]
+        assert first_args["cwd"] == "/tmp"
+        assert first_args["description"] == "Check status of the failed job"
+        assert "b55d1a12-efcd-40e0-aa87-05d8d91faf11" in second_args["command"]
+        assert second_args["cwd"] == "/tmp"
+        assert second_args["description"] == "Check status of successful July 4 job"
+
     def test_no_tool_call_returns_none(self):
         assert _parse_tool_call_xml("just plain text response") is None
 
@@ -522,9 +560,9 @@ class TestStreamSieve:
     """Verifies the sieve catches tool calls that span multiple feed() calls."""
 
     def _parse(self, buf, names):
-        tc = _parse_tool_call_xml(buf, names)
-        if tc:
-            return [tc], buf.replace(tc.get("function", {}).get("arguments", ""), "")
+        tool_calls = _parse_tool_calls_xml(buf, names)
+        if tool_calls:
+            return tool_calls, ""
         return None, buf
 
     def test_simple_text(self):
@@ -575,6 +613,28 @@ class TestStreamSieve:
         assert len(tool_events) == 1
         args = json.loads(tool_events[0][0]["function"]["arguments"])
         assert args == {"command": "ls", "timeout": 60}
+
+    def test_catches_dsml_function_calls_block_with_multiple_invokes(self):
+        text = (
+            "<｜DSML｜function_calls>\n"
+            '<｜DSML｜invoke name="bash">\n'
+            '<｜DSML｜parameter name="command" string="true">echo first</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="bash">\n'
+            '<｜DSML｜parameter name="command" string="true">echo second</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+        sieve = _StreamSieve(self._parse, tool_names=["bash"])
+        events = sieve.feed(text[:30]) + sieve.feed(text[30:90]) + sieve.feed(text[90:]) + sieve.flush()
+        assert not any(k == "text" and "DSML" in d for k, d in events)
+        tool_events = [d for k, d in events if k == "tool_call"]
+        assert len(tool_events) == 1
+        assert len(tool_events[0]) == 2
+        first_args = json.loads(tool_events[0][0]["function"]["arguments"])
+        second_args = json.loads(tool_events[0][1]["function"]["arguments"])
+        assert first_args["command"] == "echo first"
+        assert second_args["command"] == "echo second"
 
     def test_catches_eval_function_calls_block_with_multiline_code(self):
         text = (

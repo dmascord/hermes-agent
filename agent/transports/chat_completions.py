@@ -633,15 +633,19 @@ class ChatCompletionsTransport(ProviderTransport):
                     )
                 )
         else:
-            parsed_text_tool_call = _parse_text_tool_call_content(msg.content)
-            if parsed_text_tool_call is not None:
-                function = parsed_text_tool_call.get("function") or {}
+            parsed_text_tool_calls = _parse_text_tool_call_content(msg.content)
+            if parsed_text_tool_calls is not None:
                 tool_calls = [
                     ToolCall(
-                        id=parsed_text_tool_call.get("id"),
-                        name=str(function.get("name") or "unknown"),
-                        arguments=str(function.get("arguments") or "{}"),
+                        id=parsed.get("id"),
+                        name=str(
+                            (parsed.get("function") or {}).get("name") or "unknown"
+                        ),
+                        arguments=str(
+                            (parsed.get("function") or {}).get("arguments") or "{}"
+                        ),
                     )
+                    for parsed in parsed_text_tool_calls
                 ]
                 finish_reason = "tool_calls"
 
@@ -710,12 +714,12 @@ def _has_text_tool_call_marker(content: Any) -> bool:
     return isinstance(content, str) and any(marker in content for marker in _TEXT_TOOL_CALL_MARKERS)
 
 
-def _parse_text_tool_call_content(content: Any) -> dict[str, Any] | None:
+def _parse_text_tool_call_content(content: Any) -> list[dict[str, Any]] | None:
     if not _has_text_tool_call_marker(content):
         return None
     try:
-        from agent.mimocode_code_client import _parse_tool_call_xml
-        return _parse_tool_call_xml(content)
+        from agent.mimocode_code_client import _parse_tool_calls_xml
+        return _parse_tool_calls_xml(content)
     except Exception:
         return None
 

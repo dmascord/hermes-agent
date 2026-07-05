@@ -1275,6 +1275,10 @@ class _StreamSieve:
         "<｜MiMoML｜tool_calls>",
         "<|MiMoML|function_calls>",
         "<｜MiMoML｜function_calls>",
+        "<|DSML|tool_calls>",
+        "<｜DSML｜tool_calls>",
+        "<|DSML|function_calls>",
+        "<｜DSML｜function_calls>",
         "<tool_calls>",
         "<function_calls>",
         "<tool_invocation",
@@ -1441,6 +1445,14 @@ class _StreamSieve:
                 return True
             if "<|MiMoML|function_calls>" in buf and "</|MiMoML|function_calls>" in buf:
                 return True
+            if "<|DSML|tool_calls>" in buf and "</|DSML|tool_calls>" in buf:
+                return True
+            if "<|DSML|function_calls>" in buf and "</|DSML|function_calls>" in buf:
+                return True
+            if "<｜DSML｜tool_calls>" in buf and "</｜DSML｜tool_calls>" in buf:
+                return True
+            if "<｜DSML｜function_calls>" in buf and "</｜DSML｜function_calls>" in buf:
+                return True
             if "<function=" in buf and "</function>" in buf:
                 return True
             return False
@@ -1477,11 +1489,72 @@ class _StreamSieve:
             end = start + rest.find("</|MiMoML|tool_calls>") + len("</|MiMoML|tool_calls>")
         elif "<|MiMoML|function_calls>" in rest:
             end = start + rest.find("</|MiMoML|function_calls>") + len("</|MiMoML|function_calls>")
+        elif "<|DSML|tool_calls>" in rest:
+            end = start + rest.find("</|DSML|tool_calls>") + len("</|DSML|tool_calls>")
+        elif "<|DSML|function_calls>" in rest:
+            end = start + rest.find("</|DSML|function_calls>") + len("</|DSML|function_calls>")
+        elif "<｜DSML｜tool_calls>" in rest:
+            end = start + rest.find("</｜DSML｜tool_calls>") + len("</｜DSML｜tool_calls>")
+        elif "<｜DSML｜function_calls>" in rest:
+            end = start + rest.find("</｜DSML｜function_calls>") + len("</｜DSML｜function_calls>")
         elif "<tool_invocation" in rest:
             end = start + rest.find("/>") + 2
         if end < 0:
             return prefix, ""
         return prefix, text[end:]
+
+
+def _make_openai_tool_call(
+    name: str,
+    args: dict[str, Any],
+    tool_names: list[str] | None = None,
+) -> dict:
+    import uuid as _uuid
+
+    resolved = _resolve_tool_name(name, tool_names) or name
+    return {
+        "id": f"call_{_uuid.uuid4().hex[:16]}",
+        "type": "function",
+        "function": {
+            "name": resolved,
+            "arguments": json.dumps(args),
+        },
+    }
+
+
+def _parse_tool_calls_xml(
+    text: str,
+    tool_names: list[str] | None = None,
+) -> list[dict] | None:
+    """Parse text-formatted tool calls, preserving multi-invoke blocks."""
+    import re
+
+    if not isinstance(text, str):
+        return None
+
+    normalised = _strip_mimoml(text) if (
+        "MiMoML" in text or "mimoml" in text or "DSML" in text or "dsml" in text
+    ) else text
+    calls: list[dict] = []
+    for block in re.finditer(
+        r"<(?:tool_calls|function_calls)>(.*?)</(?:tool_calls|function_calls)>",
+        normalised,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        inner = block.group(1)
+        for invoke in re.finditer(
+            r'<invoke\s+name=["\']([^"\']+)["\']>(.*?)</invoke>',
+            inner,
+            re.DOTALL | re.IGNORECASE,
+        ):
+            name = invoke.group(1).strip()
+            args = _parse_mimoml_params(invoke.group(2))
+            calls.append(_make_openai_tool_call(name, args, tool_names))
+    if calls:
+        return calls
+
+    single = _parse_tool_call_xml(text, tool_names)
+    return [single] if single is not None else None
 
 
 def _parse_tool_call_xml(text: str, tool_names: list[str] | None = None) -> dict | None:
@@ -1655,19 +1728,10 @@ or (claude-style):
     # Format 5: <function_calls><invoke name="mcp__X"><parameter name="key">value</parameter></invoke></function_calls>
     m5 = re.search(r"<invoke\s+name=\"([^\"]+)\">(.*?)</invoke>", text, re.DOTALL)
     if m5:
-        import uuid as _uuid
         name = m5.group(1).strip()
         args_block = m5.group(2)
         args = _parse_mimoml_params(args_block)
-        resolved = _resolve_tool_name(name, tool_names) or name
-        return {
-            "id": f"call_{_uuid.uuid4().hex[:16]}",
-            "type": "function",
-            "function": {
-                "name": resolved,
-                "arguments": json.dumps(args),
-            },
-        }
+        return _make_openai_tool_call(name, args, tool_names)
 
     # Format 6: <tool_invocation name="mcp__X" arguments={json} /> (self-closing)
     # Arguments are raw JSON, no quotes around them. The closing /> after
@@ -1932,15 +1996,7 @@ or (claude-style):
             if m12i:
                 fname = m12i.group(1).strip()
                 args = _parse_mimoml_params(m12i.group(2))
-                resolved = _resolve_tool_name(fname, tool_names) or fname
-                return {
-                    "id": f"call_{_uuid.uuid4().hex[:16]}",
-                    "type": "function",
-                    "function": {
-                        "name": resolved,
-                        "arguments": json.dumps(args),
-                    },
-                }
+                return _make_openai_tool_call(fname, args, tool_names)
     return None
 
 
