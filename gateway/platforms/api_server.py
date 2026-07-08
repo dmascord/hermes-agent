@@ -2206,6 +2206,60 @@ def _enrich_client_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
     return [_enrich_client_tool_call(dict(tc)) for tc in tool_calls if isinstance(tc, dict)]
 
 
+def _extract_text_tool_calls_for_passthrough(content: Any) -> tuple[List[Dict[str, Any]], Any]:
+    """Convert XML/DSML text-formatted tool calls into OpenAI tool_calls.
+
+    Some tool-capable models emit tool calls as assistant text instead of the
+    structured ``tool_calls`` field. The normal chat transport handles this,
+    but hermes-code passthrough serializes SSE directly, so it needs the same
+    rescue path before it streams raw content to the client.
+    """
+    if not isinstance(content, str) or not content:
+        return [], content
+    try:
+        from agent.mimocode_code_client import _clean_tool_text, _parse_tool_calls_xml
+
+        parsed_calls = _parse_tool_calls_xml(content)
+        if not parsed_calls:
+            return [], content
+
+        converted: List[Dict[str, Any]] = []
+        for idx, parsed in enumerate(parsed_calls):
+            if not isinstance(parsed, dict):
+                continue
+            function = parsed.get("function") or {}
+            if not isinstance(function, dict):
+                continue
+            raw_name = function.get("name") or "unknown"
+            name = _normalize_external_tool_name(raw_name)
+            arguments = function.get("arguments", "{}")
+            if isinstance(arguments, (dict, list)):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            elif not isinstance(arguments, str):
+                arguments = str(arguments)
+            call_id = parsed.get("id") or parsed.get("call_id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                digest = hashlib.sha256(f"{name}:{arguments}:{idx}".encode()).hexdigest()[:16]
+                call_id = f"call_text_{digest}"
+            converted.append({
+                "id": call_id.strip(),
+                "call_id": call_id.strip(),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments or "{}",
+                },
+            })
+
+        if not converted:
+            return [], content
+        cleaned = _clean_tool_text(content).strip()
+        return _enrich_client_tool_calls(converted), cleaned
+    except Exception as exc:
+        logger.debug("text tool-call extraction failed: %s", exc)
+        return [], content
+
+
 def _normalize_external_tool_name(name: Any) -> str:
     """Map Hermes/internal tool names to client-exposed OpenCode tool names."""
     raw = str(name or "").strip()
@@ -7259,6 +7313,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _tc_dict["call_id"] = _packed_id
                                     tool_calls_out.append(_tc_dict)
                                 tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                                if not tool_calls_out:
+                                    _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out)
+                                    if _text_tool_calls:
+                                        logger.warning(
+                                            "[hermes-code][req=%s] recovered %d text-formatted tool_call(s) from assistant content for %s",
+                                            _req_id, len(_text_tool_calls), provider_model,
+                                        )
+                                        tool_calls_out = _text_tool_calls
+                                        content_out = _cleaned_content if isinstance(_cleaned_content, str) else content_out
                                 usage_obj = getattr(response_obj, "usage", None)
                                 response_text = content_out
                                 finish_reason = getattr(response_obj.choices[0], "finish_reason", "stop")
@@ -8504,6 +8567,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         # Restore original tool_call_ids for arliai responses.
                         if _mapper is not None and tool_calls_out:
                             tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
+                        if not tool_calls_out:
+                            _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out)
+                            if _text_tool_calls:
+                                logger.warning(
+                                    "[hermes-code][req=%s] recovered %d text-formatted tool_call(s) from assistant content for %s",
+                                    _req_id, len(_text_tool_calls), provider_model,
+                                )
+                                tool_calls_out = _text_tool_calls
+                                content_out = _cleaned_content if isinstance(_cleaned_content, str) else content_out
 
                         _bad_bash_summary = _invalid_bash_tool_call_summary(tool_calls_out)
                         if passthrough_tools and _bad_bash_summary and not _skip_normal_call:
@@ -8554,6 +8626,15 @@ class APIServerAdapter(BasePlatformAdapter):
                             tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
                             if _mapper is not None and tool_calls_out:
                                 tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
+                            if not tool_calls_out:
+                                _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out)
+                                if _text_tool_calls:
+                                    logger.warning(
+                                        "[hermes-code][req=%s] recovered %d text-formatted tool_call(s) from corrective retry content for %s",
+                                        _req_id, len(_text_tool_calls), provider_model,
+                                    )
+                                    tool_calls_out = _text_tool_calls
+                                    content_out = _cleaned_content if isinstance(_cleaned_content, str) else content_out
 
                         # If any provider returned no tool calls (or empty bash commands)
                         # despite having tools, skip to next. Apply a short cooldown so

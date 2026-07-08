@@ -39,6 +39,7 @@ from gateway.platforms.api_server import (
     _messages_with_retry_tool_prompt,
     _messages_with_provider_tool_prompt,
     _sanitize_passthrough_error_for_client,
+    _extract_text_tool_calls_for_passthrough,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -118,6 +119,7 @@ class TestPassthroughProviderExhaustion:
         """Casual use of 'login' in task output should not be mistaken for an auth error."""
         content = "First, run the login command to authenticate with the API"
         assert _is_provider_exhaustion_content(content) is False
+
     def test_synthetic_runtime_error_cooldown_is_capped(self):
         """Synthetic RuntimeError from _skip_provider_exhaustion_content()
         has no HTTP response.  The cooldown must be conservative (<= 1h),
@@ -129,6 +131,46 @@ class TestPassthroughProviderExhaustion:
         cd = _cooldown_seconds_for_429(exc)
         assert cd <= 3600.0, f"synthetic cooldown too long: {cd}s"
         assert cd >= 60.0
+
+
+class TestPassthroughTextToolCalls:
+    def test_extracts_dsml_function_calls_from_assistant_text(self):
+        content = (
+            "Let me start with Flow Energy.\n"
+            "<｜DSML｜function_calls>\n"
+            '<｜DSML｜invoke name="web_search">\n'
+            '<｜DSML｜parameter name="i" string="true">Find PDF price fact sheets Endeavour</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="query" string="true">Endeavour energy price fact sheet PDF flow globird zerohero</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="recency" string="true">year</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+
+        tool_calls, cleaned = _extract_text_tool_calls_for_passthrough(content)
+
+        assert len(tool_calls) == 1
+        tc = tool_calls[0]
+        assert tc["function"]["name"] == "web_search"
+        args = json.loads(tc["function"]["arguments"])
+        assert args["i"] == "Find PDF price fact sheets Endeavour"
+        assert args["query"].startswith("Endeavour energy")
+        assert args["recency"] == "year"
+        assert "DSML" not in cleaned
+        assert "Let me start with Flow Energy." in cleaned
+
+    def test_normalizes_mcp_bash_text_tool_name_for_client(self):
+        content = (
+            '<xai:function_call name="mcp__hermes-tools__bash">'
+            '<xai:parameter name="command">echo ok</xai:parameter>'
+            "</xai:function_call>"
+        )
+
+        tool_calls, cleaned = _extract_text_tool_calls_for_passthrough(content)
+
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["function"]["name"] == "bash"
+        assert json.loads(tool_calls[0]["function"]["arguments"])["command"] == "echo ok"
+        assert cleaned == ""
 
 
 class TestBashToolCallValidation:

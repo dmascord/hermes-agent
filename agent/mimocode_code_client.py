@@ -1058,7 +1058,7 @@ def _clean_tool_text(text: str) -> str:
     Removes leftover:
       - TOOL_CALL: name(...) lines
       - <|MiMoML|*> / <|DSML|*> tags
-      - <tool_call>...</tool_call>
+      - <tool_call>...</tool_call> and namespaced variants
       - <tool_use id="...">...</tool_use>
       - <function=...>...</function>
       - <parameter=...>...</parameter>
@@ -1075,15 +1075,15 @@ def _clean_tool_text(text: str) -> str:
         text = _strip_mimoml(text)
     text = _re_c.sub(r"</?[|｜]?(?:MiMoML|DSML)[|｜]?[^>]*>", "", text, flags=_re_c.IGNORECASE)
     text = _re_c.sub(
-        r"<(?:tool_calls?|function_calls)>.*?</(?:tool_calls?|function_calls)>",
+        r"<(?:\w+:)?(?:tool_calls?|function_calls?)\b[^>]*>.*?</(?:\w+:)?(?:tool_calls?|function_calls?)>",
         "",
         text,
         flags=_re_c.DOTALL | _re_c.IGNORECASE,
     )
     text = _re_c.sub(r"<tool_use\b[^>]*>.*?</tool_use>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
-    text = _re_c.sub(r"<(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?invoke[^>]*>.*?</(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?invoke>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
-    text = _re_c.sub(r"<(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?parameter[^>]*>.*?</(?:[|｜]?(?:MiMoML|DSML)[|｜]?)?parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
-    text = _re_c.sub(r"<tool_call>.*?</tool_call>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<(?:(?:[|｜]?(?:MiMoML|DSML)[|｜]?)|\w+:)?invoke[^>]*>.*?</(?:(?:[|｜]?(?:MiMoML|DSML)[|｜]?)|\w+:)?invoke>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<(?:(?:[|｜]?(?:MiMoML|DSML)[|｜]?)|\w+:)?parameter[^>]*>.*?</(?:(?:[|｜]?(?:MiMoML|DSML)[|｜]?)|\w+:)?parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
+    text = _re_c.sub(r"<(?:\w+:)?tool_call\b[^>]*>.*?</(?:\w+:)?tool_call>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<function=\w+>.*?</function>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<parameter=\w+>.*?</parameter>", "", text, flags=_re_c.DOTALL | _re_c.IGNORECASE)
     text = _re_c.sub(r"<tool_invocation[^>]*/>", "", text)
@@ -1269,6 +1269,9 @@ class _StreamSieve:
         "TOOL_CALL:",
         "<tool_call>",
         "<function_call",
+        "<xai:function_call",
+        "<xai:function_calls",
+        "<xai:invoke",
         "<function=",
         "[调用工具:",
         "<|MiMoML|tool_calls>",
@@ -1437,6 +1440,10 @@ class _StreamSieve:
                 return True
             if "<function_call" in buf and "</function_call>" in buf:
                 return True
+            if "<xai:function_calls" in buf and "</xai:function_calls>" in buf:
+                return True
+            if "<xai:function_call" in buf and "</xai:function_call>" in buf:
+                return True
             if "<tool_calls>" in buf and "</tool_calls>" in buf:
                 return True
             if "<function_calls>" in buf and "</function_calls>" in buf:
@@ -1485,6 +1492,10 @@ class _StreamSieve:
             end = start + rest.find("</function>") + len("</function>")
         elif "<function_call" in rest:
             end = start + rest.find("</function_call>") + len("</function_call>")
+        elif "<xai:function_calls" in rest:
+            end = start + rest.find("</xai:function_calls>") + len("</xai:function_calls>")
+        elif "<xai:function_call" in rest:
+            end = start + rest.find("</xai:function_call>") + len("</xai:function_call>")
         elif "<|MiMoML|tool_calls>" in rest:
             end = start + rest.find("</|MiMoML|tool_calls>") + len("</|MiMoML|tool_calls>")
         elif "<|MiMoML|function_calls>" in rest:
@@ -1537,13 +1548,13 @@ def _parse_tool_calls_xml(
     ) else text
     calls: list[dict] = []
     for block in re.finditer(
-        r"<(?:tool_calls|function_calls)>(.*?)</(?:tool_calls|function_calls)>",
+        r"<(?:\w+:)?(?:tool_calls|function_calls)>(.*?)</(?:\w+:)?(?:tool_calls|function_calls)>",
         normalised,
         re.DOTALL | re.IGNORECASE,
     ):
         inner = block.group(1)
         for invoke in re.finditer(
-            r'<invoke\s+name=["\']([^"\']+)["\']>(.*?)</invoke>',
+            r'<(?:\w+:)?invoke\s+name=["\']([^"\']+)["\']>(.*?)</(?:\w+:)?invoke>',
             inner,
             re.DOTALL | re.IGNORECASE,
         ):
@@ -1598,7 +1609,10 @@ or (claude-style):
         "<tool_call>" not in text
         and "<tool_use" not in text
         and "<function_calls>" not in text
+        and "<xai:function_call" not in text
+        and "<xai:function_calls" not in text
         and "<invoke name=" not in text
+        and "<xai:invoke name=" not in text
         and "<tool_invocation" not in text
         and "```" not in text
         and "<mcp_" not in text
@@ -1726,11 +1740,29 @@ or (claude-style):
         }
 
     # Format 5: <function_calls><invoke name="mcp__X"><parameter name="key">value</parameter></invoke></function_calls>
-    m5 = re.search(r"<invoke\s+name=\"([^\"]+)\">(.*?)</invoke>", text, re.DOTALL)
+    m5 = re.search(
+        r"<(?:\w+:)?invoke\s+name=\"([^\"]+)\">(.*?)</(?:\w+:)?invoke>",
+        text,
+        re.DOTALL,
+    )
     if m5:
         name = m5.group(1).strip()
         args_block = m5.group(2)
         args = _parse_mimoml_params(args_block)
+        return _make_openai_tool_call(name, args, tool_names)
+
+    # Format 5b: xAI function_call wrapper.
+    # xAI-compatible models sometimes emit XML with namespaced tags:
+    #   <xai:function_call name="tool"><xai:parameter name="k">v</xai:parameter></xai:function_call>
+    # or with the tool name as an attribute on the outer function_call.
+    m5b = re.search(
+        r"<xai:function_call\s+name=\"([^\"]+)\"\s*>(.*?)</xai:function_call>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if m5b:
+        name = m5b.group(1).strip()
+        args = _parse_mimoml_params(m5b.group(2))
         return _make_openai_tool_call(name, args, tool_names)
 
     # Format 6: <tool_invocation name="mcp__X" arguments={json} /> (self-closing)
@@ -2089,7 +2121,7 @@ def _parse_mimoml_params(inner: str) -> dict[str, Any]:
     import re as _re_p
     args: dict[str, Any] = {}
     for m in _re_p.finditer(
-        r'<parameter\b[^>]*\bname=["\']([^"\']+)["\'][^>]*>(.*?)</parameter>',
+        r'<(?:\w+:)?parameter\b[^>]*\bname=["\']([^"\']+)["\'][^>]*>(.*?)</(?:\w+:)?parameter>',
         inner,
         _re_p.DOTALL | _re_p.IGNORECASE,
     ):

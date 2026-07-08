@@ -736,6 +736,27 @@ def _parse_text_tool_call(text: str) -> dict | None:
     if not text:
         return None
 
+    if "<xai:" in text:
+        try:
+            from agent.mimocode_code_client import _parse_tool_call_xml
+
+            parsed = _parse_tool_call_xml(text)
+            if parsed:
+                function = parsed.get("function") or {}
+                arguments = function.get("arguments") or "{}"
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        arguments = {"raw": arguments}
+                return {
+                    "call_id": parsed.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                    "name": function.get("name", "unknown"),
+                    "arguments": arguments if isinstance(arguments, dict) else {"raw": str(arguments)},
+                }
+        except Exception:
+            pass
+
     # Format 1: <function_calls><invoke name="X"><parameter name="Y">VAL</parameter></invoke></function_calls>
     m = re.search(r"<invoke\s+name=\"([^\"]+)\">(.*?)</invoke>", text, re.DOTALL)
     if m:

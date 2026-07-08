@@ -542,6 +542,41 @@ class TestParseToolCallXml:
         assert second_args["cwd"] == "/tmp"
         assert second_args["description"] == "Check status of successful July 4 job"
 
+    def test_format_13_xai_function_call(self):
+        text = (
+            '<xai:function_call name="mcp__hermes-tools__bash">'
+            '<xai:parameter name="command">'
+            'curl -s -o /dev/null -w "%{http_code}\\n" --max-time 15 '
+            "https://www.globirdenergy.com.au/price-fact-sheet/zerohero/"
+            "</xai:parameter>"
+            "</xai:function_call>"
+        )
+        result = _parse_tool_call_xml(text, tool_names=["mcp__hermes-tools__bash"])
+        assert result is not None
+        assert result["function"]["name"] == "mcp__hermes-tools__bash"
+        args = json.loads(result["function"]["arguments"])
+        assert args["command"].startswith("curl -s")
+        assert "zerohero" in args["command"]
+
+    def test_format_13_xai_function_calls_multiple_invokes(self):
+        text = (
+            "<xai:function_calls>"
+            '<xai:invoke name="mcp__hermes-tools__bash">'
+            '<xai:parameter name="command">echo one</xai:parameter>'
+            "</xai:invoke>"
+            '<xai:invoke name="mcp__hermes-tools__bash">'
+            '<xai:parameter name="command">echo two</xai:parameter>'
+            "</xai:invoke>"
+            "</xai:function_calls>"
+        )
+        results = _parse_tool_calls_xml(text, tool_names=["mcp__hermes-tools__bash"])
+        assert results is not None
+        assert len(results) == 2
+        first_args = json.loads(results[0]["function"]["arguments"])
+        second_args = json.loads(results[1]["function"]["arguments"])
+        assert first_args == {"command": "echo one"}
+        assert second_args == {"command": "echo two"}
+
     def test_no_tool_call_returns_none(self):
         assert _parse_tool_call_xml("just plain text response") is None
 
@@ -635,6 +670,22 @@ class TestStreamSieve:
         second_args = json.loads(tool_events[0][1]["function"]["arguments"])
         assert first_args["command"] == "echo first"
         assert second_args["command"] == "echo second"
+
+    def test_catches_xai_function_call_block(self):
+        text = (
+            "running "
+            '<xai:function_call name="mcp__hermes-tools__bash">'
+            '<xai:parameter name="command">echo ok</xai:parameter>'
+            "</xai:function_call>"
+            " done"
+        )
+        sieve = _StreamSieve(self._parse, tool_names=["mcp__hermes-tools__bash"])
+        events = sieve.feed(text) + sieve.flush()
+        tool_events = [d for k, d in events if k == "tool_call"]
+        assert len(tool_events) == 1
+        assert tool_events[0][0]["function"]["name"] == "mcp__hermes-tools__bash"
+        args = json.loads(tool_events[0][0]["function"]["arguments"])
+        assert args == {"command": "echo ok"}
 
     def test_catches_eval_function_calls_block_with_multiline_code(self):
         text = (

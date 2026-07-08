@@ -37,9 +37,10 @@ def repair():
     reads self.valid_tool_names. A SimpleNamespace stub is enough to
     bind the unbound function.
     """
-    from run_agent import AIAgent
+    from agent.agent_runtime_helpers import repair_tool_call
+
     stub = SimpleNamespace(valid_tool_names=VALID)
-    return AIAgent._repair_tool_call.__get__(stub, AIAgent)
+    return lambda tool_name: repair_tool_call(stub, tool_name)
 
 
 class TestExistingBehaviorStillWorks:
@@ -94,6 +95,9 @@ class TestClassLikeEmissions:
 
     def test_mixed_separators_and_suffix(self, repair):
         assert repair("write-file_Tool") == "write_file"
+
+    def test_codex_browser_wrapper_maps_to_navigate(self, repair):
+        assert repair("browser") == "browser_navigate"
 
 
 class TestEdgeCases:

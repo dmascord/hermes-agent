@@ -1812,6 +1812,11 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     if normalized in agent.valid_tool_names:
         return normalized
 
+    # Codex-style runtimes may emit a generic browser wrapper with an
+    # action such as open_tab. Hermes exposes that operation as browser_navigate.
+    if normalized == "browser" and "browser_navigate" in agent.valid_tool_names:
+        return "browser_navigate"
+
     # Build the full candidate set for class-like emissions.
     cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
     # Strip trailing tool-suffix up to twice — TodoTool_tool needs it.
