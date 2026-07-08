@@ -1838,14 +1838,67 @@ def _extract_openai_tool_calls(raw_tool_calls: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _enrich_client_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
+_CLIENT_TOOL_EQUIVALENTS: Dict[str, Tuple[str, ...]] = {
+    # OMP renamed grep-style content search to `search`; older sessions and
+    # model priors still commonly emit `grep`.
+    "grep": ("search", "search_files"),
+    "search_files": ("search", "grep"),
+    "rg": ("search", "grep", "search_files"),
+    # File discovery aliases.
+    "glob": ("find", "search"),
+    "ls": ("find", "list"),
+    "list": ("find", "ls"),
+    # Shell aliases.
+    "terminal": ("bash", "shell"),
+    "shell": ("bash", "terminal"),
+}
+
+
+def _advertised_client_tool_names(tools: Any) -> set[str]:
+    """Return client-advertised function names from a passthrough tool list."""
+    if not isinstance(tools, list):
+        return set()
+    names: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if isinstance(name, str) and name.strip():
+            names.add(_normalize_external_tool_name(name.strip()))
+    return names
+
+
+def _resolve_client_tool_name(name: Any, advertised_names: Optional[set[str]] = None) -> Optional[str]:
+    """Map a model-emitted external tool name to one the client advertised."""
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    normalized = _normalize_external_tool_name(raw)
+    if not advertised_names:
+        return normalized
+    if normalized in advertised_names:
+        return normalized
+    for candidate in _CLIENT_TOOL_EQUIVALENTS.get(normalized, ()):
+        candidate_norm = _normalize_external_tool_name(candidate)
+        if candidate_norm in advertised_names:
+            return candidate_norm
+    return None
+
+
+def _enrich_client_tool_call(tc: Dict[str, Any], advertised_names: Optional[set[str]] = None) -> Optional[Dict[str, Any]]:
     """Ensure client-visible tool calls satisfy strict downstream schemas."""
     if not isinstance(tc, dict):
         return tc
     fn = tc.get("function")
     if not isinstance(fn, dict):
         return tc
-    name = fn.get("name")
+    name = _resolve_client_tool_name(fn.get("name"), advertised_names)
+    if not name:
+        return None
+    fn["name"] = name
     arguments = fn.get("arguments", "{}")
     if isinstance(arguments, str):
         try:
@@ -1858,7 +1911,7 @@ def _enrich_client_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
         return tc
 
     _norm = _normalize_external_tool_name(name)
-    if _norm in {"bash", "terminal"}:
+    if _norm in {"bash", "terminal", "read", "edit", "write", "search", "grep", "search_files", "glob"}:
         parsed = _external_tool_call_arguments(name, parsed)
 
     fn["arguments"] = json.dumps(parsed, ensure_ascii=False)
@@ -2200,13 +2253,28 @@ def _call_codex_passthrough(
     return types.SimpleNamespace(choices=[choice], usage=usage)
 
 
-def _enrich_client_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+def _enrich_client_tool_calls(tool_calls: Any, advertised_tools: Any = None) -> List[Dict[str, Any]]:
     if not isinstance(tool_calls, list):
         return []
-    return [_enrich_client_tool_call(dict(tc)) for tc in tool_calls if isinstance(tc, dict)]
+    advertised_names = _advertised_client_tool_names(advertised_tools) if advertised_tools else None
+    enriched: List[Dict[str, Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        item = _enrich_client_tool_call(dict(tc), advertised_names)
+        if item is not None:
+            enriched.append(item)
+        else:
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            logger.warning(
+                "[hermes-code] dropping unmapped client tool call name=%r advertised=%s",
+                fn.get("name") if isinstance(fn, dict) else None,
+                sorted(advertised_names or []),
+            )
+    return enriched
 
 
-def _extract_text_tool_calls_for_passthrough(content: Any) -> tuple[List[Dict[str, Any]], Any]:
+def _extract_text_tool_calls_for_passthrough(content: Any, advertised_tools: Any = None) -> tuple[List[Dict[str, Any]], Any]:
     """Convert XML/DSML text-formatted tool calls into OpenAI tool_calls.
 
     Some tool-capable models emit tool calls as assistant text instead of the
@@ -2254,7 +2322,7 @@ def _extract_text_tool_calls_for_passthrough(content: Any) -> tuple[List[Dict[st
         if not converted:
             return [], content
         cleaned = _clean_tool_text(content).strip()
-        return _enrich_client_tool_calls(converted), cleaned
+        return _enrich_client_tool_calls(converted, advertised_tools), cleaned
     except Exception as exc:
         logger.debug("text tool-call extraction failed: %s", exc)
         return [], content
@@ -7216,7 +7284,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                                     "arguments": json.dumps(block.input)
                                                 }
                                             })
-                                tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                                tool_calls_out = _enrich_client_tool_calls(tool_calls_out, passthrough_tools)
                                 usage_obj = getattr(response_obj, 'usage', None)
                                 reasoning_content_out = None
                                 finish_reason = "tool_calls" if tool_calls_out else "stop"
@@ -7312,9 +7380,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _tc_dict["id"] = _packed_id
                                         _tc_dict["call_id"] = _packed_id
                                     tool_calls_out.append(_tc_dict)
-                                tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                                tool_calls_out = _enrich_client_tool_calls(tool_calls_out, passthrough_tools)
                                 if not tool_calls_out:
-                                    _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out)
+                                    _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out, passthrough_tools)
                                     if _text_tool_calls:
                                         logger.warning(
                                             "[hermes-code][req=%s] recovered %d text-formatted tool_call(s) from assistant content for %s",
@@ -8562,13 +8630,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _func_name = str(getattr(_func, "name", getattr(tc, "name", "")))
                                 _func_args = str(getattr(_func, "arguments", getattr(tc, "arguments", "{}")))
                                 tool_calls_out.append({"id": str(getattr(tc, "id", "")), "type": "function", "function": {"name": _func_name, "arguments": _func_args}})
-                        tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                        tool_calls_out = _enrich_client_tool_calls(tool_calls_out, passthrough_tools)
 
                         # Restore original tool_call_ids for arliai responses.
                         if _mapper is not None and tool_calls_out:
                             tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
                         if not tool_calls_out:
-                            _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out)
+                            _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out, passthrough_tools)
                             if _text_tool_calls:
                                 logger.warning(
                                     "[hermes-code][req=%s] recovered %d text-formatted tool_call(s) from assistant content for %s",
@@ -8623,11 +8691,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                     _func_name = str(getattr(_func, "name", getattr(tc, "name", "")))
                                     _func_args = str(getattr(_func, "arguments", getattr(tc, "arguments", "{}")))
                                     tool_calls_out.append({"id": str(getattr(tc, "id", "")), "type": "function", "function": {"name": _func_name, "arguments": _func_args}})
-                            tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                            tool_calls_out = _enrich_client_tool_calls(tool_calls_out, passthrough_tools)
                             if _mapper is not None and tool_calls_out:
                                 tool_calls_out = _mapper.unsanitize_tool_calls(tool_calls_out)
                             if not tool_calls_out:
-                                _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out)
+                                _text_tool_calls, _cleaned_content = _extract_text_tool_calls_for_passthrough(content_out, passthrough_tools)
                                 if _text_tool_calls:
                                     logger.warning(
                                         "[hermes-code][req=%s] recovered %d text-formatted tool_call(s) from corrective retry content for %s",
@@ -9167,7 +9235,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     finish_reason = "tool_calls"
                                 else:
                                     finish_reason = response_obj.stop_reason or "stop"
-                            tool_calls = _enrich_client_tool_calls(tool_calls)
+                            tool_calls = _enrich_client_tool_calls(tool_calls, passthrough_tools)
                             usage_obj = getattr(response_obj, 'usage', None)
                             reasoning_content = None
 
@@ -9236,7 +9304,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                             "arguments": str(getattr(_func, "arguments", getattr(tc, "arguments", "{}"))),
                                         },
                                     })
-                            tool_calls = _enrich_client_tool_calls(tool_calls)
+                            tool_calls = _enrich_client_tool_calls(tool_calls, passthrough_tools)
                             usage_obj = getattr(response_obj, "usage", None)
                             finish_reason = getattr(response_obj.choices[0], "finish_reason", "stop")
                             if tool_calls:
@@ -9863,7 +9931,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _tc_dict["id"] = _packed_id
                                 _tc_dict["call_id"] = _packed_id
                         tool_calls_out.append(_tc_dict)
-                    tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                    tool_calls_out = _enrich_client_tool_calls(tool_calls_out, passthrough_tools)
 
                     _bad_bash_summary_ns = _invalid_bash_tool_call_summary(tool_calls_out)
                     if passthrough_tools and _bad_bash_summary_ns and locals().get("_msgs_to_send") is not None:
@@ -9909,7 +9977,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     },
                                 }
                             tool_calls_out.append(_tc_dict)
-                        tool_calls_out = _enrich_client_tool_calls(tool_calls_out)
+                        tool_calls_out = _enrich_client_tool_calls(tool_calls_out, passthrough_tools)
                         if _mapper_ns is not None and tool_calls_out:
                             tool_calls_out = _mapper_ns.unsanitize_tool_calls(tool_calls_out)
 
