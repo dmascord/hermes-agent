@@ -12,6 +12,7 @@ import json
 import hashlib
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -1128,6 +1129,50 @@ def _fixup_skill_params(name: str, args: dict) -> dict:
     return args
 
 
+def _extract_malformed_json_string_field(raw: Any, field: str) -> str | None:
+    """Extract a JSON string field when inner quotes made the object invalid."""
+    if not isinstance(raw, str) or not field:
+        return None
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"', raw, re.DOTALL)
+    if not match:
+        return None
+    start = match.end()
+    escaped = False
+    for idx in range(start, len(raw)):
+        ch = raw[idx]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch != '"':
+            continue
+        tail = raw[idx + 1 :].lstrip()
+        if tail.startswith("}") or re.match(r',\s*"[^"]+"\s*:', tail, re.DOTALL):
+            return raw[start:idx].replace('\\"', '"')
+    return None
+
+
+def _recover_bash_command_arg(args: dict, tool_name: str) -> dict:
+    normalised_name = tool_name
+    if normalised_name.startswith("mcp__hermes-tools__"):
+        normalised_name = normalised_name[len("mcp__hermes-tools__"):]
+    elif normalised_name.startswith("mcp_"):
+        normalised_name = normalised_name[4:]
+    if normalised_name not in {"bash", "terminal"} or not isinstance(args, dict):
+        return args
+    if isinstance(args.get("command"), str) and args["command"].strip():
+        return args
+    raw = args.get("raw")
+    extracted = _extract_malformed_json_string_field(raw, "command")
+    if extracted and extracted.strip():
+        recovered = dict(args)
+        recovered["command"] = extracted
+        return recovered
+    return args
+
+
 def _coerce_args_to_schema(args: dict, tool_name: str, tools: list[dict]) -> dict:
     """Coerce argument values to match the tool JSON schema when possible.
 
@@ -1137,6 +1182,7 @@ def _coerce_args_to_schema(args: dict, tool_name: str, tools: list[dict]) -> dic
     """
     if not isinstance(args, dict) or not tools:
         return args
+    args = _recover_bash_command_arg(args, tool_name)
     schema = None
     for t in tools:
         if not isinstance(t, dict):

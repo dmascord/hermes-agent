@@ -2342,9 +2342,43 @@ def _normalize_external_tool_name(name: Any) -> str:
     return raw
 
 
+def _extract_malformed_json_string_field(raw: Any, field: str) -> Optional[str]:
+    """Extract a JSON string field when inner quotes made the object invalid.
+
+    Some tool-capable models emit bash arguments like:
+    {"command":"curl -H "Authorization: Bearer $TOKEN" ...","i":"..."}
+
+    The shell command is usable, but the JSON wrapper is not.  Only recover
+    when the closing quote is followed by a clear JSON field/object boundary.
+    """
+    if not isinstance(raw, str) or not field:
+        return None
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"', raw, re.DOTALL)
+    if not match:
+        return None
+    start = match.end()
+    escaped = False
+    for idx in range(start, len(raw)):
+        ch = raw[idx]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch != '"':
+            continue
+        tail = raw[idx + 1 :].lstrip()
+        if tail.startswith("}") or re.match(r',\s*"[^"]+"\s*:', tail, re.DOTALL):
+            value = raw[start:idx]
+            return value.replace('\\"', '"')
+    return None
+
+
 def _external_tool_call_arguments(name: Any, args: Any) -> Dict[str, Any]:
     """Return schema-safe arguments for a client-executed tool call."""
     tool_name = _normalize_external_tool_name(name)
+    malformed_raw_args: Optional[str] = None
     if isinstance(args, dict):
         parsed = dict(args)
     elif isinstance(args, str) and args.strip():
@@ -2352,12 +2386,26 @@ def _external_tool_call_arguments(name: Any, args: Any) -> Dict[str, Any]:
             loaded = json.loads(args)
             parsed = dict(loaded) if isinstance(loaded, dict) else {}
         except Exception:
+            malformed_raw_args = args
             parsed = {}
     else:
         parsed = {}
 
     if tool_name == "bash":
         cmd = parsed.get("command")
+        raw_value = parsed.get("raw")
+        if not isinstance(cmd, str) and isinstance(raw_value, str):
+            extracted = _extract_malformed_json_string_field(raw_value, "command")
+            if extracted and extracted.strip():
+                cmd = extracted
+        if not isinstance(cmd, str):
+            extracted = _extract_malformed_json_string_field(malformed_raw_args, "command")
+            if extracted and extracted.strip():
+                cmd = extracted
+        if not isinstance(cmd, str) and isinstance(malformed_raw_args, str):
+            raw = malformed_raw_args.strip()
+            if raw and not raw.startswith(("{", "[")):
+                cmd = raw
         if not isinstance(cmd, str):
             for key in ("cmd", "shell", "script", "bash", "input", "text"):
                 value = parsed.get(key)
@@ -7459,6 +7507,22 @@ class APIServerAdapter(BasePlatformAdapter):
                                     len(content_out) if content_out else 0,
                                     len(reasoning_content_out) if reasoning_content_out else 0,
                                 )
+                                try:
+                                    from agent.model_cooldown_db import mark_model_cooldown
+                                    mark_model_cooldown(
+                                        provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
+                                        model=provider_model,
+                                        cooldown_seconds=120.0,
+                                        reason="text_only_with_tools",
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    from agent.model_quality_db import record_text_only
+                                    record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
+                                except Exception:
+                                    pass
+                                raise _CodexPassthroughSkip()
                             try:
                                 from agent.model_cooldown_db import mark_provider_success
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
@@ -8722,7 +8786,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             if not _is_claude_code and not _is_mimocode and not tool_calls_out:
                                 logger.warning(
                                     "[hermes-code] %s returned text-only (no tool calls) despite tools being provided, "
-                                    "returning text and marking as bad tool-caller",
+                                    "raising _CodexPassthroughSkip to try next provider",
                                     provider_model,
                                 )
                                 # Diagnostic: show what was actually returned
@@ -8753,7 +8817,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
                                 except Exception:
                                     pass
-                                # Return text to client, let quality DB track text-only rate
+                                raise _CodexPassthroughSkip()
                             elif _is_claude_code:
                                 logger.info(
                                     "[hermes-code] claude-code-cli: text-only response accepted (CLI executes tools internally)",
