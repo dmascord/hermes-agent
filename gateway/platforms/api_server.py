@@ -2236,7 +2236,7 @@ def _call_codex_passthrough(
     tool_calls_out: List[Any] = []
     for i, call_id in enumerate(tc_order):
         tc = tc_map[call_id]
-        name = tc["name"]
+        name = _normalize_external_tool_name(tc["name"])
         arguments = tc["arguments"] or "{}"
         if not call_id:
             call_id = _deterministic_call_id(name, arguments, i)
@@ -3728,7 +3728,7 @@ def _swarm_model_has_credentials(model: str) -> bool:
         return False
     if prefix == "ollama-mac":
         # Local LAN endpoint — always reachable if OLLAMA_MAC_BASE_URL is configured
-        # Default base URL points to 10.0.0.138:11435; no API key required
+        # Default base URL points to 10.0.0.139:11434; no API key required
         return True
     if prefix == "openai":
         # Check env vars first, then fall back to Hermes auth store for Codex OAuth tokens
@@ -4114,7 +4114,7 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
             runtime_kwargs["api_key"] = os.getenv("OLLAMA_LOCAL_API_KEY", os.getenv("OLLAMA_API_KEY", ""))
             runtime_kwargs["provider"] = "ollama-cloud"
         elif provider_prefix == "ollama-mac":
-            runtime_kwargs["base_url"] = os.getenv("OLLAMA_MAC_BASE_URL", "http://10.0.0.138:11435/v1")
+            runtime_kwargs["base_url"] = os.getenv("OLLAMA_MAC_BASE_URL", "http://10.0.0.139:11434/v1")
             runtime_kwargs["api_key"] = os.getenv("OLLAMA_MAC_API_KEY", "")
             runtime_kwargs["provider"] = "ollama-mac"
         elif provider_prefix not in ("openrouter",):
@@ -12106,9 +12106,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if role == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     func = tc.get("function", {})
+                    # Normalise MCP-prefixed tool names (mcp__hermes-tools__read → read)
+                    # so clients never see internal provider naming conventions.
+                    _raw_name = func.get("name", "")
+                    _norm_name = _normalize_external_tool_name(_raw_name)
                     items.append({
                         "type": "function_call",
-                        "name": func.get("name", ""),
+                        "name": _norm_name,
                         "arguments": func.get("arguments", ""),
                         "call_id": tc.get("id", ""),
                     })
@@ -12231,7 +12235,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result = {
                         "final_response": result_obj.choices[0].message.content or "",
                         "tool_calls": [
-                            {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+                            {"name": _normalize_external_tool_name(tc["function"]["name"]), "arguments": tc["function"]["arguments"]}
                             for tc in (result_obj.choices[0].message.tool_calls or [])
                         ],
                         "messages": [],
