@@ -42,6 +42,7 @@ _DEFAULT_COOLDOWN_SECONDS = 600.0
 _DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 3
 _DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 300.0
 _DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS = 300.0
+_DEFAULT_MAX_COOLDOWN_SECONDS = 3600.0  # 1 hour — universal cap for all cooldowns
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -261,6 +262,17 @@ def circuit_breaker_window_seconds() -> float:
     return _env_float("HERMES_CIRCUIT_BREAKER_WINDOW_SECONDS", _DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS)
 
 
+def max_cooldown_seconds() -> float:
+    """Universal cap for all cooldown durations (env: HERMES_MAX_COOLDOWN_SECONDS).
+
+    Prevents runaway cooldowns from 429 quota parsing (e.g. 23h+ from UTC
+    reset-time or weekly/daily quota hints) from blocking the entire
+    passthrough fallback chain.  Auth-failure cooldowns (token_invalidated)
+    are exempt — they need manual re-auth regardless of duration.
+    """
+    return _env_float("HERMES_MAX_COOLDOWN_SECONDS", _DEFAULT_MAX_COOLDOWN_SECONDS)
+
+
 def _normalize(value: str) -> str:
     return str(value or "").strip().rstrip("/").lower()
 
@@ -338,6 +350,18 @@ def mark_model_cooldown(
     cooldown = slow_cooldown_seconds() if cooldown_seconds is None else max(0.0, float(cooldown_seconds))
     if cooldown <= 0:
         return 0.0
+    # ── Universal cooldown cap ──────────────────────────────────────────────
+    # Prevent runaway cooldowns (e.g. 23h+ from 429 quota parsing) from
+    # blocking the entire passthrough fallback chain.  Auth-failure
+    # cooldowns (token_invalidated) are exempt — they need manual re-auth.
+    _max = max_cooldown_seconds()
+    _reason_lower = str(reason or "").lower()
+    if _max > 0 and cooldown > _max and "token_invalidated" not in _reason_lower:
+        logger.info(
+            "Cooldown capped: provider=%s model=%s reason=%s original=%.0fs → capped=%.0fs",
+            provider_n, model_n, reason, cooldown, _max,
+        )
+        cooldown = _max
     now = time.time()
     rec_key = _key(provider_n, model_n, base_url, credential_id)
 

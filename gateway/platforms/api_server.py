@@ -7155,6 +7155,13 @@ class APIServerAdapter(BasePlatformAdapter):
             _pt_call_count = [0]  # mutable counter: incremented per provider attempt
 
             logger.debug("[%d] streaming passthrough start: %d models", _req_id, len(_passthrough_models))
+            # ── Max provider attempts cap ──────────────────────────────────────
+            # Prevent runaway cascade where many providers return text-only
+            # (no tool calls) and the loop tries every model in the chain.
+            # Each provider attempt (API call) counts toward the limit.
+            _max_provider_attempts = int(os.getenv("HERMES_CODE_MAX_PROVIDER_ATTEMPTS", "6") or "6")
+            _provider_attempt_count = [0]  # mutable: incremented per actual attempt
+
             # Streaming passthrough: collect full response then stream as SSE
             if stream:
                 for provider_model in _passthrough_models:
@@ -7215,6 +7222,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             provider_model,
                         )
                         continue
+
+                    # ── Max provider attempts cap (streaming) ──
+                    _provider_attempt_count[0] += 1
+                    if _max_provider_attempts > 0 and _provider_attempt_count[0] > _max_provider_attempts:
+                        logger.warning(
+                            "[hermes-code][req=%s] max provider attempts (%d) reached after %s, "
+                            "stopping cascade to avoid amplification",
+                            _req_id, _max_provider_attempts, provider_model,
+                        )
+                        break
 
                     # Google Gemini 3.1+ requires thought_signature on every
                     # functionCall part.  When the opencode/OMP client replays
@@ -9193,6 +9210,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             continue
                     except Exception:
                         pass
+
+                # ── Max provider attempts cap (non-streaming) ──
+                _provider_attempt_count[0] += 1
+                if _max_provider_attempts > 0 and _provider_attempt_count[0] > _max_provider_attempts:
+                    logger.warning(
+                        "[hermes-code][req=%s] NS max provider attempts (%d) reached after %s, "
+                        "stopping cascade",
+                        _req_id, _max_provider_attempts, provider_model,
+                    )
+                    break
 
                 # Google Gemini 3.1+ requires thought_signature on every
                 # functionCall part.  The actual injection of a sentinel
