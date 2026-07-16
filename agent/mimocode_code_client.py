@@ -29,6 +29,15 @@ _logger = logging.getLogger(__name__)
 MIMOCODE_BASE_URL = "mimocode://codex"
 DEFAULT_TIMEOUT_SECONDS = 300.0
 
+# Limit mimocode-cli to 1 concurrent instance.  mimocode-cli spawns a full
+# coding-agent process tree (node/mimo + tool watchers) that is very
+# resource-heavy — running multiple instances concurrently caused OOMKills
+# and provider cascade amplification.  Requests beyond the limit block here
+# rather than spawning a fresh process, which is cheaper than crashing and
+# restarting the entire gateway.
+_MIMOCODE_SEMAPHORE = threading.Semaphore(1)
+_MIMOCODE_SEMAPHORE_TIMEOUT = 120.0  # seconds to wait before giving up
+
 MODEL_MAP = {
     "mimocode-cli": "mimo/mimo-auto",
     "mimo-auto": "mimo/mimo-auto",
@@ -379,6 +388,19 @@ class MiMoCodeClient:
         env = _build_subprocess_env()
         _logger.info("[mimocode-cli] running: %s cwd=%s prompt_via_stdin=%s", " ".join(cmd[:8]), cwd, bool(prompt_bytes))
 
+        if not _MIMOCODE_SEMAPHORE.acquire(timeout=_MIMOCODE_SEMAPHORE_TIMEOUT):
+            _logger.warning("[mimocode-cli] semaphore timeout — %ss limit reached, refusing new instance", _MIMOCODE_SEMAPHORE_TIMEOUT)
+            if cwd:
+                try:
+                    import shutil
+                    shutil.rmtree(cwd, ignore_errors=True)
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"mimocode-cli concurrency limit reached (max 1, timeout {_MIMOCODE_SEMAPHORE_TIMEOUT}s). "
+                "Try again shortly or increase HERMES_MIMOCODE_SEMAPHORE_TIMEOUT."
+            )
+
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE if prompt_bytes else subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env, text=False,
@@ -569,8 +591,16 @@ class MiMoCodeClient:
                         }
         finally:
             _kill_event.set()
-            proc.kill()
-            proc.wait()
+            # Graceful shutdown: SIGTERM first, then SIGKILL if it lingers.
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _logger.warning("[mimocode-cli] process did not exit after SIGTERM, sending SIGKILL")
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass
             stderr_thread.join(timeout=5)
             if stderr_lines:
                 _logger.warning("[mimocode-cli] stderr: %s", "".join(stderr_lines)[:500])
@@ -580,6 +610,7 @@ class MiMoCodeClient:
                     shutil.rmtree(cwd, ignore_errors=True)
                 except Exception:
                     pass
+            _MIMOCODE_SEMAPHORE.release()
 
         content_text = "\n".join(text_parts) if text_parts else ""
         # Strip the <tool_call>...</tool_call> XML out of content_text if we
@@ -659,6 +690,17 @@ class MiMoCodeClient:
 
         env = _build_subprocess_env()
         _logger.info("[mimocode-cli] stream_events: %s cwd=%s prompt_via_stdin=%s", " ".join(cmd[:8]), cwd, bool(prompt_bytes))
+
+        if not _MIMOCODE_SEMAPHORE.acquire(timeout=_MIMOCODE_SEMAPHORE_TIMEOUT):
+            _logger.warning("[mimocode-cli] stream_events semaphore timeout — %ss limit reached, refusing new instance", _MIMOCODE_SEMAPHORE_TIMEOUT)
+            if cwd:
+                try:
+                    import shutil
+                    shutil.rmtree(cwd, ignore_errors=True)
+                except Exception:
+                    pass
+            yield {"type": "error", "message": f"mimocode-cli concurrency limit reached (max 1, timeout {_MIMOCODE_SEMAPHORE_TIMEOUT}s)"}
+            return
 
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE if prompt_bytes else subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -828,8 +870,16 @@ class MiMoCodeClient:
             yield {"type": "error", "message": str(exc)}
         finally:
             _kill_event.set()
-            proc.kill()
-            proc.wait(timeout=5)
+            # Graceful shutdown: SIGTERM first, then SIGKILL if it lingers.
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _logger.warning("[mimocode-cli] stream_events process did not exit after SIGTERM, sending SIGKILL")
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass
             stderr_thread.join(timeout=2)
             # Clean up MCP workspace
             if cwd:
@@ -838,6 +888,7 @@ class MiMoCodeClient:
                     shutil.rmtree(cwd, ignore_errors=True)
                 except Exception:
                     pass
+            _MIMOCODE_SEMAPHORE.release()
 
 
 # Module-level helpers, moved here so they don't break the class body.
