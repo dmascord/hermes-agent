@@ -32,11 +32,11 @@ DEFAULT_TIMEOUT_SECONDS = 300.0
 # Limit mimocode-cli to 1 concurrent instance.  mimocode-cli spawns a full
 # coding-agent process tree (node/mimo + tool watchers) that is very
 # resource-heavy — running multiple instances concurrently caused OOMKills
-# and provider cascade amplification.  Requests beyond the limit block here
-# rather than spawning a fresh process, which is cheaper than crashing and
-# restarting the entire gateway.
+# and provider cascade amplification.  Requests beyond the limit skip
+# immediately (non-blocking) rather than waiting — the caller's fallback
+# chain handles the next provider.
 _MIMOCODE_SEMAPHORE = threading.Semaphore(1)
-_MIMOCODE_SEMAPHORE_TIMEOUT = 120.0  # seconds to wait before giving up
+_MIMOCODE_SEMAPHORE_TIMEOUT = 0.0  # non-blocking: skip immediately if busy
 
 MODEL_MAP = {
     "mimocode-cli": "mimo/mimo-auto",
@@ -389,7 +389,7 @@ class MiMoCodeClient:
         _logger.info("[mimocode-cli] running: %s cwd=%s prompt_via_stdin=%s", " ".join(cmd[:8]), cwd, bool(prompt_bytes))
 
         if not _MIMOCODE_SEMAPHORE.acquire(timeout=_MIMOCODE_SEMAPHORE_TIMEOUT):
-            _logger.warning("[mimocode-cli] semaphore timeout — %ss limit reached, refusing new instance", _MIMOCODE_SEMAPHORE_TIMEOUT)
+            _logger.info("[mimocode-cli] busy (another instance running), skipping")
             if cwd:
                 try:
                     import shutil
@@ -397,8 +397,7 @@ class MiMoCodeClient:
                 except Exception:
                     pass
             raise RuntimeError(
-                f"mimocode-cli concurrency limit reached (max 1, timeout {_MIMOCODE_SEMAPHORE_TIMEOUT}s). "
-                "Try again shortly or increase HERMES_MIMOCODE_SEMAPHORE_TIMEOUT."
+                "mimocode-cli is busy (another instance running)"
             )
 
         proc = subprocess.Popen(
@@ -692,14 +691,14 @@ class MiMoCodeClient:
         _logger.info("[mimocode-cli] stream_events: %s cwd=%s prompt_via_stdin=%s", " ".join(cmd[:8]), cwd, bool(prompt_bytes))
 
         if not _MIMOCODE_SEMAPHORE.acquire(timeout=_MIMOCODE_SEMAPHORE_TIMEOUT):
-            _logger.warning("[mimocode-cli] stream_events semaphore timeout — %ss limit reached, refusing new instance", _MIMOCODE_SEMAPHORE_TIMEOUT)
+            _logger.info("[mimocode-cli] stream_events: busy (another instance running), skipping")
             if cwd:
                 try:
                     import shutil
                     shutil.rmtree(cwd, ignore_errors=True)
                 except Exception:
                     pass
-            yield {"type": "error", "message": f"mimocode-cli concurrency limit reached (max 1, timeout {_MIMOCODE_SEMAPHORE_TIMEOUT}s)"}
+            yield {"type": "error", "message": "mimocode-cli is busy (another instance running)"}
             return
 
         proc = subprocess.Popen(

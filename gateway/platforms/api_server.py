@@ -7511,13 +7511,18 @@ class APIServerAdapter(BasePlatformAdapter):
                                     pass
                                 raise _CodexPassthroughSkip()
                             if passthrough_tools and not tool_calls_out:
-                                # Write full content to file for analysis
+                                # Text-only response: return it to the client as-is.
+                                # Previously this cascaded to the next provider via
+                                # _CodexPassthroughSkip, but that burned through the
+                                # entire fallback chain (4-150s each) only to return
+                                # an error.  OMP/clients handle text-only responses
+                                # fine — they can decide whether to re-prompt.
                                 try:
                                     import pathlib
                                     _diag_file = pathlib.Path("/tmp/text_only_diag.log")
                                     _diag_file.parent.mkdir(parents=True, exist_ok=True)
                                     with open(_diag_file, "a") as _f:
-                                        _f.write(f"--- {provider_model} ---\n")
+                                        _f.write(f"--- {provider_model} (returned as-is) ---\n")
                                         _f.write(f"tools_sent: {len(passthrough_tools)}\n")
                                         _f.write(f"tool_names: {[t.get('function',{}).get('name','?') for t in passthrough_tools[:10]]}\n")
                                         _f.write(f"content: {(content_out or '(empty)')[:1000]}\n")
@@ -7528,27 +7533,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                 except Exception:
                                     pass
                                 logger.warning(
-                                    "[hermes-code] DIAGNOSTIC %s text-only: tools=%d tool_calls=0 content_len=%d rc_len=%d",
+                                    "[hermes-code] %s text-only (tools=%d, content_len=%d) — returning to client as-is",
                                     provider_model, len(passthrough_tools),
                                     len(content_out) if content_out else 0,
-                                    len(reasoning_content_out) if reasoning_content_out else 0,
                                 )
-                                try:
-                                    from agent.model_cooldown_db import mark_model_cooldown
-                                    mark_model_cooldown(
-                                        provider=provider_model.split("/")[0] if "/" in provider_model else "copilot",
-                                        model=provider_model,
-                                        cooldown_seconds=120.0,
-                                        reason="text_only_with_tools",
-                                    )
-                                except Exception:
-                                    pass
                                 try:
                                     from agent.model_quality_db import record_text_only
                                     record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
                                 except Exception:
                                     pass
-                                raise _CodexPassthroughSkip()
                             try:
                                 from agent.model_cooldown_db import mark_provider_success
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
@@ -9003,7 +8996,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     except _CodexPassthroughSkip as _skip_exc:
                         logger.warning(
-                            "[hermes-code] %s skipped via _CodexPassthroughSkip (text-only response with tools), "
+                            "[hermes-code] %s skipped via _CodexPassthroughSkip, "
                             "trying next provider",
                             provider_model,
                         )
@@ -10102,42 +10095,20 @@ class APIServerAdapter(BasePlatformAdapter):
                                 provider_model,
                             )
                         elif not tool_calls_out:
+                            # Text-only response: return it to the client as-is.
+                            # Previously this cascaded to the next provider, but
+                            # that burned through the entire fallback chain only
+                            # to return an error.  Clients handle text-only fine.
                             logger.warning(
-                                "[hermes-code] %s returned text-only (no tool calls) despite tools being provided, "
-                                "raising _CodexPassthroughSkip to try next provider",
-                                provider_model,
-                            )
-                            # Diagnostic: show what was actually returned
-                            _rc_ns = reasoning_content[:300] if reasoning_content else ""
-                            logger.warning(
-                                "[hermes-code] DIAGNOSTIC %s (non-streaming) text-only: tools=%d tool_calls=0 content_len=%d rc_len=%d content=%.200s rc=%.100s",
+                                "[hermes-code] %s text-only (tools=%d, content_len=%d) — returning to client as-is",
                                 provider_model, len(passthrough_tools),
                                 len(content) if content else 0,
-                                len(reasoning_content) if reasoning_content else 0,
-                                content[:200] if content else "(empty)",
-                                _rc_ns[:100],
                             )
-                            # Short cooldown for text-only — model isn't broken
-                            # (it returned valid text), but for THIS request we
-                            # needed a tool call. Skip it for ~2 min.
-                            # (it returned valid text), but for THIS request we
-                            # needed a tool call. Skip it for ~2 min.
-                            try:
-                                from agent.model_cooldown_db import mark_model_cooldown
-                                mark_model_cooldown(
-                                    provider=provider_model.split("/")[0] if "/" in provider_model else "openai",
-                                    model=provider_model,
-                                    cooldown_seconds=120.0,
-                                    reason="text_only_with_tools",
-                                )
-                            except Exception:
-                                pass
                             try:
                                 from agent.model_quality_db import record_text_only
                                 record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
                             except Exception:
                                 pass
-                            raise _CodexPassthroughSkip()
                         else:
                             logger.warning(
                                 "[hermes-code] %s returned bash with empty command despite tools being provided, "
@@ -10231,7 +10202,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 except _CodexPassthroughSkip as _skip_exc:
                     logger.warning(
-                        "[hermes-code] %s skipped via _CodexPassthroughSkip (text-only response with tools), "
+                        "[hermes-code] %s skipped via _CodexPassthroughSkip, "
                         "trying next provider",
                         provider_model,
                     )
