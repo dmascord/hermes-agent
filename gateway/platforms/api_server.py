@@ -6450,9 +6450,12 @@ class APIServerAdapter(BasePlatformAdapter):
         _provider_mode = False
         if model_name == "hermes-agentic-full":
             _toolset_mode = "full"
-        elif model_name in ("hermes-code", "claude-code-cli", "mimocode-cli") or "/" in model_name:
+        elif model_name in ("hermes-code", "claude-code-cli", "mimocode-cli") or (
+            "/" in model_name and not role_cfg
+        ):
             # Activate passthrough for hermes-code, claude-code-cli, mimocode-cli,
-            # OR any model with / (provider/model format).
+            # OR any model with / (provider/model format) — but NOT swarm role
+            # aliases like hermes-gateway/hermes-reflect which have their own path.
             _provider_mode = True
         external_tool_mode = "none"
         if isinstance(tools, list) and tools:
@@ -11540,7 +11543,9 @@ class APIServerAdapter(BasePlatformAdapter):
             _toolset_mode = "full"
         elif model_name == "hermes-agentic-remote":
             _toolset_mode = "remote"
-        elif model_name in ("hermes-code", "claude-code-cli", "mimocode-cli") or "/" in model_name:
+        elif model_name in ("hermes-code", "claude-code-cli", "mimocode-cli") or (
+            "/" in model_name and not role_cfg
+        ):
             _provider_mode = True
 
         external_tool_mode = "none"
