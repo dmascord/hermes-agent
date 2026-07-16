@@ -7495,9 +7495,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                             if passthrough_tools and _has_empty_bash_tool_call(tool_calls_out):
                                 logger.warning(
-                                    "[hermes-code] %s returned bash with missing/empty/malformed command; "
-                                    "raising _CodexPassthroughSkip to try next provider",
-                                    provider_model,
+                                    "[hermes-code] %s returned bash with empty command — clearing tool_calls, returning text as-is (tools=%d, content_len=%d)",
+                                    provider_model, len(passthrough_tools),
+                                    len(content_out) if content_out else 0,
                                 )
                                 try:
                                     from agent.model_cooldown_db import mark_model_cooldown
@@ -7509,7 +7509,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                     )
                                 except Exception:
                                     pass
-                                raise _CodexPassthroughSkip()
+                                try:
+                                    from agent.model_quality_db import record_text_only
+                                    record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
+                                except Exception:
+                                    pass
+                                tool_calls_out = []
                             if passthrough_tools and not tool_calls_out:
                                 # Text-only response: return it to the client as-is.
                                 # Previously this cascaded to the next provider via
@@ -8802,31 +8807,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         # skip past it on the current request and avoid the worst
                         # case where 30+ models each return text-only in sequence.
                         if passthrough_tools and (not tool_calls_out or _has_empty_bash_tool_call(tool_calls_out)):
-                            # claude-code-cli is an agent, not a model API.
+                            # claude-code-cli and mimocode-cli are agents, not model APIs.
                             # The CLI itself executes tools (Bash, Read, etc.) and returns
                             # the final answer as text.  Don't penalise it for text-only —
                             # the "tool calls" happened inside the subprocess.
                             _is_claude_code = provider_model.startswith("claude-code-cli")
                             _is_mimocode = provider_model.startswith("mimocode-cli")
                             if not _is_claude_code and not _is_mimocode and not tool_calls_out:
+                                # Text-only: return as-is to client (streaming SSE path).
+                                # Previously cascaded via _CodexPassthroughSkip but that
+                                # burned through the entire fallback chain only to return
+                                # an error.  OMP/clients handle text-only fine.
                                 logger.warning(
-                                    "[hermes-code] %s returned text-only (no tool calls) despite tools being provided, "
-                                    "raising _CodexPassthroughSkip to try next provider",
-                                    provider_model,
-                                )
-                                # Diagnostic: show what was actually returned
-                                _rc_snippet = reasoning_content_out[:300] if reasoning_content_out else ""
-                                logger.warning(
-                                    "[hermes-code] DIAGNOSTIC %s text-only: tools=%d tool_calls=0 content_len=%d rc_len=%d content=%.200s rc=%.100s",
+                                    "[hermes-code] %s text-only (tools=%d, content_len=%d) — returning to client as-is",
                                     provider_model, len(passthrough_tools),
                                     len(content_out) if content_out else 0,
-                                    len(reasoning_content_out) if reasoning_content_out else 0,
-                                    content_out[:200] if content_out else "(empty)",
-                                    _rc_snippet[:100],
                                 )
-                                # Short cooldown for text-only — model isn't broken
-                                # (it returned valid text), but for THIS request we
-                                # needed a tool call. Skip it for ~2 min.
                                 try:
                                     from agent.model_cooldown_db import mark_model_cooldown
                                     mark_model_cooldown(
@@ -8842,22 +8838,21 @@ class APIServerAdapter(BasePlatformAdapter):
                                     record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
                                 except Exception:
                                     pass
-                                raise _CodexPassthroughSkip()
                             elif _is_claude_code:
                                 logger.info(
                                     "[hermes-code] claude-code-cli: text-only response accepted (CLI executes tools internally)",
                                     provider_model,
                                 )
                             else:
+                                # Empty bash tool call: clear it and return text as-is.
+                                # Previously cascaded via _CodexPassthroughSkip which burned
+                                # through the entire fallback chain.  The model returned
+                                # content alongside the empty tool call — return the content.
                                 logger.warning(
-                                    "[hermes-code] %s returned bash with empty command despite tools being provided, "
-                                    "raising _CodexPassthroughSkip to try next provider",
-                                    provider_model,
+                                    "[hermes-code] %s returned bash with empty command — clearing tool_calls, returning text as-is (tools=%d, content_len=%d)",
+                                    provider_model, len(passthrough_tools),
+                                    len(content_out) if content_out else 0,
                                 )
-                                # Put the model on cooldown so it's not tried again
-                                # for the next 2 minutes, avoiding repeated empty bash
-                                # round trips. Short enough to retry after a few requests,
-                                # long enough to skip past it on the current one.
                                 try:
                                     from agent.model_cooldown_db import mark_model_cooldown
                                     mark_model_cooldown(
@@ -8868,7 +8863,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                     )
                                 except Exception:
                                     pass
-                                raise _CodexPassthroughSkip()
+                                try:
+                                    from agent.model_quality_db import record_text_only
+                                    record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
+                                except Exception:
+                                    pass
+                                tool_calls_out = []
 
                         # log tool_calls for debugging continuation issues
                         _raw_finish = getattr(response_obj.choices[0], "finish_reason", "stop")
@@ -10123,15 +10123,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass
                         else:
+                            # Empty bash tool call: clear it and return text as-is.
+                            # Previously cascaded via _CodexPassthroughSkip which burned
+                            # through the entire fallback chain and returned 503.
                             logger.warning(
-                                "[hermes-code] %s returned bash with empty command despite tools being provided, "
-                                "raising _CodexPassthroughSkip to try next provider",
-                                provider_model,
+                                "[hermes-code] %s returned bash with empty command — clearing tool_calls, returning text as-is (tools=%d, content_len=%d)",
+                                provider_model, len(passthrough_tools),
+                                len(content) if content else 0,
                             )
-                            # Put the model on cooldown so it's not tried again
-                            # for the next 2 minutes, avoiding repeated empty bash
-                            # round trips. Short enough to retry after a few requests,
-                            # long enough to skip past it on the current one.
                             try:
                                 from agent.model_cooldown_db import mark_model_cooldown
                                 mark_model_cooldown(
@@ -10142,7 +10141,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 )
                             except Exception:
                                 pass
-                            raise _CodexPassthroughSkip()
+                            try:
+                                from agent.model_quality_db import record_text_only
+                                record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
+                            except Exception:
+                                pass
+                            tool_calls_out = []
 
                     usage_obj = getattr(response_obj, "usage", None)
                     # Record GHE AIU spend and enforce monthly limit.
