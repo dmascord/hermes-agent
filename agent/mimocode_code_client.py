@@ -412,6 +412,27 @@ class MiMoCodeClient:
         stderr_thread.start()
 
         try:
+            # Hard-kill watchdog: readline() blocks indefinitely when mimo enters its
+            # polling-loop bug (GET /session/status every 750ms, zero stdout output).
+            # Without this, the deadline check in the while loop never fires and the
+            # subprocess lives forever, eventually OOM-killing the gateway.
+            deadline = time.monotonic() + timeout
+            _kill_event = threading.Event()
+            def _watchdog(d=deadline, e=_kill_event, p=proc, t=timeout):
+                remaining = d - time.monotonic()
+                if remaining > 0:
+                    e.wait(timeout=remaining)
+                if not e.is_set():
+                    _logger.warning(
+                        "[mimocode-cli] watchdog killing process after %.1fs", t,
+                    )
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+            watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+            watchdog_thread.start()
+
             if tools and self._queue_in_path and self._queue_out_dir:
                 # MCP mode: read stdout line-by-line with watcher thread for tool results
                 watcher_stop = threading.Event()
@@ -420,8 +441,7 @@ class MiMoCodeClient:
                 )
                 watcher_thread.start()
 
-                deadline = time.monotonic() + timeout
-                while time.monotonic() < deadline:
+                while True:
                     raw_line = proc.stdout.readline()
                     if not raw_line:
                         break
@@ -464,7 +484,8 @@ class MiMoCodeClient:
                 watcher_stop.set()
                 watcher_thread.join(timeout=2)
                 proc.wait(timeout=10)
-                if time.monotonic() >= deadline:
+                _e_set = _kill_event.is_set()
+                if _e_set or time.monotonic() >= deadline:
                     _logger.warning(
                         "[mimocode-cli] MCP mode timeout after %.1fs — process may be stuck in polling loop",
                         timeout,
@@ -475,26 +496,20 @@ class MiMoCodeClient:
                         "the API may be rate-limiting this IP"
                     )
             else:
-                # Simple mode: no tools — use deadline-based stdout reader
-                # with hard kill-timer. Replaces proc.communicate(timeout=timeout)
-                # which could hang for the full timeout if the mimo binary enters
-                # its polling-loop bug (GET /session/status every 750ms).
-                deadline = time.monotonic() + timeout
+                # Simple mode: no tools — deadline-based stdout reader with watchdog.
+                # Replaces proc.communicate(timeout=timeout) which hangs forever when
+                # the mimo binary enters its polling-loop bug.
                 _stdout_lines: list[str] = []
-                while time.monotonic() < deadline:
+                while True:
                     raw_line = proc.stdout.readline()
                     if not raw_line:
                         break
                     _stdout_lines.append(raw_line.decode("utf-8", errors="replace"))
-                else:
-                    # Deadline reached — force-kill the process
-                    _logger.warning(
-                        "[mimocode-cli] timeout after %.1fs — force-killing process",
-                        timeout,
-                    )
-                    proc.kill()
-                    proc.wait(timeout=10)
-                    # Drain any remaining stderr before raising
+
+                proc.wait(timeout=10)
+                _e_set = _kill_event.is_set()
+                if _e_set or time.monotonic() >= deadline:
+                    # Deadline reached — watchdog already killed the process
                     stderr_thread.join(timeout=2)
                     if stderr_lines:
                         _logger.warning(
@@ -553,6 +568,7 @@ class MiMoCodeClient:
                             "total_tokens": tokens.get("total", 0),
                         }
         finally:
+            _kill_event.set()
             proc.kill()
             proc.wait()
             stderr_thread.join(timeout=5)
@@ -699,8 +715,28 @@ class MiMoCodeClient:
             return None, buf
 
         try:
+            # Hard-kill watchdog: readline() blocks indefinitely when mimo enters its
+            # polling-loop bug (GET /session/status every 750ms, zero stdout output).
+            # Without this, the deadline check in the while loop never fires and the
+            # subprocess lives forever, eventually OOM-killing the gateway.
             deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
+            _kill_event = threading.Event()
+            def _watchdog(d=deadline, e=_kill_event, p=proc, t=timeout):
+                remaining = d - time.monotonic()
+                if remaining > 0:
+                    e.wait(timeout=remaining)
+                if not e.is_set():
+                    _logger.warning(
+                        "[mimocode-cli] stream_events watchdog killing process after %.1fs", t,
+                    )
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+            watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+            watchdog_thread.start()
+
+            while True:
                 raw_line = proc.stdout.readline()
                 if not raw_line:
                     break
@@ -765,14 +801,12 @@ class MiMoCodeClient:
                         for tc in data:
                             yield _tool_call_dict_to_event(tc, tools=tools)
 
-            # After events: check timeout
-            if time.monotonic() >= deadline:
+            # After events: check timeout (watchdog will have killed the process)
+            if _kill_event.is_set() or time.monotonic() >= deadline:
                 _logger.warning(
-                    "[mimocode-cli] stream_events timeout after %.1fs — force-killing process",
+                    "[mimocode-cli] stream_events timeout after %.1fs",
                     timeout,
                 )
-                proc.kill()
-                proc.wait(timeout=10)
                 stderr_thread.join(timeout=2)
                 if stderr_lines:
                     _logger.warning(
@@ -793,6 +827,7 @@ class MiMoCodeClient:
             _logger.error("[mimocode-cli] stream_events error: %s", exc)
             yield {"type": "error", "message": str(exc)}
         finally:
+            _kill_event.set()
             proc.kill()
             proc.wait(timeout=5)
             stderr_thread.join(timeout=2)
