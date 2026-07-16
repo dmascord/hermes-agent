@@ -950,6 +950,15 @@ ROLE_ALIAS_CONFIG = {
             "recommended_tier": "balanced",
         },
     },
+    "hermes-gateway/hermes-reflect": {
+        "mode": "swarm",
+        "hint": {
+            "role": "reflect",
+            "task_type": "synthesis",
+            "recommended_tier": "cheap",
+            "max_tokens": 4096,
+        },
+    },
 }
 
 
