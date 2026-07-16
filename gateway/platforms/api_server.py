@@ -2769,25 +2769,25 @@ def _build_hermes_code_audio_pool() -> List[str]:
 # selectable passthrough entries in /v1/models.  Ordered by quality tier.
 _GHE_COPILOT_PASSTHROUGH_MODELS: tuple[tuple[str, str], ...] = (
     # (bare_copilot_id, description_suffix)
+    # Claude models — in catalog but /v1/messages endpoint returns HTML404 (routing bug)
     ("claude-sonnet-4.6",         "Anthropic Claude Sonnet 4.6 via GHE Copilot — vision, 200k context"),
     ("claude-opus-4.6",           "Anthropic Claude Opus 4.6 via GHE Copilot — vision, 200k context"),
     ("claude-sonnet-4.5",         "Anthropic Claude Sonnet 4.5 via GHE Copilot — vision"),
-    ("claude-sonnet-4",           "Anthropic Claude Sonnet 4 via GHE Copilot — vision"),
     ("claude-haiku-4.5",          "Anthropic Claude Haiku 4.5 via GHE Copilot — fast, vision"),
+    # OpenAI models — confirmed working
     ("gpt-5.4",                   "OpenAI GPT-5.4 via GHE Copilot — vision, Responses API"),
     ("gpt-5.4-mini",              "OpenAI GPT-5.4-mini via GHE Copilot — vision, Responses API"),
     ("gpt-5.5",                   "OpenAI GPT-5.5 via GHE Copilot — vision, Responses API"),
     ("gpt-5-mini",                "OpenAI GPT-5-mini via GHE Copilot — Chat Completions API"),
     ("gpt-5.3-codex",             "OpenAI GPT-5.3-codex via GHE Copilot — agentic coding, Responses API"),
-    ("gpt-5.2-codex",             "OpenAI GPT-5.2-codex via GHE Copilot — agentic coding, Responses API"),
     ("gpt-4.1",                   "OpenAI GPT-4.1 via GHE Copilot"),
-    ("gpt-4o",                    "OpenAI GPT-4o via GHE Copilot — vision"),
     ("gpt-4o-mini",               "OpenAI GPT-4o-mini via GHE Copilot — fast"),
+    # Google models — confirmed working
     ("gemini-3.1-pro-preview",    "Google Gemini 3.1 Pro Preview via GHE Copilot — vision"),
-    ("gemini-3-pro-preview",      "Google Gemini 3 Pro Preview via GHE Copilot — vision"),
-    ("gemini-3-flash-preview",    "Google Gemini 3 Flash Preview via GHE Copilot — fast, vision"),
-    ("gemini-2.5-pro",            "Google Gemini 2.5 Pro via GHE Copilot — vision"),
-    ("grok-code-fast-1",          "xAI Grok Code Fast 1 via GHE Copilot — coding"),
+    # Removed: claude-sonnet-4 (not in catalog), gpt-4o (not in catalog),
+    # gpt-5.2-codex (not in catalog), gemini-3-pro-preview (not in catalog),
+    # gemini-3-flash-preview (not in catalog), gemini-2.5-pro (blocked by org policy),
+    # grok-code-fast-1 (not in catalog)
 )
 
 _GHE_PREFIX = "github-copilot-enterprise"
