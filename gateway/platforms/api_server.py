@@ -8402,6 +8402,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 # If the bridge reported an error and produced no real content, use the error
                                 # message as the response text so downstream exhaustion/error checks catch it.
                                 if _bridge_error_msg and not _bridge_final_text and not _bridge_tool_calls:
+                                    # If the CLI is busy (concurrency limit), cascade to the next
+                                    # provider instead of returning the error text to the client.
+                                    _busy_hint = _bridge_error_msg.lower()
+                                    if "busy" in _busy_hint or "another instance running" in _busy_hint:
+                                        logger.info("[hermes-code] mimocode-cli busy — cascading to next provider")
+                                        raise _CodexPassthroughSkip("mimocode_cli_busy")
                                     _bridge_final_text = _bridge_error_msg
                                 logger.info("[TIMING][req=%s][mimo-stream] T+%.3fs bridge loop exit — building SSE response text_len=%d tool_calls=%d",
                                     _req_id, time.monotonic() - _req_start, len(_bridge_final_text), len(_bridge_tool_calls))
@@ -9057,7 +9063,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         # routing/selection issues (resolved by the pre-filter above), not
                         # model or API failures that warrant circuit-breaking.
                         _is_ctx_overflow = _is_context_overflow_error(_exc_str)
-                        if not _is_ctx_overflow:
+                        _is_cli_busy = "busy" in _exc_str or "another instance running" in _exc_str
+                        if not _is_ctx_overflow and not _is_cli_busy:
                             try:
                                 from agent.model_cooldown_db import mark_provider_failure
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
@@ -9860,6 +9867,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             # If the bridge reported an error and produced no real content, use the error
                             # message as the response text so downstream exhaustion/error checks catch it.
                             if _bridge_error_msg_ns and not _bridge_final_text_ns and not _bridge_tool_calls_ns:
+                                # If the CLI is busy (concurrency limit), cascade to the next
+                                # provider instead of returning the error text to the client.
+                                _busy_hint_ns = _bridge_error_msg_ns.lower()
+                                if "busy" in _busy_hint_ns or "another instance running" in _busy_hint_ns:
+                                    logger.info("[hermes-code] mimocode-cli ns busy — cascading to next provider")
+                                    raise _CodexPassthroughSkip("mimocode_cli_busy")
                                 _bridge_final_text_ns = _bridge_error_msg_ns
                             _usage_ns_obj = SimpleNamespace(
                                 prompt_tokens=int(_bridge_usage_ns.get("input_tokens", 0) or 0),
@@ -10224,12 +10237,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
                     passthrough_error = exc
-                    try:
-                        from agent.model_cooldown_db import mark_provider_failure
-                        _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
-                        mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
-                    except Exception:
-                        pass
+                    # If the CLI is busy (concurrency limit), cascade without
+                    # penalising the provider — it's not a real failure.
+                    _exc_busy = "busy" in str(exc).lower() or "another instance running" in str(exc).lower()
+                    if not _exc_busy:
+                        try:
+                            from agent.model_cooldown_db import mark_provider_failure
+                            _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
+                            mark_provider_failure(_cb_prov, provider_model, base_url=base_url or "", reason="passthrough_error")
+                        except Exception:
+                            pass
                     try:
                         from agent.model_quality_db import record_failure
                         _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "openai"
