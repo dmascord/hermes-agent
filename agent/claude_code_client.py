@@ -837,6 +837,38 @@ def _parse_text_tool_call(text: str) -> dict | None:
 
     return None
 
+def _parse_mcp_text_tool_call(text):
+    """Detect ``mcp__hermes-tools__<name>: <content>`` in text output.
+
+    Claude Code sometimes falls back to emitting tool calls as plain text
+    instead of structured tool_use events. This catches that pattern
+    and converts it to a structured tool_call dict.
+    """
+    import re, uuid, json as _json
+    m = re.match(
+        r"^(?:mcp__hermes-tools__|mcp_)([A-Za-z0-9_-]+)\s*:\s*(.+)",
+        text.strip(),
+        re.DOTALL,
+    )
+    if not m:
+        return None
+    raw_name = m.group(1)
+    content = m.group(2).strip()
+    # For bash, wrap content as {"command": content}; for others use {"raw": content}
+    if raw_name == "bash":
+        args = {"command": content}
+    else:
+        args = {"raw": content}
+    return {
+        "id": "call_" + uuid.uuid4().hex[:16],
+        "type": "function",
+        "function": {
+            "name": raw_name,
+            "arguments": _json.dumps(args),
+        },
+    }
+
+
 class ClaudeCodeClient:
     """Minimal OpenAI-client-compatible facade for Claude Code CLI."""
 
@@ -1217,6 +1249,8 @@ class ClaudeCodeClient:
                             # the text for XML tool call patterns and yield as
                             # tool_call if found.
                             _parsed_tc = _parse_text_tool_call(text)
+                            if not _parsed_tc:
+                                _parsed_tc = _parse_mcp_text_tool_call(text)
                             if _parsed_tc:
                                 call_id = _parsed_tc.get("call_id", uuid.uuid4().hex)
                                 tool_name = _parsed_tc.get("name", "")
@@ -1252,6 +1286,22 @@ class ClaudeCodeClient:
                         yield event
                     result_text = str(obj.get("result") or "")
                     usage = obj.get("usage", {})
+                    _parsed_tc = _parse_text_tool_call(result_text)
+                    if not _parsed_tc:
+                        _parsed_tc = _parse_mcp_text_tool_call(result_text)
+                    if _parsed_tc:
+                        _fn = _parsed_tc.get("function") or {}
+                        try:
+                            _args = json.loads(_fn.get("arguments") or "{}")
+                        except Exception:
+                            _args = {}
+                        yield {
+                            "type": "tool_call",
+                            "call_id": _parsed_tc.get("id") or uuid.uuid4().hex,
+                            "name": str(_fn.get("name") or ""),
+                            "arguments": _args if isinstance(_args, dict) else {},
+                        }
+                        return
                     yield {
                         "type": "final",
                         "text": result_text,

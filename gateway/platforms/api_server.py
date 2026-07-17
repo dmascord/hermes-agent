@@ -2351,6 +2351,29 @@ def _normalize_external_tool_name(name: Any) -> str:
     return raw
 
 
+
+# Regex for detecting MCP-prefixed tool names leaked as text content.
+# Matches: "mcp__hermes-tools__bash: find /..." or "mcp_bash: find /..."
+_RE_MCP_TEXT_LEAK = re.compile(
+    r"^(?:mcp__hermes-tools__|mcp_)([A-Za-z0-9_-]+)\s*:\s*",
+)
+
+
+def _normalize_bridge_text(text: str) -> str:
+    """Strip MCP-prefixed tool names that leaked into bridge text content.
+
+    When Claude Code or mimocode-cli fall back to text output for a tool
+    call, the text may start with ``mcp__hermes-tools__<name>: <args>``.
+    This strips the prefix so clients never see internal provider naming.
+    """
+    m = _RE_MCP_TEXT_LEAK.match(text)
+    if m:
+        tool_name = _normalize_external_tool_name(m.group(1))
+        remainder = text[m.end():]
+        return f"{tool_name}: {remainder}"
+    return text
+
+
 def _extract_malformed_json_string_field(raw: Any, field: str) -> Optional[str]:
     """Extract a JSON string field when inner quotes made the object invalid.
 
@@ -7991,6 +8014,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     elif _bt in ("text", "assistant_text"):
                                         _text = _be.get("text", "")
                                         if _text:
+                                            _text = _normalize_bridge_text(_text)
                                             _bridge_final_text += _text
                                             _text_chunk = {
                                                 "id": _bridge_completion_id, "object": "chat.completion.chunk",
@@ -8004,7 +8028,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 _bridge_error_msg = "SSE write failed during text"
                                                 break
                                     elif _bt == "final":
-                                        _bridge_final_text = _be.get("text", _bridge_final_text)
+                                        _raw_final = _be.get("text", _bridge_final_text)
+                                        _bridge_final_text = _normalize_bridge_text(_raw_final)
                                         _bridge_usage = _be.get("usage", {})
                                         _bridge_model = _be.get("model", _bridge_model)
                                     elif _bt == "error":
@@ -9714,9 +9739,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                         except Exception as _re:
                                             logger.warning("[hermes-code] ns bridge: failed to write result: %s", _re)
                                 elif _bt in ("text", "assistant_text"):
-                                    _bridge_final_text_ns += _be.get("text", "")
+                                    _bridge_final_text_ns += _normalize_bridge_text(_be.get("text", ""))
                                 elif _bt == "final":
-                                    _bridge_final_text_ns = _be.get("text", _bridge_final_text_ns)
+                                    _bridge_final_text_ns = _normalize_bridge_text(_be.get("text", _bridge_final_text_ns))
                                     _bridge_usage_ns = _be.get("usage", {})
                                     _bridge_model_ns = _be.get("model", _bridge_model_ns)
                                 elif _bt == "error":
@@ -9859,9 +9884,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                         except Exception as _re:
                                             logger.warning("[hermes-code] ns mimocode bridge: failed to write result: %s", _re)
                                 elif _bt in ("text", "assistant_text"):
-                                    _bridge_final_text_ns += _be.get("text", "")
+                                    _bridge_final_text_ns += _normalize_bridge_text(_be.get("text", ""))
                                 elif _bt == "final":
-                                    _bridge_final_text_ns = _be.get("text", _bridge_final_text_ns)
+                                    _bridge_final_text_ns = _normalize_bridge_text(_be.get("text", _bridge_final_text_ns))
                                     _bridge_usage_ns = _be.get("usage", {})
                                     _bridge_model_ns = _be.get("model", _bridge_model_ns)
                                 elif _bt == "error":
