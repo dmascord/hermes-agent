@@ -6960,10 +6960,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 }
-                await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
-                await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
-                await response.write(b"data: [DONE]\n\n")
-                await response.write_eof()
+                try:
+                    await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
+                    await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+                    await response.write(b"data: [DONE]\n\n")
+                    await response.write_eof()
+                except Exception:
+                    # Client disconnected mid-stream; skip writing error to avoid ERROR traceback
+                    pass
                 return response
 
             # Build passthrough provider chain from HERMES_CODE_MODEL and HERMES_CODE_FALLBACK_*
