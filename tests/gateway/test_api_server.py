@@ -81,6 +81,16 @@ class TestPassthroughProviderExhaustion:
             "Failed to authenticate. API Error: 401 Invalid authentication credentials"
         ) is True
 
+    def test_oauth_session_expired_content_is_provider_exhaustion(self):
+        assert _is_provider_exhaustion_content(
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        ) is True
+
+    def test_oauth_session_expired_message_is_sanitized_for_client(self):
+        exc = RuntimeError("Failed to authenticate: OAuth session expired and could not be refreshed")
+
+        assert _sanitize_passthrough_error_for_client(exc) == "provider quota or session limit exhausted"
+
     def test_normal_rst_stream_content_is_not_provider_exhaustion(self):
         content = json.dumps({
             "facts": [{

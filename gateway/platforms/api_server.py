@@ -301,6 +301,8 @@ def _is_provider_exhaustion_content(content: Any) -> bool:
         "unauthorized. api error",
         "not logged in",
         "please run /login",
+        "oauth session expired",
+        "session expired and could not be refreshed",
     )
     if any(marker in lower for marker in auth_markers):
         return True
