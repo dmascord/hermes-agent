@@ -1017,7 +1017,7 @@ _SWARM_BALANCED_MODEL_HINTS = (
     "opencode-go/minimax-m2.7",
     "ollama/glm-5.1",
     "ollama-mac/shirdel-coder-9b-claude-fable-5:latest",  # local M4 Max, 9B Nemotron coder, Q6_K, ~23 tok/s, free
-    "mlx-mac/qwen2.5-coder-32b-instruct-mlx-4bit",  # local M4 Max, 32B coder via mlx_lm.server, ~10 tok/s, free
+    "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",  # local M4 Max, 30B-A3B MoE via mlx_lm.server, ~40 tok/s, free
     # Xiaomi balanced models: good all-rounders and multimodal omni
     "xiaomi/mimo-v2-omni",
     "xiaomi/mimo-v2.5",
@@ -6406,14 +6406,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "description": "Round-robin reranker pool (Cohere + Voyage AI). POST /v1/rerank — Cohere-compatible request/response format.",
             },
             {
-                "id": "mlx-mac/qwen2.5-coder-32b-instruct-mlx-4bit",
+                "id": "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",
                 "object": "model",
                 "created": now,
                 "owned_by": "hermes",
                 "permission": [],
-                "root": "mlx-mac/qwen2.5-coder-32b-instruct-mlx-4bit",
+                "root": "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",
                 "parent": None,
-                "description": "Qwen2.5-Coder-32B-Instruct (MLX-4bit) on local M4 Max via mlx_lm.server. ~10 tok/s, 32B params. LAN-only, free.",
+                "description": "Qwen3-Coder-30B-A3B-Instruct (MLX-4bit MoE) on local M4 Max via mlx_lm.server. ~40 tok/s, 30B total / 3.3B active. LAN-only, free.",
                 "context_length": 32768,
             },
             *[
