@@ -1016,8 +1016,8 @@ _SWARM_BALANCED_MODEL_HINTS = (
     "opencode-go/qwen3.6-plus",
     "opencode-go/minimax-m2.7",
     "ollama/glm-5.1",
-    "ollama-mac/qwopus3.6-35b-a3b:latest",  # local M4 Max, 58 tok/s, free
-    "ollama-mac/shirdel-coder-9b-claude-fable-5:latest",  # local M4 Max, 9B Nemotron coder, Q6_K, free
+    "ollama-mac/shirdel-coder-9b-claude-fable-5:latest",  # local M4 Max, 9B Nemotron coder, Q6_K, ~23 tok/s, free
+    "mlx-mac/qwen2.5-coder-32b-instruct-mlx-4bit",  # local M4 Max, 32B coder via mlx_lm.server, ~10 tok/s, free
     # Xiaomi balanced models: good all-rounders and multimodal omni
     "xiaomi/mimo-v2-omni",
     "xiaomi/mimo-v2.5",
@@ -1055,6 +1055,7 @@ _SUBSCRIPTION_PROVIDER_PREFIXES = frozenset({
     "xiaomi",
     "ollama",
     "ollama-mac",
+    "mlx-mac",
     "synthetic",
     "arliai",
 })
@@ -1069,6 +1070,7 @@ _PROVIDER_BILLING_MODE: Dict[str, str] = {
     "xiaomi": "subscription",
     "ollama": "subscription",
     "ollama-mac": "subscription",
+    "mlx-mac": "subscription",
     "synthetic": "subscription",
     "arliai": "subscription",
     "openai": "subscription",
@@ -1375,6 +1377,7 @@ _EXPLICIT_MODEL_PROVIDER_ALIASES = {
     "ollama": "ollama-cloud",
     "ollama-local": "ollama-local",
     "ollama-mac": "ollama-mac",
+    "mlx-mac": "mlx-mac",
 }
 
 
@@ -1513,6 +1516,32 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 MAX_HISTORY_MESSAGES = 200
 MAX_HISTORY_TEXT_LENGTH = 240_000
+
+
+def _passthrough_request_timeout(provider_id: str, model: str | None = None) -> float:
+    """Resolve hermes-code passthrough request timeout.
+
+    Keep passthrough aligned with the primary AIAgent timeout policy:
+    provider/model config wins, then an explicit passthrough env override,
+    then the legacy HERMES_API_TIMEOUT default.
+    """
+    try:
+        from hermes_cli.timeouts import get_provider_request_timeout
+        configured = get_provider_request_timeout(provider_id, model)
+        if configured is not None:
+            return configured
+    except Exception:
+        pass
+
+    raw = os.getenv("HERMES_CODE_PASSTHROUGH_TIMEOUT") or os.getenv("HERMES_API_TIMEOUT")
+    if raw:
+        try:
+            timeout = float(raw)
+            if timeout > 0:
+                return timeout
+        except (TypeError, ValueError):
+            pass
+    return 1800.0
 
 
 def _transform_messages_to_anthropic(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]] = None) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]] | None]:
@@ -2638,10 +2667,43 @@ def _build_swarm_model_pool(*, estimated_tokens: int = 0, routing_hint: Optional
     }
 
 
-_HERMES_CODE_MAX_FALLBACKS = 35
+_HERMES_CODE_DEFAULT_MAX_FALLBACKS = 64
 _HERMES_CODE_LARGE_CONTEXT_MIN = 512_000
 _HERMES_CODE_LARGE_CONTEXT_TRIGGER = 96_000
 _HERMES_CODE_ADVERTISED_CONTEXT_LIMIT = 256_000
+
+
+def _hermes_code_max_fallbacks() -> int:
+    try:
+        return max(1, int(os.getenv("HERMES_CODE_MAX_FALLBACKS", str(_HERMES_CODE_DEFAULT_MAX_FALLBACKS))))
+    except Exception:
+        return _HERMES_CODE_DEFAULT_MAX_FALLBACKS
+
+
+def _provider_prefix_from_model(model: str) -> str:
+    raw = str(model or "").strip().lower()
+    if not raw:
+        return ""
+    if "/" in raw:
+        return raw.split("/", 1)[0]
+    return raw
+
+
+def _passthrough_fallback_provider_excluded(model: str, *, privacy: bool = False) -> bool:
+    """Return True when a model family is disabled for automatic fallback.
+
+    Explicit model requests are still handled elsewhere in strict mode. This
+    guard only prevents background fallback selection from drifting into auth-
+    backed CLI providers that can sit silent or require fresh operator login.
+    """
+    prefix = _provider_prefix_from_model(model)
+    if not prefix:
+        return False
+    env_name = "HERMES_PRIVACY_EXCLUDED_FALLBACK_PROVIDERS" if privacy else "HERMES_CODE_EXCLUDED_FALLBACK_PROVIDERS"
+    default = "openai-codex,claude-code-cli,mimocode-cli" if privacy else "mimocode-cli"
+    raw = os.getenv(env_name, default)
+    excluded = {item.strip().lower() for item in str(raw or "").split(",") if item.strip()}
+    return prefix in excluded
 
 
 def _is_prompt_too_long_error(error_text: str) -> bool:
@@ -2747,7 +2809,7 @@ def _hermes_code_skip_toxic_fallback(provider_model: str) -> bool:
 def _build_hermes_code_model_pool() -> List[str]:
     configured = os.getenv("HERMES_CODE_MODEL", "").strip()
     candidates: List[str] = [configured] if configured else []
-    for idx in range(1, _HERMES_CODE_MAX_FALLBACKS + 1):
+    for idx in range(1, _hermes_code_max_fallbacks() + 1):
         fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
         if fb:
             candidates.append(fb)
@@ -2779,7 +2841,7 @@ def _build_hermes_privacy_model_pool() -> List[str]:
     """
     configured = os.getenv("HERMES_PRIVACY_MODEL", "").strip()
     candidates: List[str] = [configured] if configured else []
-    for idx in range(1, _HERMES_CODE_MAX_FALLBACKS + 1):
+    for idx in range(1, _hermes_code_max_fallbacks() + 1):
         fb = os.getenv(f"HERMES_PRIVACY_FALLBACK_{idx}", "").strip()
         if fb:
             candidates.append(fb)
@@ -2804,7 +2866,7 @@ def _build_hermes_code_audio_pool() -> List[str]:
     """Build the audio-capable model pool from HERMES_CODE_AUDIO_MODEL and HERMES_CODE_AUDIO_FALLBACK_{N}."""
     configured = os.getenv("HERMES_CODE_AUDIO_MODEL", "").strip()
     candidates: List[str] = [configured] if configured else []
-    for idx in range(1, _HERMES_CODE_MAX_FALLBACKS + 1):
+    for idx in range(1, _hermes_code_max_fallbacks() + 1):
         fb = os.getenv(f"HERMES_CODE_AUDIO_FALLBACK_{idx}", "").strip()
         if fb:
             candidates.append(fb)
@@ -3039,6 +3101,8 @@ def _hermes_code_selectable_pool(*, estimated_tokens: int = 0) -> List[str]:
     # load credential pools and check cooldowns, so N fallbacks × N
     # credential pools × N selectability checks adds up fast.
     for model in _build_hermes_code_model_pool():
+        if _passthrough_fallback_provider_excluded(model):
+            continue
         if _hermes_code_model_is_selectable(model):
             selectable = [model]
             break
@@ -3050,7 +3114,8 @@ def _hermes_code_selectable_pool(*, estimated_tokens: int = 0) -> List[str]:
             # First available can't handle the context — scan for one that can.
             fitting = [
                 m for m in _build_hermes_code_model_pool()
-                if _hermes_code_model_is_selectable(m)
+                if not _passthrough_fallback_provider_excluded(m)
+                and _hermes_code_model_is_selectable(m)
                 and _model_can_handle_context(m, estimated_tokens)
             ]
             if fitting:
@@ -3061,7 +3126,8 @@ def _hermes_code_selectable_pool(*, estimated_tokens: int = 0) -> List[str]:
         if estimated_tokens >= _HERMES_CODE_LARGE_CONTEXT_TRIGGER:
             large_context = [
                 m for m in _build_hermes_code_model_pool()
-                if _hermes_code_model_is_selectable(m)
+                if not _passthrough_fallback_provider_excluded(m)
+                and _hermes_code_model_is_selectable(m)
                 and _model_context_length(m) >= _HERMES_CODE_LARGE_CONTEXT_MIN
             ]
             if large_context:
@@ -3076,7 +3142,11 @@ def _ordered_hermes_code_selectable_pool(*, estimated_tokens: int = 0) -> List[s
     if _SELECTABLE_POOL_CACHE and (now - _SELECTABLE_POOL_CACHE_AT) < _SELECTABLE_POOL_CACHE_TTL:
         selectable = _SELECTABLE_POOL_CACHE
     else:
-        selectable = [m for m in _build_hermes_code_model_pool() if _hermes_code_model_is_selectable(m)]
+        selectable = [
+            m for m in _build_hermes_code_model_pool()
+            if not _passthrough_fallback_provider_excluded(m)
+            and _hermes_code_model_is_selectable(m)
+        ]
         _SELECTABLE_POOL_CACHE = selectable
         _SELECTABLE_POOL_CACHE_AT = now
 
@@ -3145,6 +3215,8 @@ def _select_hermes_code_model(
             return selectable[_next_hermes_code_rr_index(min(rr_window, len(selectable)))]
         return selectable[0]
     for model in _build_hermes_code_model_pool():
+        if _passthrough_fallback_provider_excluded(model):
+            continue
         if _hermes_code_model_is_selectable(model):
             return model
     return os.getenv("HERMES_CODE_MODEL", "minimax/MiniMax-M2.7")
@@ -3158,6 +3230,8 @@ def _hermes_privacy_model_is_selectable(model: str) -> bool:
 
 def _hermes_privacy_selectable_pool(*, estimated_tokens: int = 0) -> List[str]:
     for model in _build_hermes_privacy_model_pool():
+        if _passthrough_fallback_provider_excluded(model, privacy=True):
+            continue
         if _hermes_privacy_model_is_selectable(model):
             return [model]
     return []
@@ -3184,6 +3258,8 @@ def _select_hermes_privacy_model(
     if selectable:
         return selectable[0]
     for model in _build_hermes_privacy_model_pool():
+        if _passthrough_fallback_provider_excluded(model, privacy=True):
+            continue
         if _hermes_privacy_model_is_selectable(model):
             return model
     return os.getenv("HERMES_PRIVACY_MODEL", "")
@@ -3852,6 +3928,10 @@ def _swarm_model_has_credentials(model: str) -> bool:
         # Local LAN endpoint — always reachable if OLLAMA_MAC_BASE_URL is configured
         # Default base URL points to 10.0.0.139:11434; no API key required
         return True
+    if prefix == "mlx-mac":
+        # Local LAN endpoint — always reachable if MLX_MAC_BASE_URL is configured
+        # Default base URL points to 10.0.0.139:11435; no API key required
+        return True
     if prefix == "openai":
         # Check env vars first, then fall back to Hermes auth store for Codex OAuth tokens
         if (
@@ -4239,6 +4319,10 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
             runtime_kwargs["base_url"] = os.getenv("OLLAMA_MAC_BASE_URL", "http://10.0.0.139:11434/v1")
             runtime_kwargs["api_key"] = os.getenv("OLLAMA_MAC_API_KEY", "")
             runtime_kwargs["provider"] = "ollama-mac"
+        elif provider_prefix == "mlx-mac":
+            runtime_kwargs["base_url"] = os.getenv("MLX_MAC_BASE_URL", "http://10.0.0.139:11435/v1")
+            runtime_kwargs["api_key"] = os.getenv("MLX_MAC_API_KEY", "")
+            runtime_kwargs["provider"] = "mlx-mac"
         elif provider_prefix not in ("openrouter",):
             # Unknown non-openrouter prefix — still route via OpenRouter as last resort
             runtime_kwargs["base_url"] = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
@@ -6158,10 +6242,17 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.status import read_runtime_status
 
         runtime = read_runtime_status() or {}
+        gateway_state = self._gateway_state
+        runtime_state = runtime.get("gateway_state")
+        if runtime_state and not (
+            gateway_state in _READY_STATES
+            and runtime_state in {"starting", "draining", "stopped", "startup_failed"}
+        ):
+            gateway_state = runtime_state
         return web.json_response({
             "status": "ok",
             "platform": "hermes-agent",
-            "gateway_state": runtime.get("gateway_state"),
+            "gateway_state": gateway_state,
             "platforms": runtime.get("platforms", {}),
             "active_agents": runtime.get("active_agents", 0),
             "exit_reason": runtime.get("exit_reason"),
@@ -6315,14 +6406,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "description": "Round-robin reranker pool (Cohere + Voyage AI). POST /v1/rerank — Cohere-compatible request/response format.",
             },
             {
-                "id": "ollama-mac/qwopus3.6-35b-a3b:latest",
+                "id": "mlx-mac/qwen2.5-coder-32b-instruct-mlx-4bit",
                 "object": "model",
                 "created": now,
                 "owned_by": "hermes",
                 "permission": [],
-                "root": "ollama-mac/qwopus3.6-35b-a3b:latest",
+                "root": "mlx-mac/qwen2.5-coder-32b-instruct-mlx-4bit",
                 "parent": None,
-                "description": "Qwopus 3.6 35B-A3B MoE (MLX-4bit) on local M4 Max via mlx_lm.server. ~58 tok/s, ~3.6B active params. LAN-only, free.",
+                "description": "Qwen2.5-Coder-32B-Instruct (MLX-4bit) on local M4 Max via mlx_lm.server. ~10 tok/s, 32B params. LAN-only, free.",
                 "context_length": 32768,
             },
             *[
@@ -7095,7 +7186,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _passthrough_models: List[str] = []
             _strict_mode = False  # when True, only the explicitly-requested model is tried
             # User's requested model goes first (unless already in chain)
-            if model_name in ("hermes-code", "hermes-privacy"):
+            if model_name == "hermes-code":
                 selected_code_model = _select_hermes_code_model(
                     estimated_tokens=_approx_tokens,
                     session_id=session_id,
@@ -7135,14 +7226,23 @@ class APIServerAdapter(BasePlatformAdapter):
             # Then HERMES_CODE_MODEL as the actual runtime model for hermes-code
             # (skipped in strict mode — the explicit user request is honored alone)
             primary = os.getenv("HERMES_PRIVACY_MODEL" if model_name == "hermes-privacy" else "HERMES_CODE_MODEL", "").strip()
-            if not _strict_mode and primary and "/" in primary and primary not in _passthrough_models:
+            _is_privacy_passthrough = model_name == "hermes-privacy"
+            if (
+                not _strict_mode
+                and primary
+                and "/" in primary
+                and primary not in _passthrough_models
+                and not _passthrough_fallback_provider_excluded(primary, privacy=_is_privacy_passthrough)
+            ):
                 _passthrough_models.append(primary)
             if not _strict_mode:
                 _cool = []
                 try:
                     from agent.model_cooldown_db import model_cooldown_remaining
-                    for idx in range(1, 36):
+                    for idx in range(1, _hermes_code_max_fallbacks() + 1):
                         fb = os.getenv(f"HERMES_PRIVACY_FALLBACK_{idx}" if model_name == "hermes-privacy" else f"HERMES_CODE_FALLBACK_{idx}", "").strip()
+                        if _passthrough_fallback_provider_excluded(fb, privacy=_is_privacy_passthrough):
+                            continue
                         if fb and fb not in _passthrough_models:
                             _prov = fb.split("/")[0] if "/" in fb else ""
                             _rem = model_cooldown_remaining(_prov, fb) if _prov else 0
@@ -7152,8 +7252,10 @@ class APIServerAdapter(BasePlatformAdapter):
                             _passthrough_models.append(fb)
                 except Exception:
                     # Fallback: add all models without checking (original behaviour)
-                    for idx in range(1, 36):
+                    for idx in range(1, _hermes_code_max_fallbacks() + 1):
                         fb = os.getenv(f"HERMES_PRIVACY_FALLBACK_{idx}" if model_name == "hermes-privacy" else f"HERMES_CODE_FALLBACK_{idx}", "").strip()
+                        if _passthrough_fallback_provider_excluded(fb, privacy=_is_privacy_passthrough):
+                            continue
                         if fb and fb not in _passthrough_models:
                             _passthrough_models.append(fb)
             # ── Quality-based reordering + quality floor ─────────────────────────
@@ -7470,6 +7572,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             api_key = runtime_kwargs.get("api_key", "")
                             base_url = runtime_kwargs.get("base_url", "") or None
                             api_mode = runtime_kwargs.get("api_mode", "anthropic_messages")
+                            _copilot_timeout = _passthrough_request_timeout(_copilot_provider, resolved_model)
 
                             if not api_key:
                                 logger.warning("[hermes-code] passthrough copilot %s: no API key, skipping", provider_model)
@@ -7481,7 +7584,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             if api_mode == "anthropic_messages":
                                 # Anthropic Messages API (Claude models)
                                 from agent.anthropic_adapter import build_anthropic_client
-                                anthropic_client = build_anthropic_client(api_key, base_url)
+                                anthropic_client = build_anthropic_client(api_key, base_url, timeout=_copilot_timeout)
                                 anthropic_messages, anthropic_tools = _transform_messages_to_anthropic(passthrough_messages, tools)
 
                                 api_kwargs: Dict[str, Any] = {
@@ -7551,14 +7654,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 model=resolved_model,
                                                 max_tokens=16384,
                                                 tools=passthrough_tools,
+                                                timeout=_copilot_timeout,
                                             ),
                                         ),
                                         provider_model,
                                     )
                                 else:
                                     # Chat Completions API (GPT-5-mini, GPT-4o-mini, etc.)
-                                    from hermes_cli.timeouts import get_provider_request_timeout
-                                    _chat_timeout = get_provider_request_timeout(_copilot_provider, resolved_model) or 300.0
                                     response_obj = await _await_passthrough_provider_call(
                                         _s_loop.run_in_executor(
                                             None,
@@ -7567,7 +7669,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                                 messages=_copilot_messages(passthrough_messages),
                                                 max_tokens=16384,
                                                 tools=passthrough_tools,
-                                                timeout=_chat_timeout,
+                                                timeout=_copilot_timeout,
                                             ),
                                         ),
                                         provider_model,
@@ -7935,6 +8037,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         prov = runtime_kwargs.get("provider", "")
                         api_key = runtime_kwargs.get("api_key", "")
                         base_url = runtime_kwargs.get("base_url", "") or None
+                        _provider_timeout = _passthrough_request_timeout(prov, resolved_model)
                         _provider_messages = _messages_with_provider_tool_prompt(
                             passthrough_messages,
                             provider_model=provider_model,
@@ -7968,23 +8071,29 @@ class APIServerAdapter(BasePlatformAdapter):
                                     messages=_strip_reasoning(_provider_messages) if _passthrough_has_reasoning else _provider_messages,
                                     max_tokens=16384,
                                     tools=passthrough_tools,
-                                    timeout=300,
+                                    timeout=_provider_timeout,
                                 )
-                            response_obj = await _s_loop.run_in_executor(None, _gemini_audio_call)
+                            response_obj = await _await_passthrough_provider_call(
+                                _s_loop.run_in_executor(None, _gemini_audio_call),
+                                provider_model,
+                            )
                         elif prov == "openai-codex":
                             _skip_normal_call = True  # Uses _call_codex_passthrough, not call_llm
-                            response_obj = await _s_loop.run_in_executor(
-                                None,
-                                lambda: _call_codex_passthrough(
-                                    messages=_strip_unsupported_content_for_openai(
-                                        _strip_reasoning(_provider_messages) if _passthrough_has_reasoning else _provider_messages
+                            response_obj = await _await_passthrough_provider_call(
+                                _s_loop.run_in_executor(
+                                    None,
+                                    lambda: _call_codex_passthrough(
+                                        messages=_strip_unsupported_content_for_openai(
+                                            _strip_reasoning(_provider_messages) if _passthrough_has_reasoning else _provider_messages
+                                        ),
+                                        model=resolved_model,
+                                        api_key=api_key,
+                                        base_url=base_url or "",
+                                        tools=passthrough_tools,
+                                        timeout=_provider_timeout,
                                     ),
-                                    model=resolved_model,
-                                    api_key=api_key,
-                                    base_url=base_url or "",
-                                    tools=passthrough_tools,
-                                    timeout=300,
                                 ),
+                                provider_model,
                             )
                         elif prov == "claude-code-cli":
                             # Claude Code CLI — MCP bridge mode.
@@ -8745,7 +8854,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _rc_count = sum(1 for m in _msgs_to_send if m.get("reasoning_content"))
                                         logger.warning("[hermes-code] DEEPHEX: %d messages with reasoning_content in request", _rc_count)
                                         # Make direct httpx call
-                                        async with httpx.AsyncClient(timeout=300.0) as _client:
+                                        async with httpx.AsyncClient(timeout=_provider_timeout) as _client:
                                             _headers = {
                                                 "Authorization": f"Bearer {api_key}",
                                                 "Content-Type": "application/json",
@@ -8814,8 +8923,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             logger.warning("[hermes-code] stream: acquire_stream exception for %s: %s", prov, _stream_exc)
                         if not _skip_normal_call:
                             _call_start = _time.time()
-                            from hermes_cli.timeouts import get_provider_request_timeout
-                            _call_timeout = get_provider_request_timeout(prov, resolved_model) or 300.0
+                            _call_timeout = _provider_timeout
                             logger.info("[hermes-code][req=%s] stream: calling call_llm for %s timeout=%ss", _req_id, prov, _call_timeout)
                             try:
                                 response_obj = await _await_passthrough_provider_call(
@@ -9450,6 +9558,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         api_key = runtime_kwargs.get("api_key", "")
                         base_url = runtime_kwargs.get("base_url", "") or None
                         api_mode = runtime_kwargs.get("api_mode", "anthropic_messages")
+                        _copilot_provider = provider_model.split("/")[0]
+                        _copilot_timeout = _passthrough_request_timeout(_copilot_provider, resolved_model)
 
                         if not api_key:
                             logger.debug("hermes-code passthrough: %s has no API key, skipping", provider_model)
@@ -9459,7 +9569,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         if api_mode == "anthropic_messages":
                             # Anthropic Messages API (Claude models)
                             from agent.anthropic_adapter import build_anthropic_client
-                            anthropic_client = build_anthropic_client(api_key, base_url)
+                            anthropic_client = build_anthropic_client(api_key, base_url, timeout=_copilot_timeout)
                             anthropic_messages, anthropic_tools = _transform_messages_to_anthropic(passthrough_messages, tools)
 
                             api_kwargs: Dict[str, Any] = {
@@ -9529,6 +9639,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         model=resolved_model,
                                         max_tokens=16384,
                                         tools=passthrough_tools,
+                                        timeout=_copilot_timeout,
                                     ),
                                 )
                             else:
@@ -9540,7 +9651,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         messages=passthrough_messages,
                                         max_tokens=16384,
                                         tools=passthrough_tools,
-                                        timeout=300,
+                                        timeout=_copilot_timeout,
                                     ),
                                 )
 
@@ -9703,6 +9814,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     api_key = runtime_kwargs.get("api_key", "")
                     base_url = runtime_kwargs.get("base_url", "") or None
                     api_mode = runtime_kwargs.get("api_mode", "")
+                    _provider_timeout_ns = _passthrough_request_timeout(prov, resolved_model)
                     _provider_messages = _messages_with_provider_tool_prompt(
                         passthrough_messages,
                         provider_model=provider_model,
@@ -9748,7 +9860,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 messages=_strip_reasoning(_provider_messages) if _passthrough_has_reasoning else _provider_messages,
                                 max_tokens=16384,
                                 tools=passthrough_tools,
-                                timeout=300,
+                                timeout=_provider_timeout_ns,
                             )
                         response_obj = await _ns_loop.run_in_executor(None, _gemini_audio_call_ns)
                     elif prov == "openai-codex":
@@ -9762,7 +9874,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 api_key=api_key,
                                 base_url=base_url or "",
                                 tools=passthrough_tools,
-                                timeout=300,
+                                timeout=_provider_timeout_ns,
                             ),
                         )
                         try:
@@ -10136,7 +10248,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 base_url=base_url,
                                 api_key=api_key,
                                 max_tokens=16384,
-                                timeout=300,
+                                timeout=_provider_timeout_ns,
                                 tools=passthrough_tools,
                             ),
                         )
@@ -10219,7 +10331,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 base_url=base_url,
                                 api_key=api_key,
                                 max_tokens=16384,
-                                timeout=300,
+                                timeout=_provider_timeout_ns,
                                 tools=passthrough_tools,
                             ),
                         )
