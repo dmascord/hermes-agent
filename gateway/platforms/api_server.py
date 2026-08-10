@@ -6342,6 +6342,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "context_length": hermes_code_context,
                     "max_output_tokens": hermes_code_max_output,
                 },
+                "input": ["text", "image"],
 
                 "metadata": {
                     "selected_model": hermes_code_selected,
@@ -6364,6 +6365,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "context_length": _hermes_privacy_advertised_context_length(),
                     "max_output_tokens": _hermes_privacy_advertised_max_output_tokens(),
                 },
+                "input": ["text", "image"],
                 "metadata": {
                     "selected_model": _select_hermes_privacy_model(),
                 },
