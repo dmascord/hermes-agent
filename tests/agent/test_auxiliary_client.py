@@ -2567,6 +2567,49 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert captured.get("reasoning") == {"effort": "high", "summary": "auto"}
 
+    def test_raw_stream_preserves_default_headers(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        captured = {}
+
+        class _Response:
+            status_code = 200
+
+            def iter_lines(self):
+                return iter([
+                    'data: {"type":"response.output_text.delta","delta":"hi"}',
+                    'data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}',
+                ])
+
+        class _Stream:
+            def __enter__(self):
+                return _Response()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _RawClient:
+            def stream(self, method, url, **kwargs):
+                captured["method"] = method
+                captured["url"] = url
+                captured["headers"] = kwargs.get("headers")
+                return _Stream()
+
+        real_client = SimpleNamespace(
+            api_key="codex-token",
+            base_url="https://chatgpt.com/backend-api/codex",
+            _default_headers={"User-Agent": "codex_cli_rs/1.2.3", "Originator": "codex_cli_rs"},
+            _client=_RawClient(),
+        )
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+
+        response = adapter.create(messages=[{"role": "user", "content": "hi"}])
+
+        assert response.choices[0].message.content == "hi"
+        assert captured["headers"]["User-Agent"] == "codex_cli_rs/1.2.3"
+        assert captured["headers"]["Originator"] == "codex_cli_rs"
+        assert captured["headers"]["Authorization"] == "Bearer codex-token"
+
     def test_reasoning_disabled_omits_reasoning_and_include(self):
         adapter, captured = self._build_adapter()
         adapter.create(

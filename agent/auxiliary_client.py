@@ -697,7 +697,8 @@ class _CodexCompletionsAdapter:
                 # default_headers on httpx.  We must add it explicitly when
                 # going around the SDK.
                 _api_key = getattr(self._client, "api_key", "")
-                _req_headers = {"Authorization": f"Bearer {_api_key}"}
+                _req_headers = dict(getattr(self._client, "_default_headers", {}) or {})
+                _req_headers["Authorization"] = f"Bearer {_api_key}"
                 _stream_kwargs = {"json": resp_kwargs, "headers": _req_headers}
                 if timeout is not None:
                     _stream_kwargs["timeout"] = timeout

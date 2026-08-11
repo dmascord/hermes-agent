@@ -460,12 +460,50 @@ _FALLBACK_CHAIN_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 _SELECTABLE_POOL_CACHE: List[str] = []
 _SELECTABLE_POOL_CACHE_AT: float = 0.0
 _SELECTABLE_POOL_CACHE_TTL = 300.0  # 5 min; invalidated on provider failure, passthrough checks cooldown per-attempt
+_CODEX_HTTP_CLIENTS: Dict[str, Any] = {}
+_CODEX_HTTP_CLIENT_LOCK = threading.Lock()
 
 
 def _invalidate_selectable_pool_cache() -> None:
     """Force next call to _ordered_hermes_code_selectable_pool to re-evaluate all models."""
     global _SELECTABLE_POOL_CACHE  # noqa: PLW0603
     _SELECTABLE_POOL_CACHE = []
+
+
+def _codex_http_client(effective_base: str) -> Any:
+    """Return a process-level sync httpx client for Codex passthrough."""
+    with _CODEX_HTTP_CLIENT_LOCK:
+        cached = _CODEX_HTTP_CLIENTS.get(effective_base)
+        if cached is not None and getattr(cached, "is_closed", False) is not True:
+            return cached
+
+        import socket
+        import httpx
+
+        sock_opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60))
+            sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15))
+            sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4))
+        elif hasattr(socket, "TCP_KEEPALIVE"):
+            sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 60))
+
+        client = httpx.Client(
+            transport=httpx.HTTPTransport(socket_options=sock_opts),
+        )
+        _CODEX_HTTP_CLIENTS[effective_base] = client
+        return client
+
+
+def _close_codex_http_clients() -> None:
+    with _CODEX_HTTP_CLIENT_LOCK:
+        clients = list(_CODEX_HTTP_CLIENTS.values())
+        _CODEX_HTTP_CLIENTS.clear()
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 # Session-level sticky hermes-code routing. Once a session successfully picks a
 # backend, keep using it for subsequent turns unless it becomes unavailable or
@@ -588,12 +626,13 @@ def _resolve_session_id(
         #   Turn-2+: the current hist_sig covers all prior messages including
         #   assistant responses, so it is unique per conversation. But we
         #   can't match it exactly to the turn-1 hist_sig stored in the bucket.
-        #   Instead we check _SESSION_REGISTRY_LASTHIST: if any session's
-        #   last-seen hist_sig is a prefix of the current hist_sig content,
-        #   it is the parent session. We detect this by storing the raw
-        #   history string length so we can check content inclusion cheaply.
+        #   Instead we check sessions already registered under this base key:
+        #   if any session's last-seen history is a prefix of the current
+        #   history, it is the parent session. Restricting the scan to this
+        #   bucket keeps lookup cost bounded by same-first-message collisions
+        #   instead of all active API sessions.
         #
-        #   Concretely: _SESSION_REGISTRY_LASTHIST[sid] = (hist_sig, hist_raw_len)
+        #   Concretely: _SESSION_REGISTRY_LASTHIST[sid] = (hist_sig, hist_raw)
         #   A turn-2 request's hist_parts begins with the turn-1 hist_parts,
         #   so we check if the current hist_raw starts with any known session's
         #   last hist_raw prefix.
@@ -607,11 +646,16 @@ def _resolve_session_id(
                 _SESSION_REGISTRY_MTIME[sid] = now
                 _SESSION_REGISTRY_LASTHIST[sid] = (hist_sig, hist_raw)
                 return sid
-            # Prefix match: find a session whose last hist_raw is a prefix of ours
+            # Prefix match: find a same-base session whose last hist_raw is a
+            # prefix of ours.
             best_sid = None
             best_len = 0
-            for sid, (_, stored_raw) in list(_SESSION_REGISTRY_LASTHIST.items()):
-                if sid in _SESSION_REGISTRY_MTIME and hist_raw.startswith(stored_raw) and len(stored_raw) > best_len:
+            for sid in set(bucket.values()):
+                entry = _SESSION_REGISTRY_LASTHIST.get(sid)
+                if entry is None or sid not in _SESSION_REGISTRY_MTIME:
+                    continue
+                _, stored_raw = entry
+                if hist_raw.startswith(stored_raw) and len(stored_raw) > best_len:
                     best_sid = sid
                     best_len = len(stored_raw)
             if best_sid is not None:
@@ -2136,20 +2180,9 @@ def _call_codex_passthrough(
     effective_base = (base_url or "https://chatgpt.com/backend-api/codex").rstrip("/")
     logger.info("[HTTP_LOG] Codex passthrough URL=%s model=%s auth_key_preview=%s key_len=%d", effective_base, model, api_key[:10], len(api_key))
 
-    # Build a keepalive httpx client to prevent the SITA NGFW or upstream
-    # from closing idle connections before the first SSE event arrives.
-    import socket
-    import httpx
-    _sock_opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
-    if hasattr(socket, "TCP_KEEPIDLE"):
-        _sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60))
-        _sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15))
-        _sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4))
-    elif hasattr(socket, "TCP_KEEPALIVE"):
-        _sock_opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 60))
-    _keepalive_httpx = httpx.Client(
-        transport=httpx.HTTPTransport(socket_options=_sock_opts),
-    )
+    # Reuse the keepalive httpx client across requests. Creating it per call
+    # paid a fresh TCP/TLS setup cost and never actually reused the pool.
+    _keepalive_httpx = _codex_http_client(effective_base)
 
     # Extract system prompt (instructions) from messages
     instructions = ""
@@ -2197,7 +2230,7 @@ def _call_codex_passthrough(
     tc_map: Dict[str, Dict[str, str]] = {}
     tc_order: List[str] = []  # preserve insertion order
     usage_obj = None
-    print(f"[HTTP_LOG] REQUEST codex passthrough model={model} url={url}", flush=True)
+    logger.debug("[HTTP_LOG] REQUEST codex passthrough model=%s url=%s", model, url)
     with _keepalive_httpx.stream("POST", url, json=body, headers=headers, timeout=timeout) as resp:
         if resp.status_code >= 400:
             err_body = b"".join(resp.iter_bytes())[:500]
@@ -6343,7 +6376,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "max_output_tokens": hermes_code_max_output,
                 },
                 "input": ["text", "image"],
-
+                "attachment": True,
+                "capabilities": {"input": ["text", "image"]},
+                "modalities": {"input": ["text", "image"]},
                 "metadata": {
                     "selected_model": hermes_code_selected,
                     "large_context_min": _HERMES_CODE_LARGE_CONTEXT_MIN,
@@ -6366,6 +6401,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "max_output_tokens": _hermes_privacy_advertised_max_output_tokens(),
                 },
                 "input": ["text", "image"],
+                "attachment": True,
+                "capabilities": {"input": ["text", "image"]},
+                "modalities": {"input": ["text", "image"]},
                 "metadata": {
                     "selected_model": _select_hermes_privacy_model(),
                 },
@@ -7640,9 +7678,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 if "chatgpt.com" in (base_url or "").lower() and api_mode == "codex_responses":
                                     from agent.auxiliary_client import _codex_cloudflare_headers
                                     headers = _codex_cloudflare_headers(api_key)
+                                    http_client = _codex_http_client((base_url or "https://chatgpt.com/backend-api/codex").rstrip("/"))
                                 else:
                                     headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
-                                client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers, max_retries=0)
+                                    http_client = None
+                                client_kwargs = {
+                                    "api_key": api_key,
+                                    "base_url": base_url,
+                                    "default_headers": headers,
+                                    "max_retries": 0,
+                                }
+                                if http_client is not None:
+                                    client_kwargs["http_client"] = http_client
+                                client = OpenAI(**client_kwargs)
 
                                 if api_mode == "codex_responses":
                                     # Responses API (GPT-5.x): wrap in CodexAuxiliaryClient
@@ -9626,9 +9674,19 @@ class APIServerAdapter(BasePlatformAdapter):
                             if "chatgpt.com" in (base_url or "").lower() and api_mode == "codex_responses":
                                 from agent.auxiliary_client import _codex_cloudflare_headers
                                 headers = _codex_cloudflare_headers(api_key)
+                                http_client = _codex_http_client((base_url or "https://chatgpt.com/backend-api/codex").rstrip("/"))
                             else:
                                 headers = copilot_request_headers(is_agent_turn=True, base_url=base_url)
-                            client = OpenAI(api_key=api_key, base_url=base_url, default_headers=headers, max_retries=0)
+                                http_client = None
+                            client_kwargs = {
+                                "api_key": api_key,
+                                "base_url": base_url,
+                                "default_headers": headers,
+                                "max_retries": 0,
+                            }
+                            if http_client is not None:
+                                client_kwargs["http_client"] = http_client
+                            client = OpenAI(**client_kwargs)
 
                             if api_mode == "codex_responses":
                                 # Responses API (GPT-5.x): wrap in CodexAuxiliaryClient
@@ -13812,6 +13870,7 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._runner.cleanup()
             self._runner = None
         self._app = None
+        _close_codex_http_clients()
         logger.info("[%s] API server stopped", self.name)
 
     async def send(

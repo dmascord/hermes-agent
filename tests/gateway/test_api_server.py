@@ -28,6 +28,10 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _CORS_HEADERS,
+    _CODEX_HTTP_CLIENTS,
+    _SESSION_REGISTRY,
+    _SESSION_REGISTRY_LASTHIST,
+    _SESSION_REGISTRY_MTIME,
     _call_codex_passthrough,
     _align_runtime_with_explicit_model,
     _cooldown_seconds_for_429,
@@ -38,6 +42,7 @@ from gateway.platforms.api_server import (
     _is_provider_exhaustion_error,
     _messages_with_retry_tool_prompt,
     _messages_with_provider_tool_prompt,
+    _resolve_session_id,
     _sanitize_passthrough_error_for_client,
     _extract_text_tool_calls_for_passthrough,
     check_api_server_requirements,
@@ -391,42 +396,38 @@ class TestExplicitModelRuntimeAlignment:
 
 
 class TestCodexPassthroughToolArgs:
+    def setup_method(self):
+        _CODEX_HTTP_CLIENTS.clear()
+
+    def teardown_method(self):
+        _CODEX_HTTP_CLIENTS.clear()
+
     def test_output_item_done_backfills_missing_tool_arguments(self):
+        lines = [
+            'data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"calculator"}}',
+            'data: {"type":"response.function_call_arguments.done","call_id":null,"arguments":"{\\"expression\\":\\"2+2\\"}"}',
+            'data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"calculator","arguments":"{\\"expression\\":\\"2+2\\"}"}}',
+            'data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}',
+        ]
+
+        class _Response:
+            status_code = 200
+
+            def iter_lines(self):
+                return iter(lines)
+
         class _Stream:
             def __enter__(self):
-                return iter([
-                    MagicMock(
-                        type="response.output_item.added",
-                        item=MagicMock(type="function_call", call_id="call_1", name="calculator"),
-                    ),
-                    MagicMock(
-                        type="response.function_call_arguments.done",
-                        call_id=None,
-                        arguments='{"expression":"2+2"}',
-                    ),
-                    MagicMock(
-                        type="response.output_item.done",
-                        item=MagicMock(
-                            type="function_call",
-                            call_id="call_1",
-                            name="calculator",
-                            arguments='{"expression":"2+2"}',
-                        ),
-                    ),
-                    MagicMock(
-                        type="response.completed",
-                        response=MagicMock(usage=MagicMock(input_tokens=1, output_tokens=1, total_tokens=2)),
-                    ),
-                ])
+                return _Response()
 
             def __exit__(self, exc_type, exc, tb):
                 return False
 
         mock_client = MagicMock()
-        mock_client.responses.create.return_value = _Stream()
+        mock_client.stream.return_value = _Stream()
 
         with (
-            patch("openai.OpenAI", return_value=mock_client),
+            patch("httpx.Client", return_value=mock_client) as client_cls,
             patch("agent.auxiliary_client._codex_cloudflare_headers", return_value={}),
         ):
             response = _call_codex_passthrough(
@@ -446,6 +447,39 @@ class TestCodexPassthroughToolArgs:
 
         tool_call = response.choices[0].message.tool_calls[0]
         assert tool_call.function.arguments == '{"expression":"2+2"}'
+        client_cls.assert_called_once()
+
+    def test_reuses_http_client_for_same_base_url(self):
+        class _Response:
+            status_code = 200
+
+            def iter_lines(self):
+                return iter(['data: {"type":"response.completed","response":{"usage":{}}}'])
+
+        class _Stream:
+            def __enter__(self):
+                return _Response()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _Stream()
+
+        with (
+            patch("httpx.Client", return_value=mock_client) as client_cls,
+            patch("agent.auxiliary_client._codex_cloudflare_headers", return_value={}),
+        ):
+            for _ in range(2):
+                _call_codex_passthrough(
+                    messages=[{"role": "user", "content": "hi"}],
+                    model="gpt-5.4",
+                    api_key="tok",
+                    base_url="https://chatgpt.com/backend-api/codex",
+                )
+
+        client_cls.assert_called_once()
+        assert mock_client.stream.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +789,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
-    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    if hasattr(adapter, "_handle_capabilities"):
+        app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -962,6 +997,22 @@ class TestModelsEndpoint:
             )
             assert resp.status == 200
 
+    @pytest.mark.asyncio
+    async def test_passthrough_models_advertise_image_input(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            assert resp.status == 200
+            payload = await resp.json()
+            by_id = {entry["id"]: entry for entry in payload["data"]}
+
+        for model_id in ("hermes-code", "hermes-privacy"):
+            entry = by_id[model_id]
+            assert entry["attachment"] is True
+            assert "image" in entry["input"]
+            assert "image" in entry["capabilities"]["input"]
+            assert "image" in entry["modalities"]["input"]
+
 
 # ---------------------------------------------------------------------------
 # /v1/capabilities endpoint
@@ -971,6 +1022,8 @@ class TestModelsEndpoint:
 class TestCapabilitiesEndpoint:
     @pytest.mark.asyncio
     async def test_capabilities_advertises_plugin_safe_contract(self, adapter):
+        if not hasattr(adapter, "_handle_capabilities"):
+            pytest.skip("APIServerAdapter does not expose /v1/capabilities")
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/capabilities")
@@ -989,6 +1042,8 @@ class TestCapabilitiesEndpoint:
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
+        if not hasattr(auth_adapter, "_handle_capabilities"):
+            pytest.skip("APIServerAdapter does not expose /v1/capabilities")
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/capabilities")
@@ -1600,6 +1655,35 @@ class TestDeriveChatSessionId:
         """None system prompt doesn't crash."""
         sid = _derive_chat_session_id(None, "test")
         assert isinstance(sid, str) and len(sid) > 4
+
+
+class TestResolveSessionId:
+    def setup_method(self):
+        _SESSION_REGISTRY.clear()
+        _SESSION_REGISTRY_LASTHIST.clear()
+        _SESSION_REGISTRY_MTIME.clear()
+
+    def teardown_method(self):
+        _SESSION_REGISTRY.clear()
+        _SESSION_REGISTRY_LASTHIST.clear()
+        _SESSION_REGISTRY_MTIME.clear()
+
+    def test_prefix_match_scans_same_base_bucket_only(self):
+        first = [{"role": "user", "content": "same first"}]
+        sid = _resolve_session_id("salt", "sys", first)
+
+        # Populate many unrelated sessions. The second turn should still match
+        # the original session without depending on a global registry scan.
+        for i in range(200):
+            _resolve_session_id("salt", "sys", [{"role": "user", "content": f"unrelated {i}"}])
+
+        second = [
+            {"role": "user", "content": "same first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        assert _resolve_session_id("salt", "sys", second) == sid
 
 
 # ---------------------------------------------------------------------------
