@@ -3045,7 +3045,7 @@ _HERMES_CODE_DYNAMIC_PROVIDER_MODEL_HINTS: tuple[tuple[str, str, tuple[str, ...]
             "deepseek-v4-flash",
             "mimo-v2.5-pro",
         ),
-        False,  # opencode-go is a multi-provider aggregator; opaque TOS — not ZDR-safe
+        True,  # OpenCode Privacy Policy: no training on prompts/code; ZDR via partner agreements
     ),
     (
         "ollama-cloud",
@@ -3206,7 +3206,7 @@ def _passthrough_fallback_provider_excluded(model: str, *, privacy: bool = False
         return False
     env_name = "HERMES_PRIVACY_EXCLUDED_FALLBACK_PROVIDERS" if privacy else "HERMES_CODE_EXCLUDED_FALLBACK_PROVIDERS"
     default = (
-        "mimocode-cli,claude-code-cli,openrouter,opencode-zen,opencode-go,google,zai,"
+        "mimocode-cli,claude-code-cli,openrouter,opencode-zen,google,zai,"
         "minimax,cohere,xiaomi,nvidia,anthropic,cerebras,groq,arliai,synthetic,"
         "synthetic-anthropic"
     ) if privacy else "mimocode-cli"
