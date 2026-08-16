@@ -52,6 +52,7 @@ from gateway.platforms.api_server import (
     _build_hermes_code_model_pool,
     _build_hermes_privacy_model_pool,
     _passthrough_fallback_provider_excluded,
+    _passthrough_model_health_reason,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -191,6 +192,58 @@ class TestDynamicPassthroughFallbacks:
         assert _passthrough_fallback_provider_excluded("claude-code-cli", privacy=True) is False
         assert _passthrough_fallback_provider_excluded("opencode-zen/hy3-free", privacy=True) is True
         assert _passthrough_fallback_provider_excluded("openrouter/cohere/north-mini-code:free", privacy=True) is True
+
+    def test_dynamic_discovery_skips_health_cooled_models(self, monkeypatch):
+        self._patch_catalogs(monkeypatch)
+        monkeypatch.setenv("HERMES_CODE_DYNAMIC_FALLBACKS", "true")
+        monkeypatch.setattr(
+            "agent.model_cooldown_db.model_cooldown_remaining",
+            lambda provider, model, **kwargs: 120.0 if model == "opencode-go/qwen3.6-plus" else 0.0,
+        )
+        for idx in range(1, 65):
+            monkeypatch.delenv(f"HERMES_CODE_FALLBACK_{idx}", raising=False)
+
+        pool = _build_hermes_code_model_pool()
+
+        assert "opencode-go/minimax-m3" in pool
+        assert "opencode-go/qwen3.6-plus" not in pool
+
+    def test_privacy_env_fallback_skips_health_cooled_models(self, monkeypatch):
+        self._patch_catalogs(monkeypatch)
+        monkeypatch.setenv("HERMES_PRIVACY_MODEL", "openai/gpt-5.6-sol")
+        monkeypatch.setenv("HERMES_PRIVACY_FALLBACK_1", "opencode-go/qwen3.6-plus")
+        monkeypatch.setenv("HERMES_PRIVACY_DYNAMIC_FALLBACKS", "false")
+        monkeypatch.setattr(
+            "agent.model_cooldown_db.model_cooldown_remaining",
+            lambda provider, model, **kwargs: 300.0 if model == "opencode-go/qwen3.6-plus" else 0.0,
+        )
+        for idx in range(2, 65):
+            monkeypatch.delenv(f"HERMES_PRIVACY_FALLBACK_{idx}", raising=False)
+
+        pool = _build_hermes_privacy_model_pool()
+
+        assert pool == ["openai/gpt-5.6-sol"]
+
+    def test_health_reason_hard_failures_get_long_cooldowns(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CODE_RETIRED_MODEL_COOLDOWN_SECONDS", "86400")
+        monkeypatch.setenv("HERMES_CODE_STALE_MODEL_COOLDOWN_SECONDS", "21600")
+
+        retired_seconds, retired_reason = _passthrough_model_health_reason(
+            RuntimeError("qwen3-coder-next was retired at 2026-07-15")
+        )
+        stale_seconds, stale_reason = _passthrough_model_health_reason(
+            RuntimeError("Error code: 404 - No endpoints found for kimi-k2.6:free")
+        )
+        context_seconds, context_reason = _passthrough_model_health_reason(
+            RuntimeError("context length exceeded")
+        )
+
+        assert retired_seconds == 86400.0
+        assert retired_reason == "retired_model"
+        assert stale_seconds == 21600.0
+        assert stale_reason == "stale_or_unavailable_model"
+        assert context_seconds == 0.0
+        assert context_reason == ""
 
     def test_session_limit_assistant_content_is_provider_exhaustion(self):
         assert _is_provider_exhaustion_content("You've hit your session limit · resets 10:10am (UTC)") is True

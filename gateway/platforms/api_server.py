@@ -414,8 +414,94 @@ def _skip_provider_exhaustion_content(
         exc=exc,
         stream=stream,
     )
+    _mark_passthrough_model_unhealthy(provider_model, exc, stream=stream)
     _invalidate_selectable_pool_cache()
     raise _CodexPassthroughSkip("provider_exhaustion_content")
+
+
+def _passthrough_model_provider(model: str) -> str:
+    return str(model or "").split("/", 1)[0] if "/" in str(model or "") else "openai"
+
+
+def _passthrough_model_health_cooldown(model: str) -> float:
+    """Return active health cooldown for automatic passthrough selection.
+
+    This is deliberately bypassed for strict explicit model requests. It only
+    filters background rotation candidates for hermes-code/hermes-privacy.
+    """
+    raw = str(model or "").strip()
+    if not raw:
+        return 0.0
+    blocked = {
+        item.strip().lower()
+        for item in os.getenv("HERMES_CODE_HEALTH_BLOCKED_MODELS", "").split(",")
+        if item.strip()
+    }
+    if raw.lower() in blocked:
+        return float(os.getenv("HERMES_CODE_HEALTH_BLOCKLIST_TTL_SECONDS", "86400") or "86400")
+    provider = _passthrough_model_provider(raw)
+    try:
+        from agent.model_cooldown_db import model_cooldown_remaining
+        return float(model_cooldown_remaining(provider, raw) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _passthrough_model_health_reason(exc: BaseException) -> tuple[float, str]:
+    text = str(exc or "")
+    lower = text.lower()
+    status = _exception_status_code(exc)
+
+    if _is_prompt_too_long_error(lower) or _is_context_overflow_error(lower):
+        return 0.0, ""
+    if status == 410 or " retired " in lower or " was retired " in lower:
+        return float(os.getenv("HERMES_CODE_RETIRED_MODEL_COOLDOWN_SECONDS", "86400") or "86400"), "retired_model"
+    if (
+        status == 404
+        or "no endpoints found" in lower
+        or "endpoint is unavailable" in lower
+        or "unavailable for free" in lower
+        or "no longer available" in lower
+        or "not_found" in lower
+    ):
+        return float(os.getenv("HERMES_CODE_STALE_MODEL_COOLDOWN_SECONDS", "21600") or "21600"), "stale_or_unavailable_model"
+    if _is_provider_exhaustion_error(exc) or _is_provider_exhaustion_content(text):
+        return float(os.getenv("HERMES_CODE_EXHAUSTED_MODEL_COOLDOWN_SECONDS", "900") or "900"), "provider_exhausted"
+    if status in (500, 502, 503, 504) or "timed out" in lower or "timeouterror" in lower:
+        return float(os.getenv("HERMES_CODE_TRANSIENT_MODEL_COOLDOWN_SECONDS", "900") or "900"), "transient_provider_failure"
+    if status == 400 and ("too many tokens" in lower or "max tokens" in lower):
+        return float(os.getenv("HERMES_CODE_BAD_REQUEST_MODEL_COOLDOWN_SECONDS", "1800") or "1800"), "bad_request_model_limits"
+    return 0.0, ""
+
+
+def _mark_passthrough_model_unhealthy(provider_model: str, exc: BaseException, *, stream: bool) -> None:
+    cooldown, reason = _passthrough_model_health_reason(exc)
+    if cooldown <= 0:
+        return
+    raw = str(provider_model or "").strip()
+    if not raw:
+        return
+    provider = _passthrough_model_provider(raw)
+    try:
+        from agent.model_cooldown_db import mark_model_cooldown
+        mark_model_cooldown(
+            provider=provider,
+            model=raw,
+            cooldown_seconds=cooldown,
+            reason=f"hermes_code_health_{reason}_{'stream' if stream else 'nonstream'}",
+        )
+        logger.warning(
+            "[hermes-code] health-gated %s for %.0fs after %s",
+            raw,
+            cooldown,
+            reason,
+        )
+    except Exception:
+        pass
+    _invalidate_selectable_pool_cache()
+    global _HERMES_CODE_DYNAMIC_FALLBACK_CACHE, _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE
+    _HERMES_CODE_DYNAMIC_FALLBACK_CACHE = None
+    _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE = None
 
 
 def _invoke_passthrough_hooks(hook_name: str, **kwargs: Any) -> None:
@@ -2805,6 +2891,14 @@ def _swarm_dynamic_catalog_fallbacks() -> List[str]:
             if not live:
                 continue
             model_id = f"{route_prefix}/{live}" if route_prefix else live
+            remaining = _passthrough_model_health_cooldown(model_id)
+            if remaining > 0:
+                logger.info(
+                    "[hermes-code] dynamic discovery skipped unhealthy %s (%.0fs remaining)",
+                    model_id,
+                    remaining,
+                )
+                continue
             discovered.append(model_id)
 
     # De-duplicate while preserving preference order.
@@ -3241,6 +3335,14 @@ def _build_hermes_code_model_pool() -> List[str]:
                 model,
             )
             continue
+        remaining = _passthrough_model_health_cooldown(model)
+        if remaining > 0:
+            logger.info(
+                "[hermes-code] ignoring unhealthy HERMES_CODE model candidate %s (%.0fs remaining)",
+                model,
+                remaining,
+            )
+            continue
         ordered.append(model)
     return ordered
 
@@ -3277,6 +3379,14 @@ def _build_hermes_privacy_model_pool() -> List[str]:
             logger.warning(
                 "[api_server] ignoring non-privacy HERMES_PRIVACY model candidate: %s",
                 model,
+            )
+            continue
+        remaining = _passthrough_model_health_cooldown(model)
+        if remaining > 0:
+            logger.info(
+                "[api_server] ignoring unhealthy HERMES_PRIVACY model candidate %s (%.0fs remaining)",
+                model,
+                remaining,
             )
             continue
         ordered.append(model)
@@ -7908,6 +8018,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                 continue
                         except Exception:
                             pass
+                    if not _strict_mode:
+                        _health_remaining = _passthrough_model_health_cooldown(provider_model)
+                        if _health_remaining > 0:
+                            logger.warning(
+                                "[hermes-code] %s health-gated (%.0fs remaining), skipping",
+                                provider_model,
+                                _health_remaining,
+                            )
+                            continue
 
                     # Skip toxic fallback models with extreme failure history
                     if _hermes_code_skip_toxic_fallback(provider_model):
@@ -8435,6 +8554,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             _invalidate_selectable_pool_cache()
                             # Check if this is a rate-limit (429) or auth (401) error; cooldown the provider.
                             _status_code = _exception_status_code(exc)
+                            _mark_passthrough_model_unhealthy(provider_model, exc, stream=True)
                             _is_rate_limit = _is_provider_exhaustion_error(exc)
                             _is_auth_error = _status_code == 401 or "401" in _exc_str or "unauthorized" in _exc_str or "authentication" in _exc_str
                             if _is_rate_limit:
@@ -9831,6 +9951,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _invalidate_selectable_pool_cache()
                         # Check if this is a rate-limit (429) or auth (401) error; cooldown the provider.
                         _status_code = _exception_status_code(exc)
+                        _mark_passthrough_model_unhealthy(provider_model, exc, stream=True)
                         _is_rate_limit = _is_provider_exhaustion_error(exc)
                         _is_auth_error = _status_code == 401 or "401" in _exc_str or "unauthorized" in _exc_str or "authentication" in _exc_str
                         if _is_rate_limit:
@@ -9958,6 +10079,15 @@ class APIServerAdapter(BasePlatformAdapter):
                             continue
                     except Exception:
                         pass
+                if not _strict_mode:
+                    _health_remaining = _passthrough_model_health_cooldown(provider_model)
+                    if _health_remaining > 0:
+                        logger.warning(
+                            "[hermes-code] %s health-gated (%.0fs remaining), skipping",
+                            provider_model,
+                            _health_remaining,
+                        )
+                        continue
 
                 # ── Max provider attempts cap (non-streaming) ──
                 _provider_attempt_count[0] += 1
@@ -10279,6 +10409,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         # Check if this is a rate-limit error; if so, cooldown the provider
                         _is_rate_limit = False
                         _status_code = _exception_status_code(exc)
+                        _mark_passthrough_model_unhealthy(provider_model, exc, stream=False)
                         if _status_code == 429:
                             _is_rate_limit = True
                         elif isinstance(exc, Exception):
@@ -11055,6 +11186,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Check if this is a rate-limit error; if so, cooldown the provider
                     _is_rate_limit = False
                     _status_code = _exception_status_code(exc)
+                    _mark_passthrough_model_unhealthy(provider_model, exc, stream=False)
                     if _status_code == 429:
                         _is_rate_limit = True
                     elif isinstance(exc, Exception):
