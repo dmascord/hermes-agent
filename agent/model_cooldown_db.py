@@ -353,10 +353,17 @@ def mark_model_cooldown(
     # ── Universal cooldown cap ──────────────────────────────────────────────
     # Prevent runaway cooldowns (e.g. 23h+ from 429 quota parsing) from
     # blocking the entire passthrough fallback chain.  Auth-failure
-    # cooldowns (token_invalidated) are exempt — they need manual re-auth.
+    # cooldowns (token_invalidated) and hard model-health failures (retired or
+    # stale/unavailable catalog entries) are exempt — short retry windows just
+    # put dead models back into automatic rotation too quickly.
     _max = max_cooldown_seconds()
     _reason_lower = str(reason or "").lower()
-    if _max > 0 and cooldown > _max and "token_invalidated" not in _reason_lower:
+    _cap_exempt = (
+        "token_invalidated" in _reason_lower
+        or "hermes_code_health_retired_model" in _reason_lower
+        or "hermes_code_health_stale_or_unavailable_model" in _reason_lower
+    )
+    if _max > 0 and cooldown > _max and not _cap_exempt:
         logger.info(
             "Cooldown capped: provider=%s model=%s reason=%s original=%.0fs → capped=%.0fs",
             provider_n, model_n, reason, cooldown, _max,
