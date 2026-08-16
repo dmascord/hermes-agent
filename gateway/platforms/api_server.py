@@ -1056,6 +1056,12 @@ _SWARM_PREMIUM_MODEL_HINTS = (
 _SWARM_BALANCED_MODEL_HINTS = (
     # GHE Copilot Enterprise — smaller GPT-5 models for balanced-tier tasks
     "github-copilot-enterprise/gpt-5-mini",
+    # OpenRouter free models — large context, tool-capable, zero priced.
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "openrouter/nvidia/nemotron-3.5-lightning:free",
+    "openrouter/dots-studio/dots-3-note-preview:free",
+    "openrouter/google/gemma-4-31b-it:free",
+    "openrouter/google/gemma-4-26b-a4b-it:free",
     "minimax/MiniMax-M2.7",
     "opencode-go/qwen3.6-plus",
     "opencode-go/minimax-m2.7",
@@ -1070,6 +1076,18 @@ _SWARM_BALANCED_MODEL_HINTS = (
 _SWARM_CHEAP_MODEL_HINTS = (
     # GHE Copilot Enterprise — cheapest models for cheap-tier tasks
     "github-copilot-enterprise/gpt-4o-mini",
+    # OpenRouter free models — explicitly :free so the free-only guard allows them.
+    "openrouter/cohere/north-mini-code:free",
+    "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+    "openrouter/poolside/laguna-s-2.1:free",
+    "openrouter/poolside/laguna-xs-2.1:free",
+    "openrouter/openai/gpt-oss-20b:free",
+    "openrouter/nvidia/nemotron-3-nano-30b-a3b:free",
+    "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "openrouter/liquid/lfm-2.5-2.6b:free",
+    "openrouter/nvidia/nemotron-nano-12b-v2-vl:free",
+    "openrouter/nvidia/nemotron-nano-9b-v2:free",
+    "openrouter/openrouter/free",
     "opencode-go/qwen3.5-plus",
     "opencode-go/deepseek-v4-flash",
     "opencode-zen/minimax-m2.5-free",
@@ -1133,6 +1151,8 @@ def _openrouter_nonfree_blocked(model_id: str) -> bool:
     """Return True when paid OpenRouter routing should be refused."""
     raw = str(model_id or "").strip().lower()
     if not raw:
+        return False
+    if raw in {"openrouter/free", "openrouter/openrouter/free"}:
         return False
     if raw.startswith("openrouter/"):
         return ":free" not in raw
@@ -2635,6 +2655,8 @@ def _fallback_provider_for_model(model_id: str) -> tuple[str, str]:
         # (e.g., "glm-4.7", not "zai/glm-4.7"; "GLM-4.6-Derestricted-v5", not "arliai/GLM-4.6-Derestricted-v5")
         return prefix, rest
     if prefix == "openrouter":
+        if rest == "free":
+            return "openrouter", "openrouter/free"
         return "openrouter", rest
     return "openrouter", raw
 

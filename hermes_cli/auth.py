@@ -230,6 +230,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "cohere": ProviderConfig(
+        id="cohere",
+        name="Cohere",
+        auth_type="api_key",
+        inference_base_url="https://api.cohere.com/compatibility/v1",
+        api_key_env_vars=("COHERE_API_KEY",),
+        base_url_env_var="COHERE_BASE_URL",
+    ),
     "claude-code-cli": ProviderConfig(
         id="claude-code-cli",
         name="Claude Code CLI",

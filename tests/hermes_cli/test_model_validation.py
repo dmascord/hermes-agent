@@ -204,7 +204,104 @@ class TestProviderModelIds:
             "hermes_cli.models.fetch_api_models",
             return_value=["step-3.5-flash", "step-3-agent-lite"],
         ):
-            assert provider_model_ids("stepfun") == ["step-3.5-flash", "step-3-agent-lite"]
+            assert provider_model_ids("stepfun") == [
+                "step-3.5-flash",
+                "step-3-agent-lite",
+                "step-3.5-flash-2603",
+            ]
+
+    def test_minimax_prefers_live_catalog_with_curated_fallbacks(self):
+        with patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={"api_key": "***", "base_url": "https://api.minimax.io/anthropic"},
+        ), patch(
+            "hermes_cli.models.fetch_api_models",
+            return_value=["MiniMax-M3", "MiniMax-M2.7-highspeed"],
+        ) as fetch:
+            assert provider_model_ids("minimax") == [
+                "MiniMax-M3",
+                "MiniMax-M2.7-highspeed",
+                "MiniMax-M2.7",
+                "MiniMax-M2.5",
+                "MiniMax-M2.1",
+                "MiniMax-M2",
+            ]
+        fetch.assert_called_once_with("***", "https://api.minimax.io/v1")
+
+    def test_gemini_prefers_live_native_catalog_with_curated_fallbacks(self):
+        payload = {
+            "models": [
+                {
+                    "name": "models/gemini-3.5-flash",
+                    "supportedGenerationMethods": ["generateContent"],
+                },
+                {
+                    "name": "models/gemini-3-pro-preview-tts",
+                    "supportedGenerationMethods": ["generateContent"],
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "supportedGenerationMethods": ["embedContent"],
+                },
+            ]
+        }
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                import json
+                return json.dumps(payload).encode()
+
+        with patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={"api_key": "gem-key", "base_url": "https://generativelanguage.googleapis.com/v1beta"},
+        ), patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
+            result = provider_model_ids("gemini")
+
+        assert result[:4] == [
+            "gemini-3.5-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3-pro-preview",
+            "gemini-3.1-flash-lite-preview",
+        ]
+        assert "gemini-3-pro-preview-tts" not in result
+        assert "text-embedding-004" not in result
+
+    def test_cohere_prefers_live_native_catalog_with_curated_fallbacks(self):
+        payload = {
+            "models": [
+                {"name": "command-a-plus-05-2026"},
+                {"name": "command-new-coder-08-2026"},
+            ]
+        }
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                import json
+                return json.dumps(payload).encode()
+
+        with patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={"api_key": "co-key", "base_url": "https://api.cohere.com/compatibility/v1"},
+        ), patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
+            result = provider_model_ids("cohere")
+
+        assert result[:3] == [
+            "command-a-plus-05-2026",
+            "command-new-coder-08-2026",
+            "command-a-03-2025",
+        ]
 
     def test_copilot_prefers_live_catalog(self):
         with patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={"api_key": "gh-token"}), \

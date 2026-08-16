@@ -67,7 +67,7 @@ class TestFetchOpenRouterModels:
                 return False
 
             def read(self):
-                return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
+                return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}},{"id":"cohere/north-mini-code:free","pricing":{"prompt":"0","completion":"0"},"supported_parameters":["temperature","tools"]},{"id":"google/lyria-3-pro-preview","pricing":{"prompt":"0","completion":"0"},"supported_parameters":["temperature"]}]}'
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
         with patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
@@ -76,7 +76,38 @@ class TestFetchOpenRouterModels:
         assert models == [
             ("anthropic/claude-opus-4.8", "recommended"),
             ("qwen/qwen3.7-max", ""),
+            ("cohere/north-mini-code:free", "free"),
             ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
+        ]
+
+    def test_appends_live_free_tool_models_missing_from_curated_list(self, monkeypatch):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    b'{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"},'
+                    b'"supported_parameters":["temperature","tools"]},'
+                    b'{"id":"dots-studio/dots-3-note-preview:free","pricing":{"prompt":"0","completion":"0"},'
+                    b'"context_length":512000,"supported_parameters":["temperature","tools"]},'
+                    b'{"id":"google/lyria-3-clip-preview","pricing":{"prompt":"0","completion":"0"},'
+                    b'"context_length":1048576,"supported_parameters":["temperature"]}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(_models_mod, "OPENROUTER_MODELS", [("anthropic/claude-opus-4.8", "")])
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        assert models == [
+            ("anthropic/claude-opus-4.8", "recommended"),
+            ("dots-studio/dots-3-note-preview:free", "free"),
         ]
 
     def test_falls_back_to_static_snapshot_on_fetch_failure(self, monkeypatch):

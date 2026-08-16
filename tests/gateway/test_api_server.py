@@ -46,6 +46,8 @@ from gateway.platforms.api_server import (
     _runtime_kwargs_for_model_id,
     _sanitize_passthrough_error_for_client,
     _extract_text_tool_calls_for_passthrough,
+    _fallback_provider_for_model,
+    _openrouter_nonfree_blocked,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -78,6 +80,21 @@ class TestPassthroughProviderExhaustion:
         exc = RuntimeError("You've hit your session limit · resets 5am (UTC)")
 
         assert _sanitize_passthrough_error_for_client(exc) == "provider quota or session limit exhausted"
+
+
+class TestOpenRouterFallbackRouting:
+    def test_openrouter_free_router_is_preserved_and_allowed(self):
+        assert _fallback_provider_for_model("openrouter/free") == ("openrouter", "openrouter/free")
+        assert _fallback_provider_for_model("openrouter/openrouter/free") == ("openrouter", "openrouter/free")
+        assert _openrouter_nonfree_blocked("openrouter/free") is False
+        assert _openrouter_nonfree_blocked("openrouter/openrouter/free") is False
+
+    def test_openrouter_vendor_free_model_strips_gateway_prefix(self):
+        assert _fallback_provider_for_model("openrouter/nvidia/nemotron-3-super-120b-a12b:free") == (
+            "openrouter",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+        )
+        assert _openrouter_nonfree_blocked("openrouter/nvidia/nemotron-3-super-120b-a12b:free") is False
 
     def test_session_limit_assistant_content_is_provider_exhaustion(self):
         assert _is_provider_exhaustion_content("You've hit your session limit · resets 10:10am (UTC)") is True

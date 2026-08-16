@@ -105,6 +105,11 @@ class TestGmiModelCatalog:
         assert provider_model_ids("gmi") == [
             "openai/gpt-5.4-mini",
             "zai-org/GLM-5.1-FP8",
+            "deepseek-ai/DeepSeek-V3.2",
+            "moonshotai/Kimi-K2.5",
+            "google/gemini-3.1-flash-lite-preview",
+            "anthropic/claude-sonnet-4.6",
+            "openai/gpt-5.4",
         ]
 
     def test_provider_model_ids_falls_back_to_static_models(self, monkeypatch):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
 import urllib.request
 import urllib.error
 import time
@@ -71,11 +72,22 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # OpenRouter routers
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     # Free tier
-    ("openrouter/elephant-alpha",              "free"),
-    ("openrouter/owl-alpha",                   "free"),
-    ("tencent/hy3-preview:free",               "free"),
+    ("nvidia/nemotron-3-ultra-550b-a55b:free", "free"),
+    ("nvidia/nemotron-3.5-lightning:free",     "free"),
+    ("dots-studio/dots-3-note-preview:free",   "free"),
+    ("google/gemma-4-26b-a4b-it:free",         "free"),
+    ("google/gemma-4-31b-it:free",             "free"),
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
-    ("inclusionai/ring-2.6-1t:free",           "free"),
+    ("poolside/laguna-s-2.1:free",             "free"),
+    ("poolside/laguna-xs-2.1:free",            "free"),
+    ("cohere/north-mini-code:free",            "free"),
+    ("nvidia/nemotron-3-nano-30b-a3b:free",    "free"),
+    ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "free"),
+    ("openai/gpt-oss-20b:free",                "free"),
+    ("liquid/lfm-2.5-2.6b:free",               "free"),
+    ("nvidia/nemotron-nano-12b-v2-vl:free",    "free"),
+    ("nvidia/nemotron-nano-9b-v2:free",        "free"),
+    ("openrouter/free",                        "free router"),
 ]
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
@@ -232,6 +244,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3-pro-preview",
         "gemini-3-flash-preview",
         "gemini-2.5-pro",
+    ],
+    "cohere": [
+        "command-a-plus-05-2026",
+        "command-a-03-2025",
+        "command-r-plus",
+        "command-r",
+        "command-r7b-12-2024",
     ],
     "gemini": [
         "gemini-3.1-pro-preview",
@@ -943,6 +962,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("cohere",         "Cohere",                   "Cohere (Command models via Compatibility API)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("google-gemini-cli", "Google Gemini (OAuth)",   "Google Gemini via OAuth + Code Assist (Code Assist OAuth flow)"),
@@ -1269,6 +1289,7 @@ def fetch_openrouter_models(
         live_by_id[mid] = item
 
     curated: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
     for preferred_id in preferred_ids:
         live_item = live_by_id.get(preferred_id)
         if live_item is None:
@@ -1278,8 +1299,30 @@ def fetch_openrouter_models(
         # when the user selects them. Ported from Kilo-Org/kilocode#9068.
         if not _openrouter_model_supports_tools(live_item):
             continue
-        desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
-        curated.append((preferred_id, desc))
+        if _openrouter_model_is_free(live_item.get("pricing")):
+            continue
+        curated.append((preferred_id, ""))
+        seen_ids.add(preferred_id)
+
+    # Free OpenRouter variants change faster than the in-repo/remote curated
+    # manifest.  Append every live zero-cost, tool-capable model so the picker
+    # and fallback chains do not silently miss newly-free options.
+    live_free: list[tuple[str, str, int]] = []
+    for mid, live_item in live_by_id.items():
+        if mid in seen_ids:
+            continue
+        if not _openrouter_model_is_free(live_item.get("pricing")):
+            continue
+        if not _openrouter_model_supports_tools(live_item):
+            continue
+        context = live_item.get("context_length")
+        try:
+            context_int = int(context)
+        except (TypeError, ValueError):
+            context_int = 0
+        live_free.append((mid, "free", context_int))
+    live_free.sort(key=lambda item: (":free" not in item[0], -item[2], item[0]))
+    curated.extend((mid, desc) for mid, desc, _context in live_free)
 
     if not curated:
         return list(_openrouter_catalog_cache or fallback)
@@ -2059,6 +2102,151 @@ def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     return merged
 
 
+def _merge_live_with_curated(live: Optional[list[str]], curated: list[str]) -> list[str]:
+    """Return live model IDs first with curated fallbacks appended.
+
+    Live ``/models`` endpoints are freshest but can be incomplete for private,
+    aliased, or subscription-gated model IDs.  Keep the live order so newly
+    launched models surface without a Hermes release, then append curated
+    entries that the endpoint did not list so hand-picked fallbacks still work.
+    """
+    seen_lower: set[str] = set()
+    merged: list[str] = []
+    for mid in live or []:
+        text = str(mid or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+        merged.append(text)
+    for mid in curated:
+        text = str(mid or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+        merged.append(text)
+    return merged
+
+
+_GEMINI_NON_AGENTIC_MARKERS: tuple[str, ...] = (
+    "embedding",
+    "aqa",
+    "image",
+    "tts",
+    "lyria",
+    "live",
+    "robotics",
+    "computer-use",
+    "deep-research",
+    "antigravity",
+    "nano-banana",
+)
+
+
+def _is_agentic_gemini_model(model_id: str, methods: Any) -> bool:
+    """Return True for Gemini/Gemma models suitable for the text-agent picker."""
+    mid = str(model_id or "").strip()
+    lower = mid.lower()
+    if mid.startswith("models/"):
+        mid = mid[len("models/"):]
+        lower = mid.lower()
+    if not (lower.startswith("gemini-") or lower.startswith("gemma-")):
+        return False
+    if any(marker in lower for marker in _GEMINI_NON_AGENTIC_MARKERS):
+        return False
+    if isinstance(methods, list):
+        method_names = {str(m) for m in methods}
+        return bool({"generateContent", "streamGenerateContent"} & method_names)
+    return True
+
+
+def fetch_gemini_models(
+    api_key: Optional[str],
+    base_url: Optional[str] = None,
+    timeout: float = 8.0,
+) -> Optional[list[str]]:
+    """Fetch Google Generative Language models and keep agentic text models."""
+    key = str(api_key or "").strip()
+    if not key:
+        return None
+    base = (base_url or "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
+    if not base:
+        return None
+    url = base + "/models?key=" + urllib.parse.quote(key)
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": _HERMES_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+    ids: list[str] = []
+    for item in payload.get("models", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name.startswith("models/"):
+            name = name[len("models/"):]
+        if name and _is_agentic_gemini_model(name, item.get("supportedGenerationMethods")):
+            ids.append(name)
+    return ids or None
+
+
+def fetch_cohere_models(
+    api_key: Optional[str],
+    base_url: Optional[str] = None,
+    timeout: float = 8.0,
+) -> Optional[list[str]]:
+    """Fetch Cohere chat-compatible models from the native model catalog.
+
+    Cohere's inference path can be OpenAI-compatible
+    (``/compatibility/v1``), while the native catalog is ``/v2/models`` and
+    returns ``models[].name`` rather than OpenAI-style ``data[].id``.
+    """
+    key = str(api_key or "").strip()
+    if not key:
+        return None
+    base = (base_url or "").strip().rstrip("/")
+    if "api.cohere.com" in base or not base:
+        url = "https://api.cohere.com/v2/models?endpoint=chat&page_size=1000"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+                "User-Agent": _HERMES_USER_AGENT,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode())
+        except Exception:
+            return None
+        ids = [
+            str(item.get("name") or item.get("id") or "").strip()
+            for item in payload.get("models", [])
+            if isinstance(item, dict)
+        ]
+        return [mid for mid in ids if mid] or None
+    return fetch_api_models(key, base, timeout=timeout)
+
+
+def _minimax_catalog_base_url(base_url: str) -> str:
+    """Map MiniMax Anthropic Messages inference bases to their models API base."""
+    stripped = str(base_url or "").strip().rstrip("/")
+    if stripped.endswith("/anthropic"):
+        return stripped[: -len("/anthropic")] + "/v1"
+    return stripped
+
+
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Return the best known model catalog for a provider.
 
@@ -2069,6 +2257,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     on the platform appear in ``/model`` without a Hermes release.
     """
     normalized = normalize_provider(provider)
+    curated_static = list(_PROVIDER_MODELS.get(normalized, []))
     if normalized == "openrouter":
         return model_ids(force_refresh=force_refresh)
     if normalized == "openai-codex":
@@ -2125,13 +2314,52 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             if api_key and base_url:
                 live = fetch_api_models(api_key, base_url)
                 if live:
-                    return live
+                    return _merge_live_with_curated(live, curated_static)
         except Exception:
             pass
     if normalized == "anthropic":
         live = _fetch_anthropic_models()
         if live:
             return live
+    if normalized == "gemini":
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials("gemini")
+            live = fetch_gemini_models(
+                str(creds.get("api_key") or "").strip(),
+                str(creds.get("base_url") or "").strip(),
+            )
+            if live:
+                return _merge_live_with_curated(live, curated_static)
+        except Exception:
+            pass
+    if normalized == "cohere":
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials("cohere")
+            live = fetch_cohere_models(
+                str(creds.get("api_key") or "").strip(),
+                str(creds.get("base_url") or "").strip(),
+            )
+            if live:
+                return _merge_live_with_curated(live, curated_static)
+        except Exception:
+            pass
+    if normalized in {"minimax", "minimax-cn"}:
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials(normalized)
+            api_key = str(creds.get("api_key") or "").strip()
+            base_url = _minimax_catalog_base_url(str(creds.get("base_url") or ""))
+            if api_key and base_url:
+                live = fetch_api_models(api_key, base_url)
+                if live:
+                    return _merge_live_with_curated(live, curated_static)
+        except Exception:
+            pass
     if normalized == "ollama-cloud":
         live = fetch_ollama_cloud_models(force_refresh=force_refresh)
         if live:
@@ -2180,7 +2408,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             if api_key and base_url:
                 live = fetch_api_models(api_key, base_url)
                 if live:
-                    return live
+                    return _merge_live_with_curated(live, curated_static)
         except Exception:
             pass
     if normalized == "custom":
@@ -2194,7 +2422,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             )
             live = fetch_api_models(api_key, base_url)
             if live:
-                return live
+                return _merge_live_with_curated(live, curated_static)
     # Bedrock uses live discovery keyed by the resolved AWS region so that
     # EU/AP users see eu.*/ap.* model IDs instead of the static us.* list.
     # Note: early return intentionally skips _MODELS_DEV_PREFERRED merge
@@ -2225,17 +2453,18 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 api_key, base_url = "", _p.base_url
             if not base_url:
                 base_url = _p.base_url
+            if normalized in {"gemini", "cohere", "minimax", "minimax-cn"}:
+                return curated_static
             if api_key:
-                live = _p.fetch_models(api_key=api_key)
+                live = fetch_api_models(api_key, base_url, api_mode=_p.api_mode)
                 if live:
-                    return live
+                    return _merge_live_with_curated(live, curated_static)
             # Use profile's fallback_models if defined
             if _p.fallback_models:
-                return list(_p.fallback_models)
+                return _merge_live_with_curated(None, list(_p.fallback_models))
     except Exception:
         pass
 
-    curated_static = list(_PROVIDER_MODELS.get(normalized, []))
     if normalized in _MODELS_DEV_PREFERRED:
         return _merge_with_models_dev(normalized, curated_static)
     return curated_static
@@ -3666,8 +3895,9 @@ def validate_requested_model(
                 ),
             }
 
-    # MiniMax providers don't expose a /models endpoint — validate against
-    # the static catalog instead, similar to openai-codex.
+    # MiniMax's primary inference URL is Anthropic-compatible, and some
+    # accounts/regions do not expose an Anthropic-style model list. Validate
+    # against the best merged catalog and accept hidden/new IDs with a warning.
     if normalized in {"minimax", "minimax-cn"}:
         try:
             catalog_models = provider_model_ids(normalized)
@@ -3706,8 +3936,7 @@ def validate_requested_model(
                 "message": (
                     f"Note: `{requested}` was not found in the MiniMax catalog."
                     f"{suggestion_text}"
-                    "\n  MiniMax does not expose a /models endpoint, so Hermes cannot verify the model name."
-                    "\n  The model may still work if it exists on the server."
+                    "\n  The live MiniMax catalog can be account- or region-dependent, so the model may still work if it exists on the server."
                 ),
             }
 
