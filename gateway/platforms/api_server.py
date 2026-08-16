@@ -2108,6 +2108,33 @@ def _messages_with_retry_tool_prompt(
     return [{"role": "system", "content": prompt}, *messages]
 
 
+
+_TEXT_ONLY_RETRY_PROMPT = (
+    "Your previous response did not include any tool calls, but tools are available "
+    "and expected for this task. If the task is complete, state that explicitly. "
+    "Otherwise, use the provided tools now to make progress on the task — do not "
+    "just describe what you intend to do. Issue a tool call with concrete arguments."
+)
+
+
+def _messages_with_text_only_retry(
+    messages: List[Dict[str, Any]],
+    assistant_text: str,
+) -> List[Dict[str, Any]]:
+    """Append a prior assistant turn + tool-use retry prompt for text-only recovery.
+
+    The upstream model returned a text-only response (no tool calls) even though tools
+    were sent. We echo the assistant text back as a past assistant message and append a
+    follow-up user message that explicitly demands a tool call on the next turn. This
+    gives the model concrete context to retry against rather than starting fresh.
+    """
+    patched = list(messages)
+    if assistant_text:
+        patched.append({"role": "assistant", "content": assistant_text})
+    patched.append({"role": "user", "content": _TEXT_ONLY_RETRY_PROMPT})
+    return patched
+
+
 def _tool_schema_contains_bash(tools: Optional[list]) -> bool:
     if not tools:
         return False
@@ -7464,6 +7491,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Each provider attempt (API call) counts toward the limit.
             _max_provider_attempts = int(os.getenv("HERMES_CODE_MAX_PROVIDER_ATTEMPTS", "6") or "6")
             _provider_attempt_count = [0]  # mutable: incremented per actual attempt
+            _text_only_retry_state: Dict[tuple, int] = {}  # (kind, model) -> retry count for text-only retry tracking
 
             # Streaming passthrough: collect full response then stream as SSE
             if stream:
@@ -7829,37 +7857,73 @@ class APIServerAdapter(BasePlatformAdapter):
                                     pass
                                 tool_calls_out = []
                             if passthrough_tools and not tool_calls_out:
-                                # Text-only response: return it to the client as-is.
-                                # Previously this cascaded to the next provider via
-                                # _CodexPassthroughSkip, but that burned through the
-                                # entire fallback chain (4-150s each) only to return
-                                # an error.  OMP/clients handle text-only responses
-                                # fine — they can decide whether to re-prompt.
-                                try:
-                                    import pathlib
-                                    _diag_file = pathlib.Path("/tmp/text_only_diag.log")
-                                    _diag_file.parent.mkdir(parents=True, exist_ok=True)
-                                    with open(_diag_file, "a") as _f:
-                                        _f.write(f"--- {provider_model} (returned as-is) ---\n")
-                                        _f.write(f"tools_sent: {len(passthrough_tools)}\n")
-                                        _f.write(f"tool_names: {[t.get('function',{}).get('name','?') for t in passthrough_tools[:10]]}\n")
-                                        _f.write(f"content: {(content_out or '(empty)')[:1000]}\n")
-                                        _f.write(f"rc: {(reasoning_content_out or '(empty)')[:500]}\n")
-                                        _f.write(f"last_role: {passthrough_messages[-1].get('role', '?') if passthrough_messages else '?'}\n")
-                                        _f.write(f"msg_count: {len(passthrough_messages)}\n")
-                                        _f.write(f"\n")
-                                except Exception:
-                                    pass
-                                logger.warning(
-                                    "[hermes-code] %s text-only (tools=%d, content_len=%d) — returning to client as-is",
-                                    provider_model, len(passthrough_tools),
-                                    len(content_out) if content_out else 0,
+                                # Text-only response with tools sent: try once more on the same
+                                # provider with a tool-use retry prompt appended. Catches the
+                                # common failure mode where the model narrates its plan
+                                # ("I'll go do X") in text instead of emitting structured
+                                # tool_calls, which would otherwise cause OMP to mark the
+                                # turn complete with no action taken.
+                                # Falls through to the existing "return as-is" path on the
+                                # second text-only response (i.e. the model truly has nothing
+                                # to call).
+                                _text_only_retries_left = int(
+                                    os.getenv("HERMES_CODE_TEXT_ONLY_RETRY", "1") or "1"
                                 )
-                                try:
-                                    from agent.model_quality_db import record_text_only
-                                    record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
-                                except Exception:
-                                    pass
+                                _retry_key = ("text_only_retry", provider_model)
+                                _already_retried = _text_only_retry_state.get(_retry_key, 0)
+                                if (
+                                    _text_only_retries_left > 0
+                                    and _already_retried < _text_only_retries_left
+                                    and content_out
+                                    and content_out.strip()
+                                ):
+                                    _text_only_retry_state[_retry_key] = _already_retried + 1
+                                    passthrough_messages = _messages_with_text_only_retry(
+                                        passthrough_messages, content_out,
+                                    )
+                                    logger.warning(
+                                        "[hermes-code][req=%s] %s text-only (attempt %d/%d) — "
+                                        "injecting tool-use prompt, next provider will receive retry",
+                                        _req_id, provider_model,
+                                        _already_retried + 1, _text_only_retries_left,
+                                    )
+                                    continue
+
+                            # Text-only response: return it to the client as-is.
+                            # Previously this cascaded to the next provider via
+                            # _CodexPassthroughSkip, but that burned through the
+                            # entire fallback chain (4-150s each) only to return
+                            # an error.  OMP/clients handle text-only responses
+                            # fine — they can decide whether to re-prompt.
+                            try:
+                                import pathlib
+                                _diag_file = pathlib.Path("/tmp/text_only_diag.log")
+                                _diag_file.parent.mkdir(parents=True, exist_ok=True)
+                                with open(_diag_file, "a") as _f:
+                                    _f.write(f"--- {provider_model} (returned as-is) ---\n")
+                                    _f.write(f"tools_sent: {len(passthrough_tools)}\n")
+                                    _tool_names = [t.get('function',{}).get('name','?') for t in passthrough_tools[:10]]
+                                    _f.write(f"tool_names: {_tool_names}\n")
+                                    _f.write(f"content: {(content_out or '(empty)')[:1000]}\n")
+                                    _f.write(f"rc: {(reasoning_content_out or '(empty)')[:500]}\n")
+                                    _last_role = passthrough_messages[-1].get('role', '?') if passthrough_messages else '?'
+                                    _f.write(f"last_role: {_last_role}\n")
+                                    _f.write(f"msg_count: {len(passthrough_messages)}\n")
+                                    _f.write(f"text_only_retries_used: {_already_retried}\n")
+                                    _f.write(f"\n")
+                            except Exception:
+                                pass
+                            logger.warning(
+                                "[hermes-code] %s text-only (tools=%d, content_len=%d retries=%d) — returning to client as-is",
+                                provider_model, len(passthrough_tools),
+                                len(content_out) if content_out else 0,
+                                _already_retried,
+                            )
+                            try:
+                                from agent.model_quality_db import record_text_only
+                                record_text_only(provider_model.split("/")[0], provider_model, base_url=base_url or "")
+                            except Exception:
+                                pass
                             try:
                                 from agent.model_cooldown_db import mark_provider_success
                                 _cb_prov = provider_model.split("/")[0] if "/" in provider_model else "copilot"
@@ -10443,14 +10507,46 @@ class APIServerAdapter(BasePlatformAdapter):
                                 provider_model,
                             )
                         elif not tool_calls_out:
+                            # Text-only response with tools sent: try once more on the
+                            # next provider with a tool-use retry prompt appended. Catches
+                            # the common failure mode where the model narrates its plan
+                            # ("I'll go do X") in text instead of emitting structured
+                            # tool_calls, which would otherwise cause OMP to mark the
+                            # turn complete with no action taken. Falls through to the
+                            # existing "return as-is" path on the second text-only
+                            # response (i.e. the model truly has nothing to call).
+                            _text_only_retries_left = int(
+                                os.getenv("HERMES_CODE_TEXT_ONLY_RETRY", "1") or "1"
+                            )
+                            _retry_key = ("text_only_retry", provider_model)
+                            _already_retried = _text_only_retry_state.get(_retry_key, 0)
+                            if (
+                                _text_only_retries_left > 0
+                                and _already_retried < _text_only_retries_left
+                                and content
+                                and content.strip()
+                            ):
+                                _text_only_retry_state[_retry_key] = _already_retried + 1
+                                passthrough_messages = _messages_with_text_only_retry(
+                                    passthrough_messages, content,
+                                )
+                                logger.warning(
+                                    "[hermes-code][req=%s] %s text-only (attempt %d/%d) — "
+                                    "injecting tool-use prompt, next provider will receive retry",
+                                    _req_id, provider_model,
+                                    _already_retried + 1, _text_only_retries_left,
+                                )
+                                continue
+
                             # Text-only response: return it to the client as-is.
                             # Previously this cascaded to the next provider, but
                             # that burned through the entire fallback chain only
                             # to return an error.  Clients handle text-only fine.
                             logger.warning(
-                                "[hermes-code] %s text-only (tools=%d, content_len=%d) — returning to client as-is",
+                                "[hermes-code] %s text-only (tools=%d, content_len=%d retries=%d) — returning to client as-is",
                                 provider_model, len(passthrough_tools),
                                 len(content) if content else 0,
+                                _already_retried,
                             )
                             try:
                                 from agent.model_quality_db import record_text_only
