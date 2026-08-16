@@ -1943,6 +1943,15 @@ _CLIENT_TOOL_EQUIVALENTS: Dict[str, Tuple[str, ...]] = {
     # Shell aliases.
     "terminal": ("bash", "shell"),
     "shell": ("bash", "terminal"),
+    # Memory tool aliases. OMP advertises `recall`; models with broader priors
+    # commonly emit memory_recall/recall_memory etc. Map them back to `recall`.
+    "memory_recall": ("recall",),
+    "recall_memory": ("recall",),
+    "memory_search": ("recall",),
+    # Similarly for reflect/retain.
+    "memory_reflect": ("reflect",),
+    "reflect_memory": ("reflect",),
+    "memory_retain": ("retain",),
 }
 
 
