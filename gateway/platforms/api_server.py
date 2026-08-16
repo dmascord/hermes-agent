@@ -3249,8 +3249,8 @@ def _build_hermes_privacy_model_pool() -> List[str]:
     """Build the privacy model pool from HERMES_PRIVACY_MODEL and HERMES_PRIVACY_FALLBACK_{N}.
 
     Mirrors _build_hermes_code_model_pool() but reads the parallel HERMES_PRIVACY_*
-    env-var prefix. Only models explicitly configured here are included — the privacy
-    chain is fully operator-controlled, never inheriting from HERMES_CODE_*.
+    env-var prefix. Env-configured entries keep priority, but entries outside the
+    privacy fallback allowlist are dropped before automatic discovery is appended.
     """
     configured = os.getenv("HERMES_PRIVACY_MODEL", "").strip()
     candidates: List[str] = [configured] if configured else []
@@ -3270,6 +3270,12 @@ def _build_hermes_privacy_model_pool() -> List[str]:
         if "\n" in model or "HERMES_PRIVACY_" in model:
             logger.warning(
                 "[api_server] ignoring malformed HERMES_PRIVACY model candidate: %s",
+                model,
+            )
+            continue
+        if _passthrough_fallback_provider_excluded(model, privacy=True):
+            logger.warning(
+                "[api_server] ignoring non-privacy HERMES_PRIVACY model candidate: %s",
                 model,
             )
             continue

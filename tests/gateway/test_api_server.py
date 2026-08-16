@@ -171,12 +171,14 @@ class TestDynamicPassthroughFallbacks:
     def test_hermes_privacy_uses_privacy_allowed_discovery_only(self, monkeypatch):
         self._patch_catalogs(monkeypatch)
         monkeypatch.setenv("HERMES_PRIVACY_MODEL", "openai/gpt-5.6-sol")
+        monkeypatch.setenv("HERMES_PRIVACY_FALLBACK_1", "google/gemini-2.5-flash")
         monkeypatch.setenv("HERMES_PRIVACY_DYNAMIC_FALLBACKS", "true")
-        for idx in range(1, 65):
+        for idx in range(2, 65):
             monkeypatch.delenv(f"HERMES_PRIVACY_FALLBACK_{idx}", raising=False)
 
         pool = _build_hermes_privacy_model_pool()
 
+        assert "google/gemini-2.5-flash" not in pool
         assert "github-copilot-enterprise/gpt-5.6-sol" in pool
         assert "openai/gpt-5.4-mini" in pool
         assert "opencode-go/minimax-m3" in pool
