@@ -594,6 +594,7 @@ def _close_codex_http_clients() -> None:
 _HERMES_CODE_SESSION_STICKY: Dict[str, Dict[str, Any]] = {}
 _HERMES_CODE_SESSION_STICKY_TTL = 12 * 60 * 60.0
 _HERMES_CODE_SESSION_STICKY_MAX = 4096
+_HERMES_CODE_STICKY_DISABLED = bool(os.getenv("HERMES_DISABLE_SESSION_STICKY", "").strip())
 # Session-level sticky hermes-privacy routing (separate registry from
 # hermes-code so code and privacy traffic don't cross-contaminate).
 _HERMES_PRIVACY_SESSION_STICKY: Dict[str, Dict[str, Any]] = {}
@@ -5274,7 +5275,7 @@ def _find_last_nonempty_user_message(
     for msg in reversed(conversation_messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
             content = msg.get("content", "")
-            if _normalize_chat_content(content).strip():
+            if _content_has_visible_payload(content):
                 return content
     return ""
 
@@ -5656,6 +5657,103 @@ def _normalize_chat_content(
         return ""
 
 
+def _content_has_visible_payload(content: Any) -> bool:
+    """Return True when content has user-visible text or supported media."""
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for item in content[:MAX_CONTENT_LIST_SIZE]:
+            if isinstance(item, str) and item.strip():
+                return True
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip().lower()
+            if item_type in {"text", "input_text", "output_text"}:
+                if str(item.get("text", "") or "").strip():
+                    return True
+            elif item_type in {"image_url", "input_image", "input_audio", "audio_url"}:
+                return True
+        return False
+    return bool(_normalize_chat_content(content).strip())
+
+
+def _normalize_multimodal_content(content: Any) -> Any:
+    """Validate and canonicalize chat/Responses content.
+
+    Text-only content collapses to a string. Image-bearing content is kept as
+    OpenAI chat-compatible typed parts so vision-capable routes can receive it.
+    Unsupported file/document/audio forms are rejected early with a 400 instead
+    of leaking into provider or agent internals as a 500.
+    """
+    if content is None or isinstance(content, str):
+        return _normalize_chat_content(content)
+    if not isinstance(content, list):
+        return _normalize_chat_content(content)
+
+    out: List[Any] = []
+    has_media = False
+    items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+    for item in items:
+        if isinstance(item, str):
+            if item:
+                out.append({"type": "text", "text": item[:MAX_NORMALIZED_TEXT_LENGTH]})
+            continue
+        if not isinstance(item, dict):
+            text = _normalize_chat_content(item)
+            if text:
+                out.append({"type": "text", "text": text})
+            continue
+
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type in {"text", "input_text", "output_text"}:
+            text = _normalize_chat_content(item.get("text", ""))
+            if text:
+                out.append({"type": "text", "text": text})
+            continue
+
+        if item_type in {"image_url", "input_image"}:
+            image_value = item.get("image_url", {})
+            if isinstance(image_value, dict):
+                url = str(image_value.get("url", "") or "")
+                detail = image_value.get("detail")
+            else:
+                url = str(image_value or "")
+                detail = None
+            if not url:
+                raise ValueError("invalid_image_url: missing image_url.url")
+            if not (
+                url.startswith("http://")
+                or url.startswith("https://")
+                or url.startswith("data:image/")
+            ):
+                if url.startswith("data:"):
+                    raise ValueError("unsupported_content_type: only image data URLs are supported")
+                raise ValueError("invalid_image_url: image URLs must use http, https, or data:image")
+            image_part: Dict[str, Any] = {"type": "image_url", "image_url": {"url": url}}
+            if detail is not None:
+                image_part["image_url"]["detail"] = detail
+            out.append(image_part)
+            has_media = True
+            continue
+
+        if item_type in {"file", "input_file", "document", "input_audio", "audio_url", "audio"}:
+            raise ValueError(f"unsupported_content_type: {item_type or 'unknown'}")
+        raise ValueError(f"unsupported_content_type: {item_type or 'unknown'}")
+
+    if has_media:
+        return out
+    return _normalize_chat_content(out)
+
+
+def _content_validation_error(exc: ValueError, *, param: str) -> "web.Response":
+    message = str(exc)
+    code = "unsupported_content_type" if message.startswith("unsupported_content_type:") else "invalid_image_url"
+    return web.json_response(
+        _openai_error(message, param=param, code=code),
+        status=400,
+    )
+
+
 def _preserve_multimodal_chat_content(content: Any) -> Any:
     """Return raw multimodal content when present, else normalized text.
 
@@ -5663,9 +5761,7 @@ def _preserve_multimodal_chat_content(content: Any) -> Any:
     unchanged to upstream providers. Non-list scalar content is normalized to a
     plain string for compatibility with the rest of the API server pipeline.
     """
-    if isinstance(content, list):
-        return content
-    return _normalize_chat_content(content)
+    return _normalize_multimodal_content(content)
 
 
 # Content types that are valid Anthropic blocks but unsupported/unknown to
@@ -7140,11 +7236,22 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = None
         conversation_messages: List[Dict[str, Any]] = []
 
-        for msg in messages:
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                return web.json_response(
+                    _openai_error(
+                        f"messages[{idx}] must be an object",
+                        param=f"messages[{idx}]",
+                    ),
+                    status=400,
+                )
             role = msg.get("role", "")
             raw_content = msg.get("content", "")
-            content = _normalize_chat_content(raw_content)
-            preserved_content = _preserve_multimodal_chat_content(raw_content)
+            try:
+                preserved_content = _preserve_multimodal_chat_content(raw_content)
+            except ValueError as exc:
+                return _content_validation_error(exc, param=f"messages[{idx}].content")
+            content = _normalize_chat_content(preserved_content)
             if role == "system":
                 if system_prompt is None:
                     system_prompt = content
@@ -7178,7 +7285,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if last_message.get("role") == "user":
                 raw_last_content = last_message.get("content", "") or ""
                 user_message = _unwrap_omp_system_reminder(raw_last_content)
-                if user_message is not raw_last_content:
+                if user_message != raw_last_content:
                     logger.info(
                         "[api_server] stripped OMP system-reminder wrapper from user message; "
                         "original len=%d unwrapped len=%d preview=%r",
@@ -7192,7 +7299,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # find the most recent non-blank user message so Hermes has
                 # something meaningful to act on rather than producing the
                 # "It looks like your message came through empty!" response.
-                if not _normalize_chat_content(user_message).strip():
+                if not _content_has_visible_payload(user_message):
                     # If the prior assistant message had tool_calls, the agent
                     # is mid-loop — pass history as-is so it continues
                     # processing the tool results rather than replaying a stale
@@ -7245,7 +7352,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Tool loop prevention: allow legitimate OpenAI tool continuation
         # (assistant tool_calls -> tool results), but reject orphaned tool-only
         # continuations that have no preceding assistant tool call context.
-        has_user_msg = bool(_normalize_chat_content(user_message).strip())
+        has_user_msg = _content_has_visible_payload(user_message)
         is_tool_result_only = bool(
             conversation_messages and
             conversation_messages[-1].get("role") == "tool"
@@ -7458,7 +7565,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if system_prompt:
                 passthrough_messages.append({"role": "system", "content": system_prompt})
             passthrough_messages.extend(history)
-            if _normalize_chat_content(user_message).strip():
+            if _content_has_visible_payload(user_message):
                 passthrough_messages.append({"role": "user", "content": user_message})
 
             # reasoning_content handling: some providers (DeepSeek thinking mode,
@@ -12474,16 +12581,19 @@ class APIServerAdapter(BasePlatformAdapter):
             # No error if conversation doesn't exist yet — it's a new conversation
 
         # Normalize input to message list
-        input_messages: List[Dict[str, str]] = []
+        input_messages: List[Dict[str, Any]] = []
         if isinstance(raw_input, str):
             input_messages = [{"role": "user", "content": raw_input}]
         elif isinstance(raw_input, list):
-            for item in raw_input:
+            for idx, item in enumerate(raw_input):
                 if isinstance(item, str):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
-                    content = _normalize_chat_content(item.get("content", ""))
+                    try:
+                        content = _normalize_multimodal_content(item.get("content", ""))
+                    except ValueError as exc:
+                        return _content_validation_error(exc, param=f"input[{idx}].content")
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -12492,7 +12602,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # This lets stateless clients supply their own history instead of
         # relying on server-side response chaining via previous_response_id.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        conversation_history: List[Dict[str, Any]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -12531,14 +12641,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Post-compaction continuation: pi/opencode sends a compaction summary
         # as the last assistant message with no following user message.
-        if not user_message and last_input_msg and last_input_msg.get("role") == "assistant" and _is_post_compaction_assistant_message(last_input_msg.get("content", "")):
-            user_message = _infer_intent_from_compaction_summary(last_input_msg.get("content", ""))
+        if (
+            not _content_has_visible_payload(user_message)
+            and last_input_msg
+            and last_input_msg.get("role") == "assistant"
+            and _is_post_compaction_assistant_message(_normalize_chat_content(last_input_msg.get("content", "")))
+        ):
+            user_message = _infer_intent_from_compaction_summary(_normalize_chat_content(last_input_msg.get("content", "")))
             conversation_history.append(last_input_msg)
             logger.info(
                 "[api_server][responses] post-compaction continuation — inferred intent: %s",
                 user_message[:200],
             )
-        elif not user_message.strip() and last_input_msg and last_input_msg.get("role") == "user":
+        elif not _content_has_visible_payload(user_message) and last_input_msg and last_input_msg.get("role") == "user":
             # Empty user message at end of a tool cycle (pi/opencode "please continue" signal).
             # If the prior assistant message had tool_calls, the agent is mid-loop — let
             # it continue processing tool results rather than injecting a stale user prompt.
@@ -12554,11 +12669,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     logger.info(
                         "[api_server][responses] empty user message at end of cycle — "
                         "using last non-empty user message as continuation: %s",
-                        user_message[:200],
+                        _normalize_chat_content(user_message)[:200],
                     )
                 else:
                     return web.json_response(_openai_error("No user message found in input"), status=400)
-        elif not user_message:
+        elif not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         # Truncation support
