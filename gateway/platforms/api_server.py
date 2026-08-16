@@ -2897,6 +2897,120 @@ _HERMES_CODE_DEFAULT_MAX_FALLBACKS = 64
 _HERMES_CODE_LARGE_CONTEXT_MIN = 512_000
 _HERMES_CODE_LARGE_CONTEXT_TRIGGER = 96_000
 _HERMES_CODE_ADVERTISED_CONTEXT_LIMIT = 256_000
+_HERMES_CODE_DYNAMIC_FALLBACK_CACHE: tuple[float, List[str]] | None = None
+_HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE: tuple[float, List[str]] | None = None
+_HERMES_CODE_DYNAMIC_FALLBACK_TTL_SECONDS = 600.0
+
+
+_HERMES_CODE_DYNAMIC_PROVIDER_MODEL_HINTS: tuple[tuple[str, str, tuple[str, ...], bool], ...] = (
+    (
+        "copilot",
+        "github-copilot-enterprise",
+        (
+            "claude-sonnet-4.6",
+            "claude-opus-4.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+        ),
+        True,
+    ),
+    (
+        "openai-codex",
+        "openai",
+        (
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "codex-auto-review",
+        ),
+        True,
+    ),
+    (
+        "opencode-go",
+        "opencode-go",
+        (
+            "minimax-m3",
+            "minimax-m2.7",
+            "glm-5.2",
+            "glm-5.1",
+            "qwen3.8-max",
+            "qwen3.7-max",
+            "qwen3.6-plus",
+            "qwen3.5-plus",
+            "deepseek-v4-flash",
+            "mimo-v2.5-pro",
+        ),
+        True,
+    ),
+    (
+        "ollama-cloud",
+        "ollama-cloud",
+        (
+            "glm-5.1",
+            "deepseek-v4-flash:preview",
+            "mistral-large-3:675b",
+            "kimi-k2.6",
+            "minimax-m3",
+            "kimi-k2.7-code",
+            "gpt-oss:20b",
+            "minimax-m2.7",
+        ),
+        True,
+    ),
+    (
+        "opencode-zen",
+        "opencode-zen",
+        (
+            "deepseek-v4-flash-free",
+            "mimo-v2.5-free",
+            "hy3-free",
+            "nemotron-3-ultra-free",
+            "nemotron-3.5-lightning-free",
+            "laguna-s-2.1-free",
+            "gemini-3-flash",
+            "minimax-m2.7",
+            "minimax-m2.5-free",
+            "north-mini-code-free",
+        ),
+        False,
+    ),
+    (
+        "openrouter",
+        "openrouter",
+        (
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "nvidia/nemotron-3.5-lightning:free",
+            "dots-studio/dots-3-note-preview:free",
+            "google/gemma-4-31b-it:free",
+            "google/gemma-4-26b-a4b-it:free",
+            "cohere/north-mini-code:free",
+            "openai/gpt-oss-20b:free",
+            "openrouter/free",
+        ),
+        False,
+    ),
+    ("minimax", "minimax", ("MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"), False),
+    ("zai", "zai", ("glm-5.2", "glm-5.1", "glm-5", "glm-4.7"), False),
+    ("gemini", "google", ("gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-flash-preview"), False),
+    ("cohere", "cohere", ("command-a-plus-05-2026", "command-a-03-2025", "north-mini-code-1-0"), False),
+)
+
+
+_HERMES_PRIVACY_STATIC_DYNAMIC_MODELS: tuple[str, ...] = (
+    "claude-code-cli",
+    "ollama/qwen3-coder-next",
+    "ollama-mac/shirdel-coder-9b-claude-fable-5:latest",
+    "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",
+)
 
 
 def _hermes_code_max_fallbacks() -> int:
@@ -2904,6 +3018,75 @@ def _hermes_code_max_fallbacks() -> int:
         return max(1, int(os.getenv("HERMES_CODE_MAX_FALLBACKS", str(_HERMES_CODE_DEFAULT_MAX_FALLBACKS))))
     except Exception:
         return _HERMES_CODE_DEFAULT_MAX_FALLBACKS
+
+
+def _passthrough_dynamic_catalog_fallbacks(*, privacy: bool = False) -> List[str]:
+    """Return live-discovered passthrough fallbacks for hermes-code/privacy.
+
+    ``hermes-code`` gets broad discovery across configured coding-capable
+    providers. ``hermes-privacy`` uses the same live catalog machinery but only
+    includes providers marked privacy-safe in
+    ``_HERMES_CODE_DYNAMIC_PROVIDER_MODEL_HINTS`` plus local/CLI static entries.
+    """
+    global _HERMES_CODE_DYNAMIC_FALLBACK_CACHE, _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE
+
+    env_name = "HERMES_PRIVACY_DYNAMIC_FALLBACKS" if privacy else "HERMES_CODE_DYNAMIC_FALLBACKS"
+    if os.getenv(env_name, "true").strip().lower() in ("0", "false", "no"):
+        return []
+
+    now = time.time()
+    cache = _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE if privacy else _HERMES_CODE_DYNAMIC_FALLBACK_CACHE
+    if cache is not None:
+        cached_at, cached_models = cache
+        if now - cached_at < _HERMES_CODE_DYNAMIC_FALLBACK_TTL_SECONDS:
+            return list(cached_models)
+
+    try:
+        from hermes_cli.models import provider_model_ids
+    except Exception:
+        return []
+
+    discovered: List[str] = []
+    if privacy:
+        discovered.extend(_HERMES_PRIVACY_STATIC_DYNAMIC_MODELS)
+
+    for catalog_provider, route_prefix, preferred_ids, privacy_allowed in _HERMES_CODE_DYNAMIC_PROVIDER_MODEL_HINTS:
+        if privacy and not privacy_allowed:
+            continue
+        try:
+            live_ids = provider_model_ids(catalog_provider)
+        except Exception as exc:
+            logger.debug(
+                "[hermes-code] live catalog fetch failed for %s privacy=%s: %s",
+                catalog_provider,
+                privacy,
+                exc,
+            )
+            continue
+        if not live_ids:
+            continue
+        live_by_lower = {str(mid).lower(): str(mid) for mid in live_ids if str(mid or "").strip()}
+        for preferred in preferred_ids:
+            live = live_by_lower.get(str(preferred).lower())
+            if not live:
+                continue
+            model_id = f"{route_prefix}/{live}" if route_prefix else live
+            discovered.append(model_id)
+
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for model in discovered:
+        text = str(model or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+
+    if privacy:
+        _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE = (now, deduped)
+    else:
+        _HERMES_CODE_DYNAMIC_FALLBACK_CACHE = (now, deduped)
+    return list(deduped)
 
 
 def _provider_prefix_from_model(model: str) -> str:
@@ -2926,7 +3109,10 @@ def _passthrough_fallback_provider_excluded(model: str, *, privacy: bool = False
     if not prefix:
         return False
     env_name = "HERMES_PRIVACY_EXCLUDED_FALLBACK_PROVIDERS" if privacy else "HERMES_CODE_EXCLUDED_FALLBACK_PROVIDERS"
-    default = "openai-codex,claude-code-cli,mimocode-cli" if privacy else "mimocode-cli"
+    default = (
+        "mimocode-cli,openrouter,opencode-zen,google,zai,minimax,cohere,xiaomi,"
+        "nvidia,anthropic,cerebras,groq,arliai,synthetic,synthetic-anthropic"
+    ) if privacy else "mimocode-cli"
     raw = os.getenv(env_name, default)
     excluded = {item.strip().lower() for item in str(raw or "").split(",") if item.strip()}
     return prefix in excluded
@@ -3039,6 +3225,7 @@ def _build_hermes_code_model_pool() -> List[str]:
         fb = os.getenv(f"HERMES_CODE_FALLBACK_{idx}", "").strip()
         if fb:
             candidates.append(fb)
+    candidates.extend(_passthrough_dynamic_catalog_fallbacks(privacy=False))
 
 
     seen: set[str] = set()
@@ -3071,6 +3258,7 @@ def _build_hermes_privacy_model_pool() -> List[str]:
         fb = os.getenv(f"HERMES_PRIVACY_FALLBACK_{idx}", "").strip()
         if fb:
             candidates.append(fb)
+    candidates.extend(_passthrough_dynamic_catalog_fallbacks(privacy=True))
 
     seen: set[str] = set()
     ordered: List[str] = []

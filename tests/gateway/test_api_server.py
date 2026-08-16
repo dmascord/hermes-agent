@@ -49,6 +49,9 @@ from gateway.platforms.api_server import (
     _fallback_provider_for_model,
     _openrouter_nonfree_blocked,
     _build_swarm_model_pool,
+    _build_hermes_code_model_pool,
+    _build_hermes_privacy_model_pool,
+    _passthrough_fallback_provider_excluded,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -125,6 +128,67 @@ class TestDynamicSwarmFallbacks:
         assert "opencode-zen/hy3-free" in pool["fallbacks"]
         assert "opencode-zen/mimo-v2.5-free" in pool["fallbacks"]
         assert "minimax/MiniMax-M3" in pool["fallbacks"]
+
+
+class TestDynamicPassthroughFallbacks:
+    def _patch_catalogs(self, monkeypatch):
+        def fake_provider_model_ids(provider):
+            catalogs = {
+                "copilot": ["gpt-5.6-sol", "claude-sonnet-4.6"],
+                "openai-codex": ["gpt-5.6-sol", "gpt-5.4-mini"],
+                "opencode-go": ["minimax-m3", "qwen3.6-plus"],
+                "ollama-cloud": ["glm-5.1", "minimax-m3"],
+                "opencode-zen": ["hy3-free", "mimo-v2.5-free"],
+                "openrouter": ["cohere/north-mini-code:free", "openrouter/free"],
+                "minimax": ["MiniMax-M3"],
+                "zai": ["glm-5.2"],
+                "gemini": ["gemini-2.5-flash"],
+                "cohere": ["command-a-plus-05-2026"],
+            }
+            return catalogs.get(provider, [])
+
+        monkeypatch.setattr("hermes_cli.models.provider_model_ids", fake_provider_model_ids)
+        monkeypatch.setattr("gateway.platforms.api_server._HERMES_CODE_DYNAMIC_FALLBACK_CACHE", None)
+        monkeypatch.setattr("gateway.platforms.api_server._HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE", None)
+
+    def test_hermes_code_appends_broad_live_discovery(self, monkeypatch):
+        self._patch_catalogs(monkeypatch)
+        monkeypatch.setenv("HERMES_CODE_MODEL", "github-copilot-enterprise/gpt-5.6-sol")
+        monkeypatch.setenv("HERMES_CODE_FALLBACK_1", "minimax/MiniMax-M2.7")
+        monkeypatch.setenv("HERMES_CODE_DYNAMIC_FALLBACKS", "true")
+        for idx in range(2, 65):
+            monkeypatch.delenv(f"HERMES_CODE_FALLBACK_{idx}", raising=False)
+
+        pool = _build_hermes_code_model_pool()
+
+        assert pool[:2] == ["github-copilot-enterprise/gpt-5.6-sol", "minimax/MiniMax-M2.7"]
+        assert "openai/gpt-5.4-mini" in pool
+        assert "opencode-go/minimax-m3" in pool
+        assert "opencode-zen/hy3-free" in pool
+        assert "openrouter/cohere/north-mini-code:free" in pool
+        assert "minimax/MiniMax-M3" in pool
+
+    def test_hermes_privacy_uses_privacy_allowed_discovery_only(self, monkeypatch):
+        self._patch_catalogs(monkeypatch)
+        monkeypatch.setenv("HERMES_PRIVACY_MODEL", "openai/gpt-5.6-sol")
+        monkeypatch.setenv("HERMES_PRIVACY_DYNAMIC_FALLBACKS", "true")
+        for idx in range(1, 65):
+            monkeypatch.delenv(f"HERMES_PRIVACY_FALLBACK_{idx}", raising=False)
+
+        pool = _build_hermes_privacy_model_pool()
+
+        assert "github-copilot-enterprise/gpt-5.6-sol" in pool
+        assert "openai/gpt-5.4-mini" in pool
+        assert "opencode-go/minimax-m3" in pool
+        assert "ollama-cloud/glm-5.1" in pool
+        assert "claude-code-cli" in pool
+        assert "opencode-zen/hy3-free" not in pool
+        assert "openrouter/cohere/north-mini-code:free" not in pool
+        assert "minimax/MiniMax-M3" not in pool
+        assert _passthrough_fallback_provider_excluded("openai/gpt-5.6-sol", privacy=True) is False
+        assert _passthrough_fallback_provider_excluded("claude-code-cli", privacy=True) is False
+        assert _passthrough_fallback_provider_excluded("opencode-zen/hy3-free", privacy=True) is True
+        assert _passthrough_fallback_provider_excluded("openrouter/cohere/north-mini-code:free", privacy=True) is True
 
     def test_session_limit_assistant_content_is_provider_exhaustion(self):
         assert _is_provider_exhaustion_content("You've hit your session limit · resets 10:10am (UTC)") is True
