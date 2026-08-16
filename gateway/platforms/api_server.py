@@ -1145,6 +1145,70 @@ _PROVIDER_BILLING_MODE: Dict[str, str] = {
 
 _OPENROUTER_FREE_CACHE: Dict[str, tuple[float, bool]] = {}
 _OPENROUTER_FREE_CACHE_TTL_SECONDS = 300.0
+_SWARM_DYNAMIC_FALLBACK_CACHE: tuple[float, List[str]] | None = None
+_SWARM_DYNAMIC_FALLBACK_TTL_SECONDS = 600.0
+
+
+_SWARM_DYNAMIC_PROVIDER_MODEL_HINTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "opencode-go",
+        "opencode-go",
+        (
+            "minimax-m3",
+            "minimax-m2.7",
+            "glm-5.2",
+            "glm-5.1",
+            "qwen3.8-max",
+            "qwen3.7-max",
+            "qwen3.6-plus",
+            "qwen3.5-plus",
+            "deepseek-v4-flash",
+            "mimo-v2.5-pro",
+        ),
+    ),
+    (
+        "opencode-zen",
+        "opencode-zen",
+        (
+            "deepseek-v4-flash-free",
+            "mimo-v2.5-free",
+            "hy3-free",
+            "nemotron-3-ultra-free",
+            "nemotron-3.5-lightning-free",
+            "laguna-s-2.1-free",
+            "gemini-3-flash",
+            "minimax-m2.7",
+            "minimax-m2.5-free",
+            "north-mini-code-free",
+        ),
+    ),
+    ("minimax", "minimax", ("MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed")),
+    ("zai", "zai", ("glm-5.2", "glm-5.1", "glm-5", "glm-4.7")),
+    (
+        "ollama-cloud",
+        "ollama-cloud",
+        (
+            "glm-5.1",
+            "deepseek-v4-flash:preview",
+            "mistral-large-3:675b",
+            "kimi-k2.6",
+            "minimax-m3",
+            "kimi-k2.7-code",
+            "gpt-oss:20b",
+            "minimax-m2.7",
+        ),
+    ),
+    (
+        "gemini",
+        "google",
+        ("gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-flash-preview", "gemma-4-31b-it"),
+    ),
+    (
+        "cohere",
+        "cohere",
+        ("command-a-plus-05-2026", "command-a-03-2025", "command-r-plus-08-2024", "north-mini-code-1-0"),
+    ),
+)
 
 
 def _openrouter_nonfree_blocked(model_id: str) -> bool:
@@ -2705,6 +2769,57 @@ def _build_env_fallback_chain(prefix: str) -> List[Dict[str, Any]]:
     return chain
 
 
+def _swarm_dynamic_catalog_fallbacks() -> List[str]:
+    """Return live-discovered fallback models from configured subscription providers.
+
+    Env fallbacks are operator overrides and stay first. This function fills the
+    stale-catalog gap by taking a small provider-specific preference map and
+    intersecting it with each provider's live ``provider_model_ids()`` catalog.
+    The result is cached briefly so routing does not hit model endpoints on
+    every request.
+    """
+    global _SWARM_DYNAMIC_FALLBACK_CACHE
+    now = time.time()
+    if _SWARM_DYNAMIC_FALLBACK_CACHE is not None:
+        cached_at, cached_models = _SWARM_DYNAMIC_FALLBACK_CACHE
+        if now - cached_at < _SWARM_DYNAMIC_FALLBACK_TTL_SECONDS:
+            return list(cached_models)
+
+    try:
+        from hermes_cli.models import provider_model_ids
+    except Exception:
+        return []
+
+    discovered: List[str] = []
+    for catalog_provider, route_prefix, preferred_ids in _SWARM_DYNAMIC_PROVIDER_MODEL_HINTS:
+        try:
+            live_ids = provider_model_ids(catalog_provider)
+        except Exception as exc:
+            logger.debug("[swarm] live catalog fetch failed for %s: %s", catalog_provider, exc)
+            continue
+        if not live_ids:
+            continue
+        live_by_lower = {str(mid).lower(): str(mid) for mid in live_ids if str(mid or "").strip()}
+        for preferred in preferred_ids:
+            live = live_by_lower.get(str(preferred).lower())
+            if not live:
+                continue
+            model_id = f"{route_prefix}/{live}" if route_prefix else live
+            discovered.append(model_id)
+
+    # De-duplicate while preserving preference order.
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for model in discovered:
+        if model in seen:
+            continue
+        seen.add(model)
+        deduped.append(model)
+
+    _SWARM_DYNAMIC_FALLBACK_CACHE = (now, deduped)
+    return list(deduped)
+
+
 def _build_swarm_model_pool(*, estimated_tokens: int = 0, routing_hint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build hermes-swarm routing config from environment variables."""
     primary = os.getenv("HERMES_SWARM_PRIMARY_MODEL", "ollama/qwen3-coder-next").strip()
@@ -2713,6 +2828,8 @@ def _build_swarm_model_pool(*, estimated_tokens: int = 0, routing_hint: Optional
         fb = os.getenv(f"HERMES_SWARM_FALLBACK_{idx}", "").strip()
         if fb:
             fallback_chain.append(fb)
+    if os.getenv("HERMES_SWARM_DYNAMIC_FALLBACKS", "true").strip().lower() not in ("0", "false", "no"):
+        fallback_chain.extend(_swarm_dynamic_catalog_fallbacks())
 
     seen = set()
     deduped: List[str] = []

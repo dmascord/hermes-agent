@@ -48,6 +48,7 @@ from gateway.platforms.api_server import (
     _extract_text_tool_calls_for_passthrough,
     _fallback_provider_for_model,
     _openrouter_nonfree_blocked,
+    _build_swarm_model_pool,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -95,6 +96,35 @@ class TestOpenRouterFallbackRouting:
             "nvidia/nemotron-3-super-120b-a12b:free",
         )
         assert _openrouter_nonfree_blocked("openrouter/nvidia/nemotron-3-super-120b-a12b:free") is False
+
+
+class TestDynamicSwarmFallbacks:
+    def test_live_provider_catalogs_are_appended_after_env_fallbacks(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SWARM_PRIMARY_MODEL", "ollama/qwen3-coder-next")
+        monkeypatch.setenv("HERMES_SWARM_FALLBACK_1", "minimax/MiniMax-M2.7")
+        monkeypatch.setenv("HERMES_SWARM_DYNAMIC_FALLBACKS", "true")
+        for idx in range(2, 33):
+            monkeypatch.delenv(f"HERMES_SWARM_FALLBACK_{idx}", raising=False)
+
+        def fake_provider_model_ids(provider):
+            catalogs = {
+                "opencode-go": ["minimax-m3", "qwen3.6-plus"],
+                "opencode-zen": ["hy3-free", "mimo-v2.5-free"],
+                "minimax": ["MiniMax-M3", "MiniMax-M2.7"],
+            }
+            return catalogs.get(provider, [])
+
+        monkeypatch.setattr("hermes_cli.models.provider_model_ids", fake_provider_model_ids)
+        monkeypatch.setattr("gateway.platforms.api_server._SWARM_DYNAMIC_FALLBACK_CACHE", None)
+
+        pool = _build_swarm_model_pool()
+
+        assert pool["fallbacks"][:2] == ["ollama/qwen3-coder-next", "minimax/MiniMax-M2.7"]
+        assert "opencode-go/minimax-m3" in pool["fallbacks"]
+        assert "opencode-go/qwen3.6-plus" in pool["fallbacks"]
+        assert "opencode-zen/hy3-free" in pool["fallbacks"]
+        assert "opencode-zen/mimo-v2.5-free" in pool["fallbacks"]
+        assert "minimax/MiniMax-M3" in pool["fallbacks"]
 
     def test_session_limit_assistant_content_is_provider_exhaustion(self):
         assert _is_provider_exhaustion_content("You've hit your session limit · resets 10:10am (UTC)") is True
