@@ -1980,7 +1980,7 @@ def _resolve_client_tool_name(name: Any, advertised_names: Optional[set[str]] = 
     return None
 
 
-def _enrich_client_tool_call(tc: Dict[str, Any], advertised_names: Optional[set[str]] = None) -> Optional[Dict[str, Any]]:
+def _enrich_client_tool_call(tc: Dict[str, Any], advertised_names: Optional[set[str]] = None) -> Dict[str, Any]:
     """Ensure client-visible tool calls satisfy strict downstream schemas."""
     if not isinstance(tc, dict):
         return tc
@@ -1989,7 +1989,12 @@ def _enrich_client_tool_call(tc: Dict[str, Any], advertised_names: Optional[set[
         return tc
     name = _resolve_client_tool_name(fn.get("name"), advertised_names)
     if not name:
-        return None
+        # Tool name is not in OMP's advertised list and not in the equivalence
+        # map. Pass the original tool call through to OMP unchanged so it can
+        # see the model tried to call it and respond with a tool-not-found
+        # error. Better than silently stripping — the model can learn and
+        # retry with a tool OMP actually has.
+        return tc
     fn["name"] = name
     arguments = fn.get("arguments", "{}")
     if isinstance(arguments, str):
@@ -2371,14 +2376,27 @@ def _enrich_client_tool_calls(tool_calls: Any, advertised_tools: Any = None) -> 
             continue
         item = _enrich_client_tool_call(dict(tc), advertised_names)
         if item is not None:
+            # Detect whether the name was rewritten (mapped) or passed through.
+            # If the original name was not in advertised_names and not in the
+            # equivalence map, the tool call is being forwarded to OMP as-is
+            # so OMP can respond with a tool-not-found error.
+            orig_fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            orig_name = orig_fn.get("name") if isinstance(orig_fn, dict) else None
+            new_fn = item.get("function") if isinstance(item.get("function"), dict) else {}
+            new_name = new_fn.get("name") if isinstance(new_fn, dict) else None
+            if orig_name and new_name and orig_name != new_name:
+                logger.info(
+                    "[hermes-code] mapped tool call %r -> %r",
+                    orig_name, new_name,
+                )
+            elif orig_name and advertised_names is not None:
+                _orig_norm = _normalize_external_tool_name(orig_name)
+                if _orig_norm not in advertised_names:
+                    logger.warning(
+                        "[hermes-code] passing through unmapped tool call name=%r advertised=%s",
+                        orig_name, sorted(advertised_names),
+                    )
             enriched.append(item)
-        else:
-            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-            logger.warning(
-                "[hermes-code] dropping unmapped client tool call name=%r advertised=%s",
-                fn.get("name") if isinstance(fn, dict) else None,
-                sorted(advertised_names or []),
-            )
     return enriched
 
 
