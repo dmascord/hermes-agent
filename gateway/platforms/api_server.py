@@ -536,15 +536,22 @@ _FALLBACK_CHAIN_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 _SELECTABLE_POOL_CACHE: List[str] = []
 _SELECTABLE_POOL_CACHE_AT: float = 0.0
 _SELECTABLE_POOL_CACHE_TTL = 300.0  # 5 min; invalidated on provider failure, passthrough checks cooldown per-attempt
+_PRIVACY_SELECTABLE_POOL_CACHE: List[str] = []
+_PRIVACY_SELECTABLE_POOL_CACHE_AT: float = 0.0
+_PRIVACY_SELECTABLE_POOL_CACHE_TTL = 300.0
 _CODEX_HTTP_CLIENTS: Dict[str, Any] = {}
 _CODEX_HTTP_CLIENT_LOCK = threading.Lock()
 
 
 def _invalidate_selectable_pool_cache() -> None:
-    """Force next call to _ordered_hermes_code_selectable_pool to re-evaluate all models."""
-    global _SELECTABLE_POOL_CACHE  # noqa: PLW0603
+    """Force next call to _ordered_hermes_code_selectable_pool to re-evaluate all models.
+    Also invalidates the privacy selectable pool cache since both rely on the
+    same credential pool / cooldown DB state and a provider failure should
+    invalidate both.
+    """
+    global _SELECTABLE_POOL_CACHE, _PRIVACY_SELECTABLE_POOL_CACHE  # noqa: PLW0603
     _SELECTABLE_POOL_CACHE = []
-
+    _PRIVACY_SELECTABLE_POOL_CACHE = []
 
 def _codex_http_client(effective_base: str) -> Any:
     """Return a process-level sync httpx client for Codex passthrough."""
@@ -587,7 +594,11 @@ def _close_codex_http_clients() -> None:
 _HERMES_CODE_SESSION_STICKY: Dict[str, Dict[str, Any]] = {}
 _HERMES_CODE_SESSION_STICKY_TTL = 12 * 60 * 60.0
 _HERMES_CODE_SESSION_STICKY_MAX = 4096
-_HERMES_CODE_STICKY_DISABLED = bool(os.getenv("HERMES_DISABLE_SESSION_STICKY", "").strip())
+# Session-level sticky hermes-privacy routing (separate registry from
+# hermes-code so code and privacy traffic don't cross-contaminate).
+_HERMES_PRIVACY_SESSION_STICKY: Dict[str, Dict[str, Any]] = {}
+_HERMES_PRIVACY_SESSION_STICKY_TTL = 12 * 60 * 60.0
+_HERMES_PRIVACY_SESSION_STICKY_MAX = 2048
 # Session collision registry.
 # Problem: two OMP clients with the same first message + same IP/UA get the
 # same base session ID.  The registry resolves this without requiring any
@@ -3033,7 +3044,7 @@ _HERMES_CODE_DYNAMIC_PROVIDER_MODEL_HINTS: tuple[tuple[str, str, tuple[str, ...]
             "deepseek-v4-flash",
             "mimo-v2.5-pro",
         ),
-        True,
+        False,  # opencode-go is a multi-provider aggregator; opaque TOS — not ZDR-safe
     ),
     (
         "ollama-cloud",
@@ -3194,8 +3205,9 @@ def _passthrough_fallback_provider_excluded(model: str, *, privacy: bool = False
         return False
     env_name = "HERMES_PRIVACY_EXCLUDED_FALLBACK_PROVIDERS" if privacy else "HERMES_CODE_EXCLUDED_FALLBACK_PROVIDERS"
     default = (
-        "mimocode-cli,openrouter,opencode-zen,google,zai,minimax,cohere,xiaomi,"
-        "nvidia,anthropic,cerebras,groq,arliai,synthetic,synthetic-anthropic"
+        "mimocode-cli,claude-code-cli,openrouter,opencode-zen,opencode-go,google,zai,"
+        "minimax,cohere,xiaomi,nvidia,anthropic,cerebras,groq,arliai,synthetic,"
+        "synthetic-anthropic"
     ) if privacy else "mimocode-cli"
     raw = os.getenv(env_name, default)
     excluded = {item.strip().lower() for item in str(raw or "").split(",") if item.strip()}
@@ -3288,19 +3300,25 @@ def _hermes_code_skip_toxic_fallback(provider_model: str) -> bool:
     """Return True if a fallback entry has accumulated extreme recent failures.
 
     Some models (e.g. ``opencode-go/deepseek-v4-pro``) are repeatedly broken and
-    re-entering the cooldown DB at 300s per trip would still let the swarm hit
-    them every ~5 minutes.  After three recent failures we hard-skip them for
-    the rest of the process lifetime.
+    re-entering the cooldown DB at the configured cooldown window per trip would
+    still let the swarm hit them every cycle.  After N recent failures we
+    hard-skip them for the rest of the process lifetime.  The threshold is
+    configurable via ``HERMES_CODE_TOXIC_FAILURE_THRESHOLD`` (default 3) so the
+    same logic applies to any toxic model — not just a hardcoded one.
     """
     raw = str(provider_model or "").strip().lower()
-    if raw != "opencode-go/deepseek-v4-pro":
+    if not raw or "/" not in raw:
         return False
     try:
+        threshold = max(1, int(os.getenv("HERMES_CODE_TOXIC_FAILURE_THRESHOLD", "3")))
+    except Exception:
+        threshold = 3
+    try:
         from agent.model_cooldown_db import provider_failure_count
-        return provider_failure_count("opencode-go", "opencode-go/deepseek-v4-pro") >= 3
+        provider_prefix = raw.split("/", 1)[0]
+        return provider_failure_count(provider_prefix, raw) >= threshold
     except Exception:
         return False
-
 
 def _build_hermes_code_model_pool() -> List[str]:
     configured = os.getenv("HERMES_CODE_MODEL", "").strip()
@@ -3597,6 +3615,88 @@ def _sticky_hermes_code_session_model(
     return model
 
 
+def _purge_hermes_privacy_session_sticky(now: Optional[float] = None) -> None:
+    now = time.time() if now is None else now
+    stale = [
+        session_id
+        for session_id, entry in _HERMES_PRIVACY_SESSION_STICKY.items()
+        if now - float(entry.get("last_seen_at") or entry.get("selected_at") or 0.0) > _HERMES_PRIVACY_SESSION_STICKY_TTL
+    ]
+    for session_id in stale:
+        _HERMES_PRIVACY_SESSION_STICKY.pop(session_id, None)
+    if len(_HERMES_PRIVACY_SESSION_STICKY) <= _HERMES_PRIVACY_SESSION_STICKY_MAX:
+        return
+    overflow = sorted(
+        _HERMES_PRIVACY_SESSION_STICKY.items(),
+        key=lambda item: float(item[1].get("last_seen_at") or item[1].get("selected_at") or 0.0),
+    )
+    for session_id, _ in overflow[: max(0, len(_HERMES_PRIVACY_SESSION_STICKY) - _HERMES_PRIVACY_SESSION_STICKY_MAX)]:
+        _HERMES_PRIVACY_SESSION_STICKY.pop(session_id, None)
+
+
+def _remember_hermes_privacy_session_model(session_id: Optional[str], model: str) -> None:
+    if _HERMES_CODE_STICKY_DISABLED:
+        return
+    session_key = str(session_id or "").strip()
+    chosen_model = str(model or "").strip()
+    if not session_key or not chosen_model:
+        return
+    now = time.time()
+    _purge_hermes_privacy_session_sticky(now)
+    _HERMES_PRIVACY_SESSION_STICKY[session_key] = {
+        "model": chosen_model,
+        "selected_at": now,
+        "last_seen_at": now,
+    }
+
+
+def _clear_hermes_privacy_session_model(session_id: Optional[str], reason: str = "") -> None:
+    session_key = str(session_id or "").strip()
+    if not session_key:
+        return
+    removed = _HERMES_PRIVACY_SESSION_STICKY.pop(session_key, None)
+    if removed and reason:
+        logger.info(
+            "[api_server] cleared sticky hermes-privacy model for session=%s model=%s reason=%s",
+            session_key,
+            removed.get("model"),
+            reason,
+        )
+
+
+def _sticky_hermes_privacy_session_model(
+    session_id: Optional[str], *, estimated_tokens: int = 0,
+) -> Optional[str]:
+    if _HERMES_CODE_STICKY_DISABLED:
+        return None
+    session_key = str(session_id or "").strip()
+    if not session_key:
+        return None
+    now = time.time()
+    _purge_hermes_privacy_session_sticky(now)
+    entry = _HERMES_PRIVACY_SESSION_STICKY.get(session_key)
+    if not entry:
+        return None
+    model = str(entry.get("model") or "").strip()
+    if not model:
+        _HERMES_PRIVACY_SESSION_STICKY.pop(session_key, None)
+        return None
+    if not _hermes_privacy_model_is_selectable(model):
+        _clear_hermes_privacy_session_model(session_key, reason="model_unavailable")
+        return None
+    if estimated_tokens > 0 and not _model_can_handle_context(model, estimated_tokens):
+        _clear_hermes_privacy_session_model(session_key, reason=f"context_mismatch:{estimated_tokens}")
+        return None
+    entry["last_seen_at"] = now
+    logger.info(
+        "[api_server] reusing sticky hermes-privacy model for session=%s model=%s est_tokens=%s",
+        session_key,
+        model,
+        estimated_tokens,
+    )
+    return model
+
+
 def _normalize_model_for_runtime_provider(model: str, runtime_provider: str) -> str:
     """Normalize explicit provider-prefixed models to provider-native ids.
 
@@ -3752,13 +3852,25 @@ def _hermes_privacy_model_is_selectable(model: str) -> bool:
 
 
 def _hermes_privacy_selectable_pool(*, estimated_tokens: int = 0) -> List[str]:
-    for model in _build_hermes_privacy_model_pool():
-        if _passthrough_fallback_provider_excluded(model, privacy=True):
-            continue
-        if _hermes_privacy_model_is_selectable(model):
-            return [model]
-    return []
-
+    global _PRIVACY_SELECTABLE_POOL_CACHE, _PRIVACY_SELECTABLE_POOL_CACHE_AT
+    now = time.time()
+    if _PRIVACY_SELECTABLE_POOL_CACHE and (now - _PRIVACY_SELECTABLE_POOL_CACHE_AT) < _PRIVACY_SELECTABLE_POOL_CACHE_TTL:
+        selectable = _PRIVACY_SELECTABLE_POOL_CACHE
+    else:
+        selectable = [
+            m for m in _build_hermes_privacy_model_pool()
+            if not _passthrough_fallback_provider_excluded(m, privacy=True)
+            and _hermes_privacy_model_is_selectable(m)
+        ]
+        _PRIVACY_SELECTABLE_POOL_CACHE = selectable
+        _PRIVACY_SELECTABLE_POOL_CACHE_AT = now
+    if not selectable:
+        return []
+    if estimated_tokens > 0:
+        fitting = [m for m in selectable if _model_can_handle_context(m, estimated_tokens)]
+        if fitting:
+            selectable = fitting
+    return selectable
 
 def _select_hermes_privacy_model(
     *,
@@ -3769,6 +3881,14 @@ def _select_hermes_privacy_model(
     avoid_external_image_incompatible: bool = False,
 ) -> str:
     """Select a model from the privacy-restricted chain."""
+    sticky = _sticky_hermes_privacy_session_model(session_id, estimated_tokens=estimated_tokens)
+    if sticky:
+        if require_vision and not _model_supports_vision(sticky):
+            sticky = None
+        elif avoid_external_image_incompatible and sticky.startswith("github-copilot"):
+            sticky = None
+    if sticky:
+        return sticky
     selectable = _hermes_privacy_selectable_pool(estimated_tokens=estimated_tokens)
     if require_vision:
         vision_models = [m for m in selectable if _model_supports_vision(m)]
@@ -3786,6 +3906,8 @@ def _select_hermes_privacy_model(
         if _hermes_privacy_model_is_selectable(model):
             return model
     return os.getenv("HERMES_PRIVACY_MODEL", "")
+
+
 
 
 def _hermes_privacy_advertised_context_length() -> int:
@@ -6584,7 +6706,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     model,
                     _resolved_base_url,
                 )
-                _remember_hermes_code_session_model(session_id, code_model or model)
+                if model_name == "hermes-privacy":
+                    _remember_hermes_privacy_session_model(session_id, code_model or model)
+                else:
+                    _remember_hermes_code_session_model(session_id, code_model or model)
 
         _t_cfg = time.time()
         user_config = _load_gateway_config()
