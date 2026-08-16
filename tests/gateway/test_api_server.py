@@ -43,6 +43,7 @@ from gateway.platforms.api_server import (
     _messages_with_retry_tool_prompt,
     _messages_with_provider_tool_prompt,
     _resolve_session_id,
+    _runtime_kwargs_for_model_id,
     _sanitize_passthrough_error_for_client,
     _extract_text_tool_calls_for_passthrough,
     check_api_server_requirements,
@@ -341,6 +342,44 @@ class TestProviderToolPrompt:
 
 
 class TestExplicitModelRuntimeAlignment:
+    def test_codex_fallback_runtime_selects_pool_entry(self):
+        """Fallback Codex resolution must rotate/select, not just peek at the pool."""
+        pool = MagicMock()
+        entry = MagicMock()
+        entry.runtime_api_key = "codex-token"
+        entry.runtime_base_url = ""
+        entry.base_url = "https://chatgpt.com/backend-api/codex"
+        entry.label = "codex-a"
+        pool.select.return_value = entry
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "OPENAI_API_KEY": "",
+                    "OPENAI_BASE_URL": "",
+                    "OPENAI_CODEX_API_KEY": "",
+                    "OPENAI_OAUTH_TOKEN": "",
+                    "OPENAI_CODEX_TOKEN": "",
+                    "CODEX_ACCESS_TOKEN": "",
+                },
+                clear=False,
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=RuntimeError("stale singleton"),
+            ),
+            patch("agent.credential_pool.load_pool", return_value=pool),
+        ):
+            runtime, resolved_model = _runtime_kwargs_for_model_id("openai-codex/gpt-5.3-codex")
+
+        assert resolved_model == "gpt-5.3-codex"
+        assert runtime["provider"] == "openai-codex"
+        assert runtime["api_key"] == "codex-token"
+        assert runtime["credential_pool"] is pool
+        pool.select.assert_called_once_with()
+        pool.peek.assert_not_called()
+
     def test_enterprise_copilot_model_prefers_enterprise_runtime(self):
         with patch(
             "gateway.platforms.api_server._runtime_kwargs_for_model_id",

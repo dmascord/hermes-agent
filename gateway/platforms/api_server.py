@@ -1337,7 +1337,7 @@ def _resolve_swarm_model(pool, *, context_overflow: bool = False, estimated_toke
                 return premium_choice
 
         if estimated_tokens > 8000:
-            premium = [m for m in candidates if "gpt-5.3-codex" in m or "gpt-5.2-codex" in m]
+            premium = [m for m in candidates if "gpt-5.6-" in m or "gpt-5.5" in m]
             if premium:
                 logger.info("[api_server] HIGH complexity (%s tokens) — using premium: %s", estimated_tokens, premium[0])
                 return premium[0]
@@ -2991,6 +2991,9 @@ _GHE_COPILOT_PASSTHROUGH_MODELS: tuple[tuple[str, str], ...] = (
     ("gpt-5.4",                   "OpenAI GPT-5.4 via GHE Copilot — vision, Responses API"),
     ("gpt-5.4-mini",              "OpenAI GPT-5.4-mini via GHE Copilot — vision, Responses API"),
     ("gpt-5.5",                   "OpenAI GPT-5.5 via GHE Copilot — vision, Responses API"),
+    ("gpt-5.6-sol",               "OpenAI GPT-5.6 Sol via GHE Copilot — vision, Responses API"),
+    ("gpt-5.6-terra",             "OpenAI GPT-5.6 Terra via GHE Copilot — vision, Responses API"),
+    ("gpt-5.6-luna",              "OpenAI GPT-5.6 Luna via GHE Copilot — vision, Responses API"),
     ("gpt-5-mini",                "OpenAI GPT-5-mini via GHE Copilot — Chat Completions API"),
     ("gpt-5.3-codex",             "OpenAI GPT-5.3-codex via GHE Copilot — agentic coding, Responses API"),
     ("gpt-4.1",                   "OpenAI GPT-4.1 via GHE Copilot"),
@@ -3004,7 +3007,7 @@ _GHE_COPILOT_PASSTHROUGH_MODELS: tuple[tuple[str, str], ...] = (
 )
 
 _GHE_PREFIX = "github-copilot-enterprise"
-_GHE_VISION_PREFIXES = ("claude-", "gemini-", "gpt-4o", "gpt-4.1", "gpt-5.4", "gpt-5.5", "gpt-5-mini")
+_GHE_VISION_PREFIXES = ("claude-", "gemini-", "gpt-4o", "gpt-4.1", "gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-5-mini")
 _GHE_CODEX_MARKERS = ("codex",)
 
 
@@ -4165,7 +4168,7 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
                         from agent.credential_pool import load_pool
 
                         _pool = load_pool("openai-codex")
-                        _entry = _pool.peek()
+                        _entry = _pool.select()
                         logger.warning("[hermes-code] codex pool: entry=%s runtime_api_key=%s", 
                             getattr(_entry, 'label', 'unknown') if _entry else 'NONE',
                             "SET" if getattr(_entry, 'runtime_api_key', None) else "EMPTY")
@@ -4292,7 +4295,7 @@ def _runtime_kwargs_for_model_id(model: str) -> tuple[Dict[str, Any], str]:
             try:
                 from agent.credential_pool import load_pool
                 _pool = load_pool("openai-codex")
-                _entry = _pool.peek()
+                _entry = _pool.select()
                 _codex_api_key = getattr(_entry, "runtime_api_key", "") if _entry else ""
                 if _codex_api_key:
                     runtime_kwargs["base_url"] = getattr(_entry, "runtime_base_url", None) or getattr(_entry, "base_url", "") or os.getenv("OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex")
@@ -12911,8 +12914,8 @@ class APIServerAdapter(BasePlatformAdapter):
         pool = swarm_model_pool or {}
         preferred_models = [
             os.getenv("HERMES_SWARM_VERIFY_MODEL", "").strip(),
+            "openai/gpt-5.6-sol",
             "openai/gpt-5.5",
-            "openai/gpt-5.3-codex",
             "google/gemini-2.5-flash",
             "openai/gpt-5-mini",
         ]

@@ -12,46 +12,29 @@ import os
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.5",
-    "gpt-5.4-mini",
     "gpt-5.4",
-    "gpt-5.3-codex",
-    # gpt-5.3-codex-spark is in research preview and is exposed *only* via
-    # the Codex CLI / OAuth backend (chatgpt.com/backend-api/codex/models)
-    # for ChatGPT Pro subscribers. It is NOT available in the public OpenAI
-    # API, so it intentionally stays out of the "openai" provider catalog
-    # in hermes_cli/models.py — only the openai-codex (OAuth) provider
-    # surfaces it. The Codex backend reports ``supported_in_api: false`` for
-    # this slug; that flag describes API availability, not Codex backend
-    # availability, so the fetch/cache code paths below intentionally do
-    # not filter on it. PR #12994 removed this entry on the assumption it
-    # was unsupported — that was wrong; restored here. Keep it in the
-    # curated fallback so Pro users still see Spark in `/model` when live
-    # discovery is unavailable (offline first run, transient API failure).
-    "gpt-5.3-codex-spark",
-    # NOTE: gpt-5.2-codex / gpt-5.1-codex-max / gpt-5.1-codex-mini were
-    # previously listed here but the chatgpt.com Codex backend returns
+    "gpt-5.4-mini",
+    "codex-auto-review",
+    # NOTE: gpt-5.3-codex / gpt-5.3-codex-spark / gpt-5.2-codex /
+    # gpt-5.1-codex-max / gpt-5.1-codex-mini were previously listed here
+    # but the chatgpt.com Codex backend now returns
     # HTTP 400 "The '<model>' model is not supported when using Codex with
-    # a ChatGPT account." for all three on every ChatGPT Pro account we've
-    # tested (verified live 2026-05-27). Keeping them in the fallback list
-    # leaked dead slugs into /model when live discovery was unavailable
-    # (transient API failure, first-run before refresh) and surfaced HTTP 400
-    # crashes on selection. The Codex CLI public catalog still references
-    # these slugs, which is why they survived previously — but those entries
-    # describe the public OpenAI API, not the OAuth-backed Codex backend
-    # Hermes uses. Removed here. If OpenAI re-enables them on Codex backend,
-    # live discovery will pick them up automatically via _fetch_models_from_api.
+    # a ChatGPT account." for them. Keeping dead slugs in the fallback list
+    # leaks them into /model when live discovery is unavailable and causes
+    # avoidable 400s. If OpenAI re-enables them on the Codex backend, live
+    # discovery will pick them up automatically via _fetch_models_from_api.
 ]
 
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
-    ("gpt-5.5", ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex")),
-    ("gpt-5.4-mini", ("gpt-5.3-codex",)),
-    ("gpt-5.4", ("gpt-5.3-codex",)),
-    # Surface Spark whenever any compatible Codex template is present so
-    # accounts hitting the live endpoint with an older lineup still see
-    # Spark in the picker. Backend gates real availability by ChatGPT Pro
-    # entitlement; Hermes does not.
-    ("gpt-5.3-codex-spark", ("gpt-5.3-codex",)),
+    ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4")),
+    ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4")),
+    ("gpt-5.6-luna", ("gpt-5.5", "gpt-5.4")),
+    ("gpt-5.5", ("gpt-5.4", "gpt-5.4-mini")),
+    ("gpt-5.4-mini", ("gpt-5.4",)),
 ]
 
 
@@ -106,8 +89,7 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
         slug = slug.strip()
         # Codex CLI's catalog uses ``supported_in_api`` for the public OpenAI
         # API, not for the OAuth-backed Codex backend that this provider uses.
-        # Some valid Codex CLI models (for example gpt-5.3-codex-spark) are
-        # marked false here but are still accepted by the Codex route.
+        # Some valid Codex backend-only models can be marked false here.
         visibility = item.get("visibility", "")
         if isinstance(visibility, str) and visibility.strip().lower() in {"hide", "hidden"}:
             continue
