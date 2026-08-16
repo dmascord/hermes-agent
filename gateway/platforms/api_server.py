@@ -7810,8 +7810,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                 finish_reason = getattr(response_obj.choices[0], "finish_reason", "stop")
                                 if tool_calls_out:
                                     finish_reason = "tool_calls"
-                                else:
-                                    finish_reason = "stop"
 
                             # ── Common variables and success marking ──
                             _skip_provider_exhaustion_content(
@@ -9809,8 +9807,6 @@ class APIServerAdapter(BasePlatformAdapter):
                             finish_reason = getattr(response_obj.choices[0], "finish_reason", "stop")
                             if tool_calls:
                                 finish_reason = "tool_calls"
-                            else:
-                                finish_reason = "stop"
 
                         # ── Common success marking + JSON response ──
                         try:
