@@ -92,20 +92,14 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     is_http_429 = status_code == 429
 
     # 1. Honour Retry-After header if the underlying HTTP response is attached.
-    # Check error body first to determine if this is a weekly/daily quota.
     body = str(exc).lower()
-    _is_quota_limit = any(kw in body for kw in ["weekly", "daily", "usage limit", "limitname", "session limit"])
-    _max = float(_os.getenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "0") or "0")
     try:
         retry_after = exc.response.headers.get("Retry-After") or exc.response.headers.get("retry-after")  # type: ignore[union-attr]
         if retry_after:
             _val = max(60.0, float(retry_after))
-            # For weekly/daily quotas, respect the full Retry-After value (providers like
-            # opencode-go return the exact reset time in this header). Only cap generic
-            # rate limits which have small Retry-After values (typically < 3600s).
-            if _is_quota_limit:
-                return _val
-            return _val if _max <= 0 else min(_val, _max)
+            # Retry-After is an explicit provider instruction. Honour it even
+            # when it is longer than the generic circuit-breaker cap.
+            return _val
     except Exception:
         pass
 
@@ -148,11 +142,10 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
             _unit = _reset_match.group(2)
             _multipliers = {"second": 1, "minute": 60, "hour": 3600}
             _raw = _amount * _multipliers.get(_unit, 3600)
-            return _raw if _max <= 0 else min(_raw, _max)
+            return float(_raw)
         _hour_match = _re.search(r'(\d+)\s*-?\s*hour', body)
         if _hour_match:
-            _raw = max(3600.0, int(_hour_match.group(1)) * 3600.0)
-            return _raw if _max <= 0 else min(_raw, _max)
+            return max(3600.0, int(_hour_match.group(1)) * 3600.0)
         if "hour" in body:
             return 3600.0
         return 600.0
@@ -165,8 +158,7 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
         _unit = _reset_match.group(2)
         _multipliers = {"second": 1, "minute": 60, "hour": 3600, "day": 86400, "week": 604800}
         _raw = _amount * _multipliers.get(_unit, 3600)
-        # Only cap hourly limits — weekly/daily limits should be respected.
-        return _raw if _max <= 0 else min(_raw, _max)
+        return float(_raw)
 
     if _has_quota_ctx and ("weekly" in body or "week" in body):
         # Weekly limit — respect the full window, don't cap it.
@@ -185,9 +177,7 @@ def _cooldown_seconds_for_429(exc: Exception) -> float:
     # "5 hour", "5-hour", "5hour" etc.
     _hour_match = _re.search(r'(\d+)\s*-?\s*hour', body)
     if _hour_match:
-        _raw = max(3600.0, int(_hour_match.group(1)) * 3600.0)
-        # Only cap hourly limits — they might be overly aggressive.
-        return _raw if _max <= 0 else min(_raw, _max)
+        return max(3600.0, int(_hour_match.group(1)) * 3600.0)
     if "hour" in body:
         return 3600.0
     # ChatGPT/Codex quota errors can say "resets 5am (UTC)" without a

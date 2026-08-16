@@ -74,12 +74,35 @@ class TestCheckRequirements:
 
 
 class TestPassthroughProviderExhaustion:
+    class _Response:
+        def __init__(self, headers, status_code=429):
+            self.headers = headers
+            self.status_code = status_code
+
+    class _HTTPError(Exception):
+        def __init__(self, message, headers, status_code=429):
+            super().__init__(message)
+            self.response = TestPassthroughProviderExhaustion._Response(headers, status_code=status_code)
+            self.status_code = status_code
+
     def test_codex_session_limit_is_fallback_exhaustion(self):
         exc = RuntimeError("codex passthrough HTTP 429: b\"You've hit your session limit · resets 5am (UTC)\"")
 
         assert _is_provider_exhaustion_error(exc) is True
         assert _cooldown_seconds_for_429(exc) >= 60.0
         assert _cooldown_seconds_for_429(exc) <= 24 * 3600.0
+
+    def test_retry_after_header_is_honoured_without_local_cap(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "3600")
+        exc = self._HTTPError("rate_limit_exceeded", {"Retry-After": "21600"})
+
+        assert _cooldown_seconds_for_429(exc) == 21600.0
+
+    def test_body_reset_window_is_honoured_without_local_cap(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MAX_CIRCUIT_BREAKER_COOLDOWN", "3600")
+        exc = self._HTTPError("usage limit exceeded; retry in 5 hours", {})
+
+        assert _cooldown_seconds_for_429(exc) == 5 * 3600.0
 
     def test_provider_exhaustion_message_is_sanitized_for_client(self):
         exc = RuntimeError("You've hit your session limit · resets 5am (UTC)")
