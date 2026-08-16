@@ -277,7 +277,23 @@ def test_auth_add_nous_oauth_honors_custom_label(tmp_path, monkeypatch):
 
 def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "singleton-access",
+                        "refresh_token": "singleton-refresh",
+                    },
+                    "last_refresh": "2026-03-22T10:00:00Z",
+                    "auth_mode": "chatgpt",
+                }
+            },
+        },
+    )
     token = _jwt_with_email("codex@example.com")
     monkeypatch.setattr(
         "hermes_cli.auth._codex_device_code_login",
@@ -303,11 +319,13 @@ def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
 
     payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     entries = payload["credential_pool"]["openai-codex"]
-    entry = next(item for item in entries if item["source"] == "device_code")
+    entry = next(item for item in entries if item["source"] == "manual:device_code:codex@example.com")
     assert payload["active_provider"] == "openai-codex"
-    assert payload["providers"]["openai-codex"]["tokens"]["access_token"] == token
+    assert payload["providers"]["openai-codex"]["tokens"]["access_token"] == "singleton-access"
+    assert payload["providers"]["openai-codex"]["tokens"]["refresh_token"] == "singleton-refresh"
     assert entry["label"] == "codex@example.com"
-    assert entry["source"] == "device_code"
+    assert entry["source"] == "manual:device_code:codex@example.com"
+    assert entry["access_token"] == token
     assert entry["refresh_token"] == "refresh-token"
     assert entry["base_url"] == "https://chatgpt.com/backend-api/codex"
 
@@ -1169,8 +1187,7 @@ def test_auth_add_codex_clears_suppression_marker(tmp_path, monkeypatch):
     assert "openai-codex" not in payload.get("suppressed_sources", {})
     # New pool entry must be present
     entries = payload["credential_pool"]["openai-codex"]
-    assert any(e["source"] == "device_code" for e in entries)
-    assert payload["active_provider"] == "openai-codex"
+    assert any(e["source"] == "manual:device_code:codex@example.com" for e in entries)
 
 
 def test_seed_from_singletons_respects_codex_suppression(tmp_path, monkeypatch):

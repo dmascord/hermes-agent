@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -110,6 +111,21 @@ def _api_key_default_label(count: int) -> str:
 
 def _display_source(source: str) -> str:
     return source.split(":", 1)[1] if source.startswith("manual:") else source
+
+
+def _codex_manual_device_code_source(label: str, existing_sources: set[str]) -> str:
+    slug = re.sub(r"[^a-z0-9_.@-]+", "-", (label or "").strip().lower()).strip("-")
+    if not slug:
+        slug = uuid.uuid4().hex[:8]
+    slug = slug[:96].strip("-") or uuid.uuid4().hex[:8]
+    source = f"{SOURCE_MANUAL}:device_code:{slug}"
+    if source not in existing_sources:
+        return source
+    for _ in range(20):
+        candidate = f"{source}:{uuid.uuid4().hex[:6]}"
+        if candidate not in existing_sources:
+            return candidate
+    return f"{source}:{uuid.uuid4().hex}"
 
 
 def _classify_exhausted_status(entry) -> tuple[str, bool]:
@@ -312,16 +328,26 @@ def auth_add_command(args) -> None:
             creds["tokens"]["access_token"],
             _oauth_default_label(provider, len(pool.entries()) + 1),
         )
-        auth_mod._save_codex_tokens(
-            creds["tokens"],
-            last_refresh=creds.get("last_refresh"),
+        expires_at_ms = None
+        expires_in = creds.get("expires_in")
+        if isinstance(expires_in, (int, float)) and expires_in > 0:
+            expires_at_ms = int(time.time() * 1000) + int(expires_in * 1000)
+        source = _codex_manual_device_code_source(label, {entry.source for entry in pool.entries()})
+        entry = PooledCredential(
+            provider=provider,
+            id=uuid.uuid4().hex[:6],
             label=label,
-            expires_in=creds.get("expires_in"),
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=source,
+            access_token=creds["tokens"]["access_token"],
+            refresh_token=creds["tokens"].get("refresh_token"),
+            expires_at_ms=expires_at_ms,
+            base_url=creds.get("base_url") or _provider_base_url(provider),
+            last_refresh=creds.get("last_refresh"),
         )
-        pool = load_pool(provider)
-        entry = next((item for item in pool.entries() if item.source == "device_code"), None)
-        shown_label = entry.label if entry is not None else label
-        print(f'Saved {provider} OAuth device-code credentials: "{shown_label}"')
+        entry = pool.add_entry(entry)
+        print(f'Added {provider} OAuth device-code credential #{len(pool.entries())}: "{entry.label}"')
         return
 
     if provider == "xai-oauth":
