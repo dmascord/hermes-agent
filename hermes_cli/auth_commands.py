@@ -6,6 +6,7 @@ import math
 import re
 import sys
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 import uuid
 
@@ -22,10 +23,12 @@ from agent.credential_pool import (
     PooledCredential,
     _exhausted_until,
     _normalize_custom_pool_name,
+    clear_pool_cache,
     get_pool_strategy,
     label_from_token,
     list_custom_pool_providers,
     load_pool,
+    write_credential_pool,
 )
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import PROVIDER_REGISTRY

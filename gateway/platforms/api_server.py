@@ -3215,6 +3215,39 @@ def _passthrough_fallback_provider_excluded(model: str, *, privacy: bool = False
     return prefix in excluded
 
 
+def _hermes_code_max_fallbacks() -> int:
+    try:
+        return max(1, int(os.getenv("HERMES_CODE_MAX_FALLBACKS", str(_HERMES_CODE_DEFAULT_MAX_FALLBACKS))))
+    except Exception:
+        return _HERMES_CODE_DEFAULT_MAX_FALLBACKS
+
+
+def _provider_prefix_from_model(model: str) -> str:
+    raw = str(model or "").strip().lower()
+    if not raw:
+        return ""
+    if "/" in raw:
+        return raw.split("/", 1)[0]
+    return raw
+
+
+def _passthrough_fallback_provider_excluded(model: str, *, privacy: bool = False) -> bool:
+    """Return True when a model family is disabled for automatic fallback.
+
+    Explicit model requests are still handled elsewhere in strict mode. This
+    guard only prevents background fallback selection from drifting into auth-
+    backed CLI providers that can sit silent or require fresh operator login.
+    """
+    prefix = _provider_prefix_from_model(model)
+    if not prefix:
+        return False
+    env_name = "HERMES_PRIVACY_EXCLUDED_FALLBACK_PROVIDERS" if privacy else "HERMES_CODE_EXCLUDED_FALLBACK_PROVIDERS"
+    default = "openai-codex,claude-code-cli,mimocode-cli" if privacy else "mimocode-cli"
+    raw = os.getenv(env_name, default)
+    excluded = {item.strip().lower() for item in str(raw or "").split(",") if item.strip()}
+    return prefix in excluded
+
+
 def _is_prompt_too_long_error(error_text: str) -> bool:
     """Detect upstream "context/prompt too large" error strings."""
     txt = str(error_text or "").lower()

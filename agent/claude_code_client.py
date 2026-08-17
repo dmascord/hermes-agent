@@ -187,7 +187,10 @@ def _claude_oauth_refresh_token(refresh_token: str, *, timeout: float = 15.0) ->
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")
-        except Exception as exc:
+        except urllib.error.HTTPError as exc:
+            # If any endpoint returns 400 or 401, it is a terminal failure.
+            if exc.code in (400, 401, 404):
+                raise
             last_error = exc
             continue
         data = json.loads(raw)
@@ -538,7 +541,7 @@ def _maybe_refresh_claude_oauth() -> bool:
                 pass
             # If the refresh token is dead (invalid_grant), write a tombstone
             # to auth.json to prevent repeated failed attempts
-            if exc.code in (400, 401):
+            if exc.code in (400, 401, 404):
                 _persist_claude_credentials_to_auth_json(
                     full_credentials={}, expires_at_ms=0,
                 )

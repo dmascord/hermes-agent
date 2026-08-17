@@ -955,6 +955,15 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 result = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            # 400/401 are terminal — the refresh token is dead. Do not mask
+            # the real failure with a 404 from a fallback endpoint that does
+            # not exist for this route.
+            if exc.code in (400, 401, 404):
+                raise
+            logger.debug("Anthropic token refresh failed at %s: %s", endpoint, exc)
+            last_error = exc
+            continue
         except Exception as exc:
             last_error = exc
             logger.debug("Anthropic token refresh failed at %s: %s", endpoint, exc)
