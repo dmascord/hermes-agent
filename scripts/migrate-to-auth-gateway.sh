@@ -67,12 +67,18 @@ set_secret_field() {
   if kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" \
       -o jsonpath="{.data.${key}}" 2>/dev/null | grep -q .; then
     kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type='json' \
-      -p="[{\"op\":\"replace\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]" \
-      2>/dev/null
+      -p="[{\"op\":\"replace\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]"
   else
     kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type='merge' \
-      -p="{\"data\": {\"${key}\": \"${b64}\"}}" \
-      2>/dev/null
+      -p="{\"data\": {\"${key}\": \"${b64}\"}}"
+  fi
+}
+
+generate_hex() {
+  if command -v openssl &>/dev/null; then
+    openssl rand -hex 32
+  else
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
   fi
 }
 wait_for_pod_ready() {
@@ -153,10 +159,7 @@ fi
 
 # ── Phase 3: Deploy sidecar + Traefik routing ───────────────────────────────
 
-info "Phase 3 — Deploying auth-sidecar + Traefik IngressRoute"
-
-kubectl apply -f "$INGROUTE_MANIFEST"
-ok "IngressRoute + Middleware + ClusterIP Service applied."
+info "Phase 3 — Deploying auth-sidecar"
 
 # The deployment already includes the sidecar container definition from
 # k8s/hermes-deployment.yaml.  Rolling update replaces the pod with one
@@ -165,6 +168,9 @@ kubectl apply -f "${REPO_ROOT}/k8s/hermes-deployment.yaml"
 ok "Deployment manifest applied."
 
 wait_for_pod_ready
+
+kubectl apply -f "$INGROUTE_MANIFEST"
+ok "IngressRoute + Middleware + ClusterIP Service applied."
 
 # ── Phase 3b: Verify ────────────────────────────────────────────────────────
 
