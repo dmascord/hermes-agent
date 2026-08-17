@@ -70,8 +70,8 @@ set_secret_field() {
       -p="[{\"op\":\"replace\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]" \
       2>/dev/null
   else
-    kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type='json' \
-      -p="[{\"op\":\"add\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]" \
+    kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type='merge' \
+      -p="{\"data\": {\"${key}\": \"${b64}\"}}" \
       2>/dev/null
   fi
 }
