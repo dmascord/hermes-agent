@@ -24,7 +24,7 @@
 #   - Hermes-env-vault already contains HERMES_API_KEYS_JSON and
 #     HERMES_INTERNAL_TOKEN is either absent or will be overwritten.
 #
-set -euxo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

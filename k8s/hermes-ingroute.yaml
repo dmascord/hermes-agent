@@ -16,6 +16,7 @@ spec:
   type: ClusterIP
   selector:
     app: hermes
+    hermes.tusker.net.au/auth-sidecar: "true"
   ports:
     - name: http-auth
       port: 8081
