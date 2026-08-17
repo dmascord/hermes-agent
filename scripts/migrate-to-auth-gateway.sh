@@ -64,8 +64,7 @@ set_secret_field() {
   local b64
   b64="$(echo -n "$value" | base64)"
   # Idempotent: add if absent, replace if present.
-  if kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" \
-      -o jsonpath="{.data.${key}}" 2>/dev/null | grep -q .; then
+  if kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data}' | grep -q "\"${key}\""; then
     kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type='json' \
       -p="[{\"op\":\"replace\",\"path\":\"/data/${key}\",\"value\":\"${b64}\"}]"
   else
@@ -73,7 +72,6 @@ set_secret_field() {
       -p="{\"data\": {\"${key}\": \"${b64}\"}}"
   fi
 }
-
 generate_hex() {
   if command -v openssl &>/dev/null; then
     openssl rand -hex 32
