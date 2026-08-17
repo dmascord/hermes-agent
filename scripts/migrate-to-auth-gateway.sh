@@ -62,7 +62,7 @@ get_secret_field() {
 set_secret_field() {
   local key="$1" value="$2"
   local b64
-  b64="$(echo -n "$value" | base64)"
+  b64="$(echo -n "$value" | base64 -w0)"
   # Idempotent: add if absent, replace if present.
   if kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data}' | grep -q "\"${key}\""; then
     kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type='json' \
