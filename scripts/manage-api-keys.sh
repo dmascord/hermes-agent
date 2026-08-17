@@ -45,6 +45,9 @@ case "${1:-}" in
     fi
     NEW_KEYS=$(echo "$KEYS" | jq --arg id "$ID" --arg sec "$SECRET" '.keys += [{"id": $id, "secret": $sec}]')
     save_keys "$NEW_KEYS"
+    if [ "${NORESTART:-0}" != "1" ]; then
+      kubectl rollout restart deployment/hermes -n "$NAMESPACE"
+    fi
     ok "Added key for '$ID': $SECRET"
     ;;
   revoke)
@@ -53,6 +56,9 @@ case "${1:-}" in
     KEYS=$(get_keys)
     NEW_KEYS=$(echo "$KEYS" | jq --arg id "$ID" 'del(.keys[] | select(.id == $id))')
     save_keys "$NEW_KEYS"
+    if [ "${NORESTART:-0}" != "1" ]; then
+      kubectl rollout restart deployment/hermes -n "$NAMESPACE"
+    fi
     ok "Revoked key for '$ID'"
     ;;
   *)
