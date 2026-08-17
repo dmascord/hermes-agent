@@ -30,6 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REGISTRY="${REGISTRY:-10.103.195.90:5000}"
 IMAGE="${REGISTRY}/hermes-auth-sidecar:latest"
+REGISTRY_TLS_VERIFY="${REGISTRY_TLS_VERIFY:-false}"
 NAMESPACE="${NAMESPACE:-hermes}"
 SECRET_NAME="hermes-env-vault"
 DEPLOY_NAME="hermes"
@@ -123,7 +124,7 @@ if command -v docker &>/dev/null; then
   docker push "$SIDECAR_IMAGE"
 elif command -v buildah &>/dev/null; then
   buildah bud -t "$SIDECAR_IMAGE" -f "${REPO_ROOT}/auth-sidecar/Dockerfile" "${REPO_ROOT}/auth-sidecar/"
-  buildah push "$SIDECAR_IMAGE"
+  buildah push --tls-verify="${REGISTRY_TLS_VERIFY}" "$SIDECAR_IMAGE"
 else
   fail "Neither docker nor buildah found on this host."
 fi
