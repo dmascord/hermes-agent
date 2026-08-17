@@ -1,0 +1,56 @@
+# Traefik routing layer for Hermes API auth.
+#
+# The `forwardAuth` Middleware calls the auth-sidecar ClusterIP service so the
+# client's API key is validated outside Hermes.  On success, the sidecar
+# replaces the Bearer token with the internal credential that Hermes accepts.
+#
+# NOTE: forwardAuth runs in the Traefik pod.  `address` must target the
+# ClusterIP service, not localhost, otherwise Traefik validates against itself.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-auth
+  namespace: hermes
+spec:
+  type: ClusterIP
+  selector:
+    app: hermes
+  ports:
+    - name: http-auth
+      port: 8081
+      targetPort: http-auth
+      protocol: TCP
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: hermes-api-auth
+  namespace: hermes
+spec:
+  forwardAuth:
+    # Route through the ClusterIP service so Traefik reaches the sidecar.
+    address: "http://hermes-auth.hermes.svc.cluster.local:8081/validate"
+    trustForwardHeader: true
+    authResponseHeaders:
+      - Authorization
+      - X-Hermes-Consumer
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: hermes-api
+  namespace: hermes
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`hermes.tusker.net.au`) && PathPrefix(`/v1/`)
+      kind: Rule
+      middlewares:
+        - name: hermes-api-auth
+      services:
+        - name: hermes
+          port: 8642
+  tls:
+    secretName: hermes-tls

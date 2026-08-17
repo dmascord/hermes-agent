@@ -32,6 +32,19 @@
 #
 # If you change `strategy` or the probe blocks, re-verify the rollout safety
 # properties with the test procedure at the bottom of `AGENTS.md`.
+#
+# ── Auth sidecar ────────────────────────────────────────────────────────────
+# This pod runs a second container, `auth-sidecar`, that Traefik calls via
+# forwardAuth (see hermes-ingroute.yaml) to validate client API keys before
+# forwarding /v1/* traffic.  On success the sidecar swaps the client key for
+# the internal token (HERMES_INTERNAL_TOKEN) and returns it in the
+# Authorization header, so client keys never reach Hermes.  Hermes itself
+# only ever accepts the internal token via API_SERVER_KEY.
+#
+# The sidecar reads exactly two env vars from hermes-env-vault:
+#   HERMES_API_KEYS_JSON  — JSON array of {id, secret} client keys
+#   HERMES_INTERNAL_TOKEN — the single token Hermes accepts
+# It does NOT inherit the rest of the vault (explicit env, not envFrom).
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -99,6 +112,9 @@ spec:
         - effect: NoSchedule
           key: node.kubernetes.io/disk-pressure
           operator: Exists
+      # ── Containers ─────────────────────────────────────────────────────
+      # The Hermes gateway plus the auth-sidecar that Traefik calls to
+      # validate client API keys before forwarding traffic.
       containers:
         - name: hermes
           image: 10.103.195.90:5000/hermes-agent:swarm-alpine-20260624181046
@@ -112,6 +128,16 @@ spec:
           env:
             - name: COPILOT_MONTHLY_AIU_LIMIT
               value: "3900"
+            # Hermes only accepts the internal token.  Traefik validates the
+            # client's key via the auth-sidecar and swaps in this token before
+            # forwarding, so client keys never reach Hermes.  This explicit
+            # entry overrides the API_SERVER_KEY that envFrom would otherwise
+            # surface from hermes-env-vault.
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-env-vault
+                  key: HERMES_INTERNAL_TOKEN
           envFrom:
             - secretRef:
                 name: hermes-env-vault
@@ -204,6 +230,51 @@ spec:
               mountPath: /home/tusker/.claude
             - name: hermes-data
               mountPath: /opt/data
+        - name: auth-sidecar
+          image: 10.103.195.90:5000/hermes-auth-sidecar:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/hermes-api-auth"]
+          ports:
+            - name: http-auth
+              containerPort: 8081
+              protocol: TCP
+          # Only the two keys this process needs — never the whole vault.
+          env:
+            - name: HERMES_API_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-env-vault
+                  key: HERMES_API_KEYS_JSON
+            - name: HERMES_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-env-vault
+                  key: HERMES_INTERNAL_TOKEN
+          resources:
+            limits:
+              cpu: "100m"
+              memory: 32Mi
+            requests:
+              cpu: 10m
+              memory: 8Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 1
       volumes:
         - name: hermes-home
           persistentVolumeClaim:
