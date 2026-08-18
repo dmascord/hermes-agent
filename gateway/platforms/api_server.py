@@ -769,6 +769,8 @@ def _resolve_session_id(
 
 _HERMES_CODE_RR_LOCK = threading.Lock()
 _HERMES_CODE_RR_INDEX = 0
+_HERMES_PRIVACY_RR_LOCK = threading.Lock()
+_HERMES_PRIVACY_RR_INDEX = 0
 
 # ---------------------------------------------------------------------------
 # Reasoning-content extraction helper
@@ -2996,6 +2998,30 @@ _HERMES_CODE_ADVERTISED_CONTEXT_LIMIT = 256_000
 _HERMES_CODE_DYNAMIC_FALLBACK_CACHE: tuple[float, List[str]] | None = None
 _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE: tuple[float, List[str]] | None = None
 _HERMES_CODE_DYNAMIC_FALLBACK_TTL_SECONDS = 600.0
+_HERMES_PREMIUM_DYNAMIC_FALLBACK_CACHE: tuple[float, List[str]] | None = None
+_HERMES_HEAVY_MODEL_OVERRIDES = frozenset({
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5",
+    "gpt-5.3-codex", "codex-auto-review", "deepseek-v4-pro",
+    "mistral-large-3:675b", "gemini-2.5-pro",
+    "command-a-plus-05-2026", "command-a-03-2025", "claude-sonnet-4.6", "claude-opus-4.6",
+})
+
+
+def _hermes_model_is_heavyweight(model: str) -> bool:
+    """Classify a routed model using catalog pricing plus slug overrides."""
+    raw = str(model or "").strip().lower()
+    if not raw:
+        return False
+    bare = raw.split("/", 1)[1] if "/" in raw else raw
+    if bare in _HERMES_HEAVY_MODEL_OVERRIDES:
+        return True
+    try:
+        from agent.models_dev import is_heavyweight_model
+        provider = raw.split("/", 1)[0] if "/" in raw else ""
+        provider = {"github-copilot-enterprise": "copilot"}.get(provider, provider)
+        return is_heavyweight_model(bare, provider)
+    except Exception:
+        return False
 
 
 _HERMES_CODE_DYNAMIC_PROVIDER_MODEL_HINTS: tuple[tuple[str, str, tuple[str, ...], bool], ...] = (
@@ -3116,22 +3142,32 @@ def _hermes_code_max_fallbacks() -> int:
         return _HERMES_CODE_DEFAULT_MAX_FALLBACKS
 
 
-def _passthrough_dynamic_catalog_fallbacks(*, privacy: bool = False) -> List[str]:
+def _passthrough_dynamic_catalog_fallbacks(*, privacy: bool = False, premium: bool = False) -> List[str]:
     """Return live-discovered passthrough fallbacks for hermes-code/privacy.
 
     ``hermes-code`` gets broad discovery across configured coding-capable
     providers. ``hermes-privacy`` uses the same live catalog machinery but only
     includes providers marked privacy-safe in
     ``_HERMES_CODE_DYNAMIC_PROVIDER_MODEL_HINTS`` plus local/CLI static entries.
+    ``hermes-premium`` shares the code discovery path but retains heavyweight
+    models that the default rotation excludes.
     """
-    global _HERMES_CODE_DYNAMIC_FALLBACK_CACHE, _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE
+    global _HERMES_CODE_DYNAMIC_FALLBACK_CACHE, _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE, _HERMES_PREMIUM_DYNAMIC_FALLBACK_CACHE
 
-    env_name = "HERMES_PRIVACY_DYNAMIC_FALLBACKS" if privacy else "HERMES_CODE_DYNAMIC_FALLBACKS"
+    env_name = (
+        "HERMES_PREMIUM_DYNAMIC_FALLBACKS" if premium
+        else "HERMES_PRIVACY_DYNAMIC_FALLBACKS" if privacy
+        else "HERMES_CODE_DYNAMIC_FALLBACKS"
+    )
     if os.getenv(env_name, "true").strip().lower() in ("0", "false", "no"):
         return []
 
     now = time.time()
-    cache = _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE if privacy else _HERMES_CODE_DYNAMIC_FALLBACK_CACHE
+    cache = (
+        _HERMES_PREMIUM_DYNAMIC_FALLBACK_CACHE if premium
+        else _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE if privacy
+        else _HERMES_CODE_DYNAMIC_FALLBACK_CACHE
+    )
     if cache is not None:
         cached_at, cached_models = cache
         if now - cached_at < _HERMES_CODE_DYNAMIC_FALLBACK_TTL_SECONDS:
@@ -3175,10 +3211,15 @@ def _passthrough_dynamic_catalog_fallbacks(*, privacy: bool = False) -> List[str
         text = str(model or "").strip()
         if not text or text in seen:
             continue
+        if not privacy and not premium and _hermes_model_is_heavyweight(text):
+            logger.debug("[api_server] excluding heavyweight model %s from default rotation", text)
+            continue
         seen.add(text)
         deduped.append(text)
 
-    if privacy:
+    if premium:
+        _HERMES_PREMIUM_DYNAMIC_FALLBACK_CACHE = (now, deduped)
+    elif privacy:
         _HERMES_PRIVACY_DYNAMIC_FALLBACK_CACHE = (now, deduped)
     else:
         _HERMES_CODE_DYNAMIC_FALLBACK_CACHE = (now, deduped)
@@ -3222,30 +3263,6 @@ def _hermes_code_max_fallbacks() -> int:
         return _HERMES_CODE_DEFAULT_MAX_FALLBACKS
 
 
-def _provider_prefix_from_model(model: str) -> str:
-    raw = str(model or "").strip().lower()
-    if not raw:
-        return ""
-    if "/" in raw:
-        return raw.split("/", 1)[0]
-    return raw
-
-
-def _passthrough_fallback_provider_excluded(model: str, *, privacy: bool = False) -> bool:
-    """Return True when a model family is disabled for automatic fallback.
-
-    Explicit model requests are still handled elsewhere in strict mode. This
-    guard only prevents background fallback selection from drifting into auth-
-    backed CLI providers that can sit silent or require fresh operator login.
-    """
-    prefix = _provider_prefix_from_model(model)
-    if not prefix:
-        return False
-    env_name = "HERMES_PRIVACY_EXCLUDED_FALLBACK_PROVIDERS" if privacy else "HERMES_CODE_EXCLUDED_FALLBACK_PROVIDERS"
-    default = "openai-codex,claude-code-cli,mimocode-cli" if privacy else "mimocode-cli"
-    raw = os.getenv(env_name, default)
-    excluded = {item.strip().lower() for item in str(raw or "").split(",") if item.strip()}
-    return prefix in excluded
 
 
 def _is_prompt_too_long_error(error_text: str) -> bool:
@@ -3457,6 +3474,41 @@ def _build_hermes_code_audio_pool() -> List[str]:
             logger.warning(
                 "[api_server] ignoring malformed HERMES_CODE_AUDIO model candidate: %s",
                 model,
+            )
+            continue
+        ordered.append(model)
+    return ordered
+
+
+def _build_hermes_premium_model_pool() -> List[str]:
+    """Build the premium model pool from HERMES_PREMIUM_MODEL and HERMES_PREMIUM_FALLBACK_{N}."""
+    configured = os.getenv("HERMES_PREMIUM_MODEL", "").strip()
+    candidates: List[str] = [configured] if configured else []
+    for idx in range(1, _hermes_code_max_fallbacks() + 1):
+        fb = os.getenv(f"HERMES_PREMIUM_FALLBACK_{idx}", "").strip()
+        if fb:
+            candidates.append(fb)
+    candidates.extend(_passthrough_dynamic_catalog_fallbacks(privacy=False, premium=True))
+
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for model in candidates:
+        model = str(model or "").strip()
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        if "\n" in model or "HERMES_PREMIUM_" in model:
+            logger.warning(
+                "[api_server] ignoring malformed HERMES_PREMIUM model candidate: %s",
+                model,
+            )
+            continue
+        remaining = _passthrough_model_health_cooldown(model)
+        if remaining > 0:
+            logger.info(
+                "[hermes-premium] ignoring unhealthy HERMES_PREMIUM model candidate %s (%.0fs remaining)",
+                model,
+                remaining,
             )
             continue
         ordered.append(model)
@@ -3831,6 +3883,17 @@ def _next_hermes_code_rr_index(window: int) -> int:
         return idx
 
 
+def _next_hermes_privacy_rr_index(window: int) -> int:
+    global _HERMES_PRIVACY_RR_INDEX
+    if window <= 1:
+        return 0
+    with _HERMES_PRIVACY_RR_LOCK:
+        idx = _HERMES_PRIVACY_RR_INDEX % window
+        _HERMES_PRIVACY_RR_INDEX = (_HERMES_PRIVACY_RR_INDEX + 1) % max(window, 1)
+        return idx
+
+
+
 def _select_hermes_code_model(
     *,
     estimated_tokens: int = 0,
@@ -3880,6 +3943,64 @@ def _select_hermes_code_model(
 
 
 
+
+def _hermes_premium_model_is_selectable(model: str) -> bool:
+    """Availability check for the premium model chain."""
+    return _hermes_code_model_is_selectable(model)
+
+
+def _hermes_premium_selectable_pool(*, estimated_tokens: int = 0) -> List[str]:
+    selectable = [
+        m for m in _build_hermes_premium_model_pool()
+        if _hermes_premium_model_is_selectable(m)
+    ]
+    if not selectable:
+        return []
+    if estimated_tokens > 0:
+        fitting = [m for m in selectable if _model_can_handle_context(m, estimated_tokens)]
+        if fitting:
+            selectable = fitting
+    return selectable
+
+
+def _select_hermes_premium_model(
+    *,
+    estimated_tokens: int = 0,
+    session_id: Optional[str] = None,
+    require_vision: bool = False,
+    require_audio: bool = False,
+    avoid_external_image_incompatible: bool = False,
+) -> str:
+    sticky = _sticky_hermes_code_session_model(session_id, estimated_tokens=estimated_tokens)
+    if sticky:
+        if require_vision and not _model_supports_vision(sticky):
+            sticky = None
+        elif avoid_external_image_incompatible and sticky.startswith("github-copilot"):
+            sticky = None
+    if sticky and sticky in _build_hermes_premium_model_pool():
+        return sticky
+    selectable = _hermes_premium_selectable_pool(estimated_tokens=estimated_tokens)
+    if require_vision:
+        vision_models = [m for m in selectable if _model_supports_vision(m)]
+        if vision_models:
+            selectable = vision_models
+    if avoid_external_image_incompatible:
+        compatible = [m for m in selectable if not m.startswith("github-copilot")]
+        if compatible:
+            selectable = compatible
+    if selectable:
+        try:
+            rr_window = max(1, int(os.getenv("HERMES_PREMIUM_ROUND_ROBIN_WINDOW", os.getenv("HERMES_CODE_ROUND_ROBIN_WINDOW", "3"))))
+        except Exception:
+            rr_window = 3
+        if rr_window > 1:
+            return selectable[_next_hermes_code_rr_index(min(rr_window, len(selectable)))]
+        return selectable[0]
+    for model in _build_hermes_premium_model_pool():
+        if _hermes_premium_model_is_selectable(model):
+            return model
+    return os.getenv("HERMES_PREMIUM_MODEL", "")
+
 def _hermes_privacy_model_is_selectable(model: str) -> bool:
     """Availability check for the privacy model chain. Reuses hermes-code machinery."""
     return _hermes_code_model_is_selectable(model)
@@ -3891,13 +4012,43 @@ def _hermes_privacy_selectable_pool(*, estimated_tokens: int = 0) -> List[str]:
     if _PRIVACY_SELECTABLE_POOL_CACHE and (now - _PRIVACY_SELECTABLE_POOL_CACHE_AT) < _PRIVACY_SELECTABLE_POOL_CACHE_TTL:
         selectable = _PRIVACY_SELECTABLE_POOL_CACHE
     else:
-        selectable = [
+        try:
+            from agent.model_quality_db import get_quality_score
+            _privacy_floor = float(os.getenv("HERMES_PRIVACY_QUALITY_FLOOR", "50.0") or 0.0)
+        except Exception:
+            _privacy_floor = 0.0
+        raw_pool = [
             m for m in _build_hermes_privacy_model_pool()
             if not _passthrough_fallback_provider_excluded(m, privacy=True)
             and _hermes_privacy_model_is_selectable(m)
         ]
-        _PRIVACY_SELECTABLE_POOL_CACHE = selectable
-        _PRIVACY_SELECTABLE_POOL_CACHE_AT = now
+        if _privacy_floor > 0:
+            _scored = []
+            for m in raw_pool:
+                try:
+                    prefix = m.split("/", 1)[0] if "/" in m else ""
+                    model_name = m.split("/", 1)[1] if "/" in m else m
+                    s = get_quality_score(prefix, model_name)
+                except Exception:
+                    s = 100.0  # no data → assume healthy
+                if s >= _privacy_floor:
+                    _scored.append(m)
+            selectable = _scored if _scored else raw_pool  # fall back to unfiltered if floor kills everything
+            # Sort by quality score descending so best models rotate first.
+            try:
+                from agent.model_quality_db import get_quality_score
+                def _privacy_sort_key(m: str) -> float:
+                    try:
+                        prefix = m.split("/", 1)[0] if "/" in m else ""
+                        model_name = m.split("/", 1)[1] if "/" in m else m
+                        return get_quality_score(prefix, model_name)
+                    except Exception:
+                        return 100.0  # no data → keep high rank
+                selectable.sort(key=_privacy_sort_key, reverse=True)
+            except Exception:
+                pass  # keep build order if scoring unavailable
+        else:
+            selectable = raw_pool
     if not selectable:
         return []
     if estimated_tokens > 0:
@@ -3933,6 +4084,12 @@ def _select_hermes_privacy_model(
         if compatible:
             selectable = compatible
     if selectable:
+        try:
+            rr_window = max(1, int(os.getenv("HERMES_PRIVACY_ROUND_ROBIN_WINDOW", "3")))
+        except Exception:
+            rr_window = 3
+        if rr_window > 1:
+            return selectable[_next_hermes_privacy_rr_index(min(rr_window, len(selectable)))]
         return selectable[0]
     for model in _build_hermes_privacy_model_pool():
         if _passthrough_fallback_provider_excluded(model, privacy=True):
@@ -7153,6 +7310,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
             },
             {
+                "id": "hermes-premium",
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": "hermes-premium",
+                "parent": None,
+                "description": f"Premium coding pool - heavyweight paid models retained. Currently selects: {_select_hermes_premium_model()}.",
+                "context_length": _hermes_code_advertised_context_length(),
+                "max_completion_tokens": _hermes_code_advertised_max_output_tokens(),
+                "context_window": {
+                    "context_length": _hermes_code_advertised_context_length(),
+                    "max_output_tokens": _hermes_code_advertised_max_output_tokens(),
+                },
+                "input": ["text", "image"],
+                "attachment": True,
+                "capabilities": {"input": ["text", "image"]},
+                "modalities": {"input": ["text", "image"]},
+                "metadata": {
+                    "selected_model": _select_hermes_premium_model(),
+                },
+            },
+            {
                 "id": "hermes-agentic-remote",
                 "object": "model",
                 "created": now,
@@ -7479,7 +7659,7 @@ class APIServerAdapter(BasePlatformAdapter):
         _provider_mode = False
         if model_name == "hermes-agentic-full":
             _toolset_mode = "full"
-        elif model_name in ("hermes-code", "hermes-privacy", "claude-code-cli", "mimocode-cli") or (
+        elif model_name in ("hermes-code", "hermes-privacy", "hermes-premium", "claude-code-cli", "mimocode-cli") or (
             "/" in model_name and not role_cfg
         ):
             # Activate passthrough for hermes-code, claude-code-cli, mimocode-cli,
@@ -7488,7 +7668,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _provider_mode = True
         external_tool_mode = "none"
         if isinstance(tools, list) and tools:
-            if model_name in ("hermes-code", "hermes-privacy"):
+            if model_name in ("hermes-code", "hermes-privacy", "hermes-premium"):
                 external_tool_mode = "inband"
             else:
                 external_tool_mode = "inband" if force_connection_close else "broker"
@@ -8002,6 +8182,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 if selected_privacy_model and selected_privacy_model not in _passthrough_models:
                     _passthrough_models.append(selected_privacy_model)
+
+            elif model_name == "hermes-premium":
+                selected_premium_model = _select_hermes_premium_model(
+                    estimated_tokens=_approx_tokens,
+                    session_id=session_id,
+                    require_vision=_needs_vision,
+                    require_audio=_needs_audio,
+                    avoid_external_image_incompatible=_uses_external_image_urls,
+                )
+                if selected_premium_model and selected_premium_model not in _passthrough_models:
+                    _passthrough_models.append(selected_premium_model)
             elif model_name and model_name not in _passthrough_models:
                 if "/" in model_name:
                     _passthrough_models.append(model_name)
@@ -8020,8 +8211,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass  # Already added above
             # Then HERMES_CODE_MODEL as the actual runtime model for hermes-code
             # (skipped in strict mode — the explicit user request is honored alone)
-            primary = os.getenv("HERMES_PRIVACY_MODEL" if model_name == "hermes-privacy" else "HERMES_CODE_MODEL", "").strip()
+            primary = os.getenv("HERMES_PRIVACY_MODEL" if model_name == "hermes-privacy" else "HERMES_PREMIUM_MODEL" if model_name == "hermes-premium" else "HERMES_CODE_MODEL", "").strip()
             _is_privacy_passthrough = model_name == "hermes-privacy"
+            _is_premium_passthrough = model_name == "hermes-premium"
             if (
                 not _strict_mode
                 and primary
@@ -8035,7 +8227,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 try:
                     from agent.model_cooldown_db import model_cooldown_remaining
                     for idx in range(1, _hermes_code_max_fallbacks() + 1):
-                        fb = os.getenv(f"HERMES_PRIVACY_FALLBACK_{idx}" if model_name == "hermes-privacy" else f"HERMES_CODE_FALLBACK_{idx}", "").strip()
+                        fb = os.getenv(f"HERMES_PRIVACY_FALLBACK_{idx}" if model_name == "hermes-privacy" else f"HERMES_PREMIUM_FALLBACK_{idx}" if model_name == "hermes-premium" else f"HERMES_CODE_FALLBACK_{idx}", "").strip()
                         if _passthrough_fallback_provider_excluded(fb, privacy=_is_privacy_passthrough):
                             continue
                         if fb and fb not in _passthrough_models:
@@ -8048,7 +8240,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     # Fallback: add all models without checking (original behaviour)
                     for idx in range(1, _hermes_code_max_fallbacks() + 1):
-                        fb = os.getenv(f"HERMES_PRIVACY_FALLBACK_{idx}" if model_name == "hermes-privacy" else f"HERMES_CODE_FALLBACK_{idx}", "").strip()
+                        fb = os.getenv(f"HERMES_PRIVACY_FALLBACK_{idx}" if model_name == "hermes-privacy" else f"HERMES_PREMIUM_FALLBACK_{idx}" if model_name == "hermes-premium" else f"HERMES_CODE_FALLBACK_{idx}", "").strip()
                         if _passthrough_fallback_provider_excluded(fb, privacy=_is_privacy_passthrough):
                             continue
                         if fb and fb not in _passthrough_models:
@@ -8084,7 +8276,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     # bad models (e.g. opencode-go/deepseek-v4-flash=45.4) without
                     # removing mid-quality options that the user explicitly picked.
                     # Set HERMES_CODE_QUALITY_FLOOR=0 to disable.
-                    _floor = float(os.getenv("HERMES_PRIVACY_QUALITY_FLOOR" if model_name == "hermes-privacy" else "HERMES_CODE_QUALITY_FLOOR", "50.0") or 0.0)
+                    _floor = float(os.getenv("HERMES_PRIVACY_QUALITY_FLOOR" if model_name == "hermes-privacy" else "HERMES_PREMIUM_QUALITY_FLOOR" if model_name == "hermes-premium" else "HERMES_CODE_QUALITY_FLOOR", "50.0") or 0.0)
                     _kept: List[str] = []
                     _dropped: List[Tuple[str, float]] = []
                     for m in _rest:
@@ -12729,14 +12921,14 @@ class APIServerAdapter(BasePlatformAdapter):
             _toolset_mode = "full"
         elif model_name == "hermes-agentic-remote":
             _toolset_mode = "remote"
-        elif model_name in ("hermes-code", "hermes-privacy", "claude-code-cli", "mimocode-cli") or (
+        elif model_name in ("hermes-code", "hermes-privacy", "hermes-premium", "claude-code-cli", "mimocode-cli") or (
             "/" in model_name and not role_cfg
         ):
             _provider_mode = True
 
         external_tool_mode = "none"
         if isinstance(tools, list) and tools:
-            if model_name in ("hermes-code", "hermes-privacy"):
+            if model_name in ("hermes-code", "hermes-privacy", "hermes-premium"):
                 external_tool_mode = "inband"
             else:
                 external_tool_mode = "broker"

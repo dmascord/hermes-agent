@@ -51,6 +51,8 @@ from gateway.platforms.api_server import (
     _build_swarm_model_pool,
     _build_hermes_code_model_pool,
     _build_hermes_privacy_model_pool,
+    _build_hermes_premium_model_pool,
+    _hermes_model_is_heavyweight,
     _passthrough_fallback_provider_excluded,
     _passthrough_model_health_reason,
     check_api_server_requirements,
@@ -207,14 +209,59 @@ class TestDynamicPassthroughFallbacks:
         assert "openai/gpt-5.4-mini" in pool
         assert "opencode-go/minimax-m3" in pool
         assert "ollama-cloud/glm-5.1" in pool
-        assert "claude-code-cli" in pool
+        assert "claude-code-cli" not in pool
         assert "opencode-zen/hy3-free" not in pool
         assert "openrouter/cohere/north-mini-code:free" not in pool
         assert "minimax/MiniMax-M3" not in pool
         assert _passthrough_fallback_provider_excluded("openai/gpt-5.6-sol", privacy=True) is False
-        assert _passthrough_fallback_provider_excluded("claude-code-cli", privacy=True) is False
+        assert _passthrough_fallback_provider_excluded("claude-code-cli", privacy=True) is True
         assert _passthrough_fallback_provider_excluded("opencode-zen/hy3-free", privacy=True) is True
         assert _passthrough_fallback_provider_excluded("openrouter/cohere/north-mini-code:free", privacy=True) is True
+
+    def test_hermes_premium_keeps_heavyweight_models(self, monkeypatch):
+        self._patch_catalogs(monkeypatch)
+        monkeypatch.setenv("HERMES_PREMIUM_MODEL", "github-copilot-enterprise/gpt-5.6-sol")
+        monkeypatch.setenv("HERMES_PREMIUM_FALLBACK_1", "opencode-go/minimax-m3")
+        monkeypatch.setenv("HERMES_PREMIUM_DYNAMIC_FALLBACKS", "true")
+        for idx in range(2, 65):
+            monkeypatch.delenv(f"HERMES_PREMIUM_FALLBACK_{idx}", raising=False)
+
+        pool = _build_hermes_premium_model_pool()
+
+        assert pool[0] == "github-copilot-enterprise/gpt-5.6-sol"
+        assert "github-copilot-enterprise/gpt-5.6-sol" in pool
+        assert "openai/gpt-5.4-mini" in pool
+        assert "opencode-go/minimax-m3" in pool
+        assert "opencode-go/qwen3.6-plus" in pool
+        assert "openrouter/cohere/north-mini-code:free" in pool
+        assert "claude-code-cli" not in pool
+
+    def test_hermes_code_drops_heavyweight_dynamic_models(self, monkeypatch):
+        self._patch_catalogs(monkeypatch)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._hermes_model_is_heavyweight",
+            lambda m: m.endswith("gpt-5.6-sol"),
+        )
+        monkeypatch.setenv("HERMES_CODE_DYNAMIC_FALLBACKS", "true")
+        for idx in range(1, 65):
+            monkeypatch.delenv(f"HERMES_CODE_FALLBACK_{idx}", raising=False)
+
+        pool = _build_hermes_code_model_pool()
+
+        assert "github-copilot-enterprise/gpt-5.6-sol" not in pool
+        assert "openai/gpt-5.4-mini" in pool
+
+    def test_heavyweight_overrides_recognise_subscription_models(self):
+        assert _hermes_model_is_heavyweight("github-copilot-enterprise/gpt-5.6-sol") is True
+        assert _hermes_model_is_heavyweight("openai/gpt-5.3-codex") is True
+        assert _hermes_model_is_heavyweight("github-copilot-enterprise/gpt-5.6-luna") is False
+        assert _hermes_model_is_heavyweight("ollama/qwen3-coder-next") is False
+        assert _hermes_model_is_heavyweight("ollama-cloud/mistral-large-3:675b") is True
+        assert _hermes_model_is_heavyweight("gemini/gemini-2.5-pro") is True
+        assert _hermes_model_is_heavyweight("cohere/command-a-plus-05-2026") is True
+        assert _hermes_model_is_heavyweight("cohere/command-a-03-2025") is True
+        assert _hermes_model_is_heavyweight("github-copilot-enterprise/claude-sonnet-4.6") is True
+        assert _hermes_model_is_heavyweight("github-copilot-enterprise/claude-opus-4.6") is True
 
     def test_dynamic_discovery_skips_health_cooled_models(self, monkeypatch):
         self._patch_catalogs(monkeypatch)
@@ -1234,7 +1281,7 @@ class TestModelsEndpoint:
             payload = await resp.json()
             by_id = {entry["id"]: entry for entry in payload["data"]}
 
-        for model_id in ("hermes-code", "hermes-privacy"):
+        for model_id in ("hermes-code", "hermes-privacy", "hermes-premium"):
             entry = by_id[model_id]
             assert entry["attachment"] is True
             assert "image" in entry["input"]

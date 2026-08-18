@@ -121,6 +121,28 @@ class ModelInfo:
             caps.append("open weights")
         return ", ".join(caps) if caps else "basic"
 
+def is_heavyweight_model(
+    model_id: str,
+    provider_id: str,
+    *,
+    input_cost_threshold: float = 1.0,
+    output_cost_threshold: float = 8.0,
+) -> bool:
+    """Return whether authoritative catalog pricing classifies a model as premium.
+
+    Unknown or unpriced models are deliberately not classified here.  Callers
+    supply exact policy overrides for subscription models whose catalogs only
+    expose an ID, such as ChatGPT Codex OAuth.
+    """
+    info = get_model_info(provider_id, model_id)
+    return bool(
+        info
+        and info.has_cost_data()
+        and (
+            info.cost_input >= input_cost_threshold
+            or info.cost_output >= output_cost_threshold
+        )
+    )
 
 @dataclass
 class ProviderInfo:
