@@ -3434,6 +3434,12 @@ def _build_hermes_privacy_model_pool() -> List[str]:
                 model,
             )
             continue
+        if _hermes_model_is_heavyweight(model):
+            logger.debug(
+                "[api_server] excluding heavyweight HERMES_PRIVACY model candidate: %s",
+                model,
+            )
+            continue
         if _passthrough_fallback_provider_excluded(model, privacy=True):
             logger.warning(
                 "[api_server] ignoring non-privacy HERMES_PRIVACY model candidate: %s",
