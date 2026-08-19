@@ -3211,7 +3211,7 @@ def _passthrough_dynamic_catalog_fallbacks(*, privacy: bool = False, premium: bo
         text = str(model or "").strip()
         if not text or text in seen:
             continue
-        if not privacy and not premium and _hermes_model_is_heavyweight(text):
+        if not premium and _hermes_model_is_heavyweight(text):
             logger.debug("[api_server] excluding heavyweight model %s from default rotation", text)
             continue
         seen.add(text)
